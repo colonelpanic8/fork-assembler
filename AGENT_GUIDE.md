@@ -9,7 +9,8 @@ output, and conflict resolutions live only in tracked files under
 ## Reporting status
 
 Run `fork-fold status` for an offline comparison of the manifest, lock, and
-last build. Add `--live` when current remote heads or merged PR state matter.
+last build. It also lists the manifest's exclusions with their reasons, after
+the stack. Add `--live` when current remote heads or merged PR state matter.
 Report whether live refs moved past their lock pins, whether the manifest is a
 prefix-extension of the lock (append = cheap incremental build; reorder or
 removal = suffix rebuild with likely re-resolution), and whether the last
@@ -20,12 +21,41 @@ build completed.
 1. Run `fork-fold add REMOTE:BRANCH` (or `--pr N`, or `--patch FILE`). For a
    new fork, first add it under `[remotes]` in `manifest.toml`. To carry all
    of a user's open PRs, run `fork-fold add --prs-from USER`; it is
-   idempotent and appends only PRs not already carried.
+   idempotent and appends only PRs that are neither already carried nor
+   excluded.
 2. Run `fork-fold build`. Appends build incrementally from the last assembled
    commit.
 3. If it completes, commit `manifest.toml`, `manifest.lock.json`, and any
    tracked resolution changes together using explicit paths. Unrelated local
    changes may exist.
+
+## Refusing a target
+
+Absence records nothing. `add --prs-from` re-appends every open PR it finds,
+so deleting an entry — or commenting it out — is not a decision the manifest
+remembers. To keep a target out, say so:
+
+```sh
+fork-fold exclude --pr 3970 --reason "superseded by 3984, which contains it"
+```
+
+The case that forces this: a combined PR that merges two others and builds on
+top of both. Carrying either parent alongside it duplicates that parent's
+commits, and the parents usually stay open, so every sweep offers them again.
+Exclude both, naming the combined PR in the reason.
+
+Always record a `--reason`. An exclusion nobody can justify later is
+indistinguishable from an oversight, and the reason is quoted wherever the
+refusal is reported.
+
+`exclude` never touches the lock — nothing needs rebuilding after one. It
+refuses a target that is currently carried: run `fork-fold remove NAME` first
+and accept that it invalidates the build from that position. Report both the
+exclusion and any removal it required.
+
+Exclude a closed or superseded PR too, even though discovery only sees open
+ones. The exclusion is what answers "why isn't this carried?" without git
+archaeology.
 
 ## When a build stops on a conflict
 
@@ -93,6 +123,11 @@ base. In the same repair cycle, update the base past the merge, run
 `fork-fold prune --dry-run`, prune the dead entries, and rebuild. Report which
 entries were pruned and why, and resolve any orphaned fixups the prune
 reported.
+
+The same applies when the base picks up someone else's fix for a problem a
+carried entry also solves: the entry is now redundant, not merged, so `prune`
+will not see it. Remove it, exclude it so a sweep cannot bring it back, and
+say in the reason which upstream change obsoleted it.
 
 ## Verification
 

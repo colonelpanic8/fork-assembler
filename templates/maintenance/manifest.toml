@@ -33,3 +33,14 @@ ref = "main"
 #                                 # for content belonging to no entry (e.g.
 #                                 # site-local customization). Cross-entry
 #                                 # repairs belong in a fixup instead.
+
+# Targets deliberately NOT carried. Absence records nothing: `add --prs-from`
+# re-appends every open PR it finds, so commenting an entry out is inert.
+# An exclusion is the positive refusal, and the only form of it that survives
+# a discovery sweep. Record one with `fork-fold exclude`; it never touches the
+# lock, so nothing needs rebuilding.
+#
+# [[exclude]]
+# pr = 1234                       # or branch = "mine:some-topic", or
+#                                 # patch = "patches/example.patch"
+# reason = "superseded by 1240, which already contains it"

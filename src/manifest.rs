@@ -1,4 +1,5 @@
-//! `manifest.toml` — INTENT: named remotes, the base, and the ordered entries.
+//! `manifest.toml` — INTENT: named remotes, the base, the ordered entries,
+//! and the targets deliberately not carried.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -19,6 +20,8 @@ struct RawManifest {
     publish: Option<Publish>,
     #[serde(default, rename = "entry")]
     entries: Vec<RawEntry>,
+    #[serde(default, rename = "exclude")]
+    excludes: Vec<RawExclude>,
 }
 
 #[derive(Deserialize)]
@@ -49,12 +52,21 @@ struct RawEntry {
     note: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RawExclude {
+    branch: Option<String>,
+    pr: Option<i64>,
+    patch: Option<String>,
+    reason: Option<String>,
+}
+
 pub struct Manifest {
     pub remotes: BTreeMap<String, String>,
     pub base: Base,
     pub provenance_file: Option<String>,
     pub publish: Option<Publish>,
     pub entries: Vec<Entry>,
+    pub excludes: Vec<Exclusion>,
 }
 
 pub struct Base {
@@ -125,6 +137,98 @@ impl Entry {
     }
 }
 
+/// A target deliberately NOT carried.
+///
+/// Absence from the entry list records nothing. Discovery
+/// (`add --prs-from`) appends every open PR it finds, so commenting an entry
+/// out is inert — the next sweep puts it back, and carrying a PR alongside a
+/// combined branch that already contains it duplicates its commits. An
+/// exclusion is the positive statement that a target must stay out: it is the
+/// only thing about a non-carried target that survives a sweep, so it is the
+/// only correct place to say no.
+///
+/// `reason` is not load-bearing; recording one is the point of making the
+/// refusal declarative, since an exclusion nobody can justify six months
+/// later is indistinguishable from an oversight. It is quoted everywhere an
+/// exclusion is reported.
+#[derive(Clone)]
+pub struct Exclusion {
+    pub target: Target,
+    pub reason: Option<String>,
+}
+
+/// What an exclusion names: the same three shapes an entry can take, minus
+/// everything that only matters to a merge. An exclusion has no step, so it
+/// has no remote to fetch from, no position, and no fixup.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A topic branch, as the `REMOTE:BRANCH` spec an entry would name.
+    Branch { spec: String },
+    /// A PR number, matched wherever it surfaces: a `pr` entry, a branch
+    /// entry carrying `pr = N` metadata, or a PR found by discovery.
+    Pr { number: i64 },
+    /// A tracked patch file.
+    Patch { path: String },
+}
+
+impl Target {
+    /// How the CLI names this target, in `add`'s vocabulary.
+    pub fn label(&self) -> String {
+        match self {
+            Target::Branch { spec } => format!("branch {spec}"),
+            Target::Pr { number } => format!("pr {number}"),
+            Target::Patch { path } => format!("patch {path}"),
+        }
+    }
+}
+
+impl Exclusion {
+    /// Build one from the three mutually exclusive target fields. Shared by
+    /// `load` and by the verbs that read the live document, so both reject
+    /// the same shapes in the same words.
+    pub fn from_fields(
+        branch: Option<String>,
+        pr: Option<i64>,
+        patch: Option<String>,
+        reason: Option<String>,
+    ) -> Result<Exclusion> {
+        let target = match (branch, pr, patch) {
+            (Some(spec), None, None) => {
+                if !spec.contains(':') {
+                    bail!("exclusion {spec:?}: branch targets are REMOTE:BRANCH");
+                }
+                Target::Branch { spec }
+            }
+            (None, Some(number), None) => Target::Pr { number },
+            (None, None, Some(path)) => Target::Patch { path },
+            _ => bail!(
+                "an exclusion must name exactly one of: `branch = \"remote:branch\"`, \
+                 `pr = N`, or `patch = \"file\"`"
+            ),
+        };
+        Ok(Exclusion { target, reason })
+    }
+
+    /// Does `entry` carry what this exclusion refuses?
+    pub fn matches(&self, entry: &Entry) -> bool {
+        match (&self.target, &entry.kind) {
+            (Target::Pr { number }, _) => entry.pr_number() == Some(*number),
+            (Target::Branch { spec }, Kind::Branch { .. }) => &entry.source() == spec,
+            (Target::Patch { path }, Kind::Patch { path: carried }) => carried == path,
+            _ => false,
+        }
+    }
+
+    /// Label plus the recorded reason: what every message reporting this
+    /// exclusion prints, so the refusal always arrives with its justification.
+    pub fn describe(&self) -> String {
+        match &self.reason {
+            Some(reason) => format!("{} ({reason})", self.target.label()),
+            None => format!("{} (no reason recorded)", self.target.label()),
+        }
+    }
+}
+
 impl Manifest {
     pub fn remote_url(&self, name: &str) -> Result<&str> {
         self.remotes
@@ -149,6 +253,36 @@ pub fn sanitize_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The name an entry answers to: its explicit `name`, else one derived from
+/// what it tracks. One rule, shared by the typed load path and by the verbs
+/// that read `manifest.toml` as a document, so a name never depends on which
+/// reader asked.
+pub fn entry_name(
+    name: Option<&str>,
+    branch: Option<&str>,
+    pr: Option<i64>,
+    patch: Option<&str>,
+) -> Result<String> {
+    if let Some(name) = name {
+        return Ok(name.to_string());
+    }
+    if let Some(spec) = branch {
+        let branch = spec.split_once(':').map_or(spec, |(_, b)| b);
+        return Ok(branch.to_string());
+    }
+    if let Some(number) = pr {
+        return Ok(format!("pr-{number}"));
+    }
+    if let Some(path) = patch {
+        return Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .with_context(|| format!("cannot derive a name from patch path {path:?}"));
+    }
+    bail!("an entry must name a `branch`, a `pr`, or a `patch`");
 }
 
 fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
@@ -182,18 +316,12 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
              (optionally with `pr = N` metadata), `pr = N`, or `patch = \"file\"`"
         ),
     };
-    let name = match raw.name {
-        Some(name) => name,
-        None => match &kind {
-            Kind::Branch { branch, .. } => branch.clone(),
-            Kind::Pr { number, .. } => format!("pr-{number}"),
-            Kind::Patch { path } => Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .with_context(|| format!("cannot derive a name from patch path {path:?}"))?
-                .to_string(),
-        },
-    };
+    let name = entry_name(
+        raw.name.as_deref(),
+        raw.branch.as_deref(),
+        raw.pr,
+        raw.patch.as_deref(),
+    )?;
     if name.is_empty() || name == "base" {
         bail!("invalid entry name {name:?} (empty and \"base\" are reserved)");
     }
@@ -239,6 +367,27 @@ pub fn load(root: &Path) -> Result<Manifest> {
         }
     }
 
+    let excludes = raw
+        .excludes
+        .into_iter()
+        .map(|x| Exclusion::from_fields(x.branch, x.pr, x.patch, x.reason))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Carrying and refusing the same target is not a precedence question with
+    // a defensible answer: one of the two statements is a mistake, and only
+    // the maintainer knows which. Fail every command until it is resolved,
+    // rather than silently honoring whichever the code happens to read last.
+    for exclusion in &excludes {
+        if let Some(entry) = entries.iter().find(|e| exclusion.matches(e)) {
+            bail!(
+                "manifest both carries and excludes {}: entry {:?} tracks it \
+                 while an [[exclude]] refuses it -- delete whichever is wrong",
+                exclusion.describe(),
+                entry.name
+            );
+        }
+    }
+
     let manifest = Manifest {
         remotes: raw.remotes,
         base: Base {
@@ -249,6 +398,7 @@ pub fn load(root: &Path) -> Result<Manifest> {
         provenance_file: raw.provenance_file,
         publish: raw.publish,
         entries,
+        excludes,
     };
 
     manifest.remote_url(&manifest.base.remote)?;
@@ -328,6 +478,114 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
         earliest,
         orphaned_fixups,
     })
+}
+
+/// What `record_exclusion` did to the manifest.
+pub enum Excluded {
+    /// A new `[[exclude]]` table was appended.
+    Added,
+    /// The target was already excluded, with the reason left as it was.
+    AlreadyRecorded,
+    /// The target was already excluded and its reason was replaced.
+    ReasonUpdated { previous: Option<String> },
+}
+
+/// Record an exclusion in manifest.toml (comment-preserving), idempotently.
+///
+/// Refuses when the target is currently carried. Removing an entry
+/// invalidates every later entry's build, and that consequence belongs to
+/// `remove`, which reports it; a bookkeeping verb must not trigger it as a
+/// side effect.
+///
+/// Never touches the lock: an exclusion says nothing about any assembled
+/// tree, so nothing needs rebuilding after one.
+pub fn record_exclusion(root: &Path, target: &Target, reason: Option<&str>) -> Result<Excluded> {
+    let manifest = load(root)?;
+    let exclusion = Exclusion {
+        target: target.clone(),
+        reason: reason.map(str::to_string),
+    };
+    if let Some(entry) = manifest.entries.iter().find(|e| exclusion.matches(e)) {
+        bail!(
+            "{} is carried by entry {:?}; run `fork-fold remove {}` first \
+             (that invalidates the build from its position, which is why \
+             excluding will not do it for you)",
+            target.label(),
+            entry.name,
+            entry.name
+        );
+    }
+
+    let path = root.join(FILE);
+    let mut doc = fs::read_to_string(&path)?
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let existing = doc
+        .get("exclude")
+        .and_then(Item::as_array_of_tables)
+        .map(|arr| {
+            arr.iter()
+                .position(|t| read_exclude_target(t).as_ref() == Some(target))
+        })
+        .unwrap_or(None);
+
+    if let Some(index) = existing {
+        let table = doc
+            .get_mut("exclude")
+            .and_then(Item::as_array_of_tables_mut)
+            .and_then(|arr| arr.get_mut(index))
+            .context("exclusion vanished between read and edit")?;
+        let previous = table
+            .get("reason")
+            .and_then(Item::as_str)
+            .map(str::to_string);
+        match reason {
+            Some(reason) if previous.as_deref() != Some(reason) => {
+                table["reason"] = toml_edit::value(reason);
+                fs::write(&path, doc.to_string())?;
+                return Ok(Excluded::ReasonUpdated { previous });
+            }
+            _ => return Ok(Excluded::AlreadyRecorded),
+        }
+    }
+
+    let excludes = doc
+        .entry("exclude")
+        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    let arr = excludes
+        .as_array_of_tables_mut()
+        .context("`exclude` is set to something other than [[exclude]] tables")?;
+    let mut table = toml_edit::Table::new();
+    match target {
+        Target::Branch { spec } => table["branch"] = toml_edit::value(spec.as_str()),
+        Target::Pr { number } => table["pr"] = toml_edit::value(*number),
+        Target::Patch { path } => table["patch"] = toml_edit::value(path.as_str()),
+    }
+    if let Some(reason) = reason {
+        table["reason"] = toml_edit::value(reason);
+    }
+    arr.push(table);
+    fs::write(&path, doc.to_string())?;
+    Ok(Excluded::Added)
+}
+
+/// The target an `[[exclude]]` table names, reading the live document rather
+/// than the typed load, so the editing verbs see exactly what is on disk.
+pub fn read_exclude_target(table: &toml_edit::Table) -> Option<Target> {
+    if let Some(spec) = table.get("branch").and_then(Item::as_str) {
+        return Some(Target::Branch {
+            spec: spec.to_string(),
+        });
+    }
+    if let Some(number) = table.get("pr").and_then(Item::as_integer) {
+        return Some(Target::Pr { number });
+    }
+    table
+        .get("patch")
+        .and_then(Item::as_str)
+        .map(|path| Target::Patch {
+            path: path.to_string(),
+        })
 }
 
 /// Attach (`Some`) or detach (`None`) an entry's coherence fixup in

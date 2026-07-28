@@ -78,6 +78,21 @@ enum Command {
         #[arg(long, value_name = "USER")]
         prs_from: Option<String>,
     },
+    /// Record a target as deliberately not carried, so discovery cannot
+    /// re-admit it (does not touch the lock; nothing needs rebuilding)
+    Exclude {
+        /// Branch target as remote:branch
+        target: Option<String>,
+        /// PR number to refuse
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Patch file to refuse
+        #[arg(long)]
+        patch: Option<String>,
+        /// Why this target stays out; quoted wherever the refusal is reported
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Attach a coherence fixup to an entry: a patch applied as part of that
     /// entry's own merge step, so the entry boundary is never an invalid tree
     Fixup {
@@ -233,6 +248,45 @@ fn existing_entries(doc: &DocumentMut) -> ExistingEntries {
     e
 }
 
+/// The exclusions recorded in the live document, in manifest order.
+fn existing_exclusions(doc: &DocumentMut) -> Result<Vec<manifest::Exclusion>> {
+    let Some(tables) = doc.get("exclude").and_then(Item::as_array_of_tables) else {
+        return Ok(Vec::new());
+    };
+    tables
+        .iter()
+        .map(|t| {
+            manifest::Exclusion::from_fields(
+                t.get("branch").and_then(Item::as_str).map(str::to_string),
+                t.get("pr").and_then(Item::as_integer),
+                t.get("patch").and_then(Item::as_str).map(str::to_string),
+                t.get("reason").and_then(Item::as_str).map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// Refuse an explicitly requested target that the manifest excludes.
+///
+/// Discovery sweeps are bulk and impersonal, so `--prs-from` skips excluded
+/// PRs with a note. Naming one on the command line is a decision, and the
+/// maintainer deserves to learn it contradicts a recorded one rather than
+/// watch the request vanish.
+fn reject_if_excluded(exclusions: &[manifest::Exclusion], target: &manifest::Target) -> Result<()> {
+    if let Some(exclusion) = exclusions.iter().find(|x| &x.target == target) {
+        bail!(
+            "{} is excluded by the manifest: {}\n\
+             delete that [[exclude]] first if the refusal no longer holds",
+            target.label(),
+            exclusion
+                .reason
+                .clone()
+                .unwrap_or_else(|| "no reason recorded".into())
+        );
+    }
+    Ok(())
+}
+
 fn push_entry(doc: &mut DocumentMut, fill: impl FnOnce(&mut Table)) {
     let entries = doc
         .entry("entry")
@@ -295,6 +349,81 @@ fn open_prs_by(slug: &str, author: &str) -> Result<Vec<(i64, String)>> {
     Ok(prs)
 }
 
+/// What a discovery sweep decides about one PR it found.
+#[derive(Debug, PartialEq, Eq)]
+enum Discovered {
+    Append,
+    AlreadyCarried,
+    Excluded(String),
+}
+
+/// Sort discovered PRs into append / already-carried / excluded.
+///
+/// Split out from the sweep so the decision is testable without `gh`: this is
+/// the whole of what `--prs-from` decides, and the exclusion rule is the part
+/// worth proving.
+fn triage_discovered(
+    prs: &[(i64, String)],
+    carried: &HashSet<i64>,
+    exclusions: &[manifest::Exclusion],
+) -> Vec<(i64, String, Discovered)> {
+    prs.iter()
+        .map(|(number, title)| {
+            let verdict = if carried.contains(number) {
+                Discovered::AlreadyCarried
+            } else if let Some(exclusion) = exclusions
+                .iter()
+                .find(|x| x.target == manifest::Target::Pr { number: *number })
+            {
+                Discovered::Excluded(
+                    exclusion
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "no reason recorded".into()),
+                )
+            } else {
+                Discovered::Append
+            };
+            (*number, title.clone(), verdict)
+        })
+        .collect()
+}
+
+fn exclude(
+    target: Option<String>,
+    pr: Option<u64>,
+    patch: Option<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    let target = manifest::Exclusion::from_fields(target, pr.map(|n| n as i64), patch, None)
+        .context("nothing to exclude: pass REMOTE:BRANCH, --pr, or --patch")?
+        .target;
+    let root = PathBuf::from(".");
+    match manifest::record_exclusion(&root, &target, reason.as_deref())? {
+        manifest::Excluded::Added => {
+            println!("excluded {}", target.label());
+            if reason.is_none() {
+                println!(
+                    "  no reason recorded -- add one with `--reason` so the refusal \
+                     is still legible later"
+                );
+            }
+            println!("  the lock is untouched; nothing needs rebuilding");
+        }
+        manifest::Excluded::AlreadyRecorded => {
+            println!("already excluded: {}", target.label())
+        }
+        manifest::Excluded::ReasonUpdated { previous } => {
+            println!("already excluded: {}", target.label());
+            match previous {
+                Some(previous) => println!("  reason updated (was: {previous})"),
+                None => println!("  reason recorded"),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn add(
     target: Option<String>,
     pr: Option<u64>,
@@ -306,12 +435,19 @@ fn add(
     }
     let (path, mut doc) = load_manifest()?;
     let existing = existing_entries(&doc);
+    let exclusions = existing_exclusions(&doc)?;
     let mut appended = 0usize;
 
     if let Some(branch) = target {
         if !branch.contains(':') {
             bail!("branch entries are REMOTE:BRANCH (remote names come from [remotes])");
         }
+        reject_if_excluded(
+            &exclusions,
+            &manifest::Target::Branch {
+                spec: branch.clone(),
+            },
+        )?;
         if existing.branches.contains(&branch) {
             println!("already carried: {branch}");
         } else {
@@ -324,6 +460,7 @@ fn add(
     }
     if let Some(n) = pr {
         let n = n as i64;
+        reject_if_excluded(&exclusions, &manifest::Target::Pr { number: n })?;
         if existing.prs.contains(&n) {
             println!("already carried: pr {n}");
         } else {
@@ -335,6 +472,7 @@ fn add(
         }
     }
     if let Some(file) = patch {
+        reject_if_excluded(&exclusions, &manifest::Target::Patch { path: file.clone() })?;
         if existing.patches.contains(&file) {
             println!("already carried: patch {file}");
         } else {
@@ -351,17 +489,21 @@ fn add(
         if prs.is_empty() {
             println!("no open PRs by {author} on {slug}");
         }
-        for (n, title) in prs {
-            if existing.prs.contains(&n) {
-                println!("already carried: pr {n} ({title})");
-                continue;
+        for (n, title, verdict) in triage_discovered(&prs, &existing.prs, &exclusions) {
+            match verdict {
+                Discovered::AlreadyCarried => println!("already carried: pr {n} ({title})"),
+                Discovered::Excluded(reason) => {
+                    println!("excluded: pr {n} ({title}) -- not added: {reason}")
+                }
+                Discovered::Append => {
+                    push_entry(&mut doc, |t| {
+                        t["pr"] = value(n);
+                        t["summary"] = value(&title);
+                    });
+                    println!("added pr {n} ({title})");
+                    appended += 1;
+                }
             }
-            push_entry(&mut doc, |t| {
-                t["pr"] = value(n);
-                t["summary"] = value(&title);
-            });
-            println!("added pr {n} ({title})");
-            appended += 1;
         }
     }
 
@@ -398,6 +540,12 @@ fn main() -> Result<()> {
             patch,
             prs_from,
         } => add(target, pr, patch, prs_from),
+        Command::Exclude {
+            target,
+            pr,
+            patch,
+            reason,
+        } => exclude(target, pr, patch, reason),
         Command::Build { locked } => {
             let code = engine::build(&std::env::current_dir()?, locked)?;
             std::process::exit(code);
@@ -431,5 +579,64 @@ fn main() -> Result<()> {
         }
         Command::Prune { dry_run } => ops::prune(&std::env::current_dir()?, dry_run),
         Command::Status { live } => ops::status(&std::env::current_dir()?, live),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found() -> Vec<(i64, String)> {
+        vec![
+            (7, "superseded".to_string()),
+            (8, "carried".to_string()),
+            (9, "fresh".to_string()),
+        ]
+    }
+
+    fn excluding(number: i64, reason: Option<&str>) -> manifest::Exclusion {
+        manifest::Exclusion {
+            target: manifest::Target::Pr { number },
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    /// The sweep's whole job: an excluded PR is skipped with its reason while
+    /// everything else it found is still appended.
+    #[test]
+    fn discovery_skips_excluded_prs_and_appends_the_rest() {
+        let carried = HashSet::from([8]);
+        let excludes = vec![excluding(7, Some("superseded by 10"))];
+        let verdicts = triage_discovered(&found(), &carried, &excludes);
+        assert_eq!(
+            verdicts.iter().map(|(n, _, v)| (*n, v)).collect::<Vec<_>>(),
+            vec![
+                (7, &Discovered::Excluded("superseded by 10".into())),
+                (8, &Discovered::AlreadyCarried),
+                (9, &Discovered::Append),
+            ]
+        );
+    }
+
+    /// An exclusion without a reason still bites; only the message changes.
+    #[test]
+    fn discovery_skips_an_exclusion_with_no_reason() {
+        let verdicts = triage_discovered(&found(), &HashSet::new(), &[excluding(7, None)]);
+        assert_eq!(
+            verdicts[0].2,
+            Discovered::Excluded("no reason recorded".into())
+        );
+    }
+
+    /// Carried wins the report when a target is somehow both: the manifest
+    /// load rejects that state, so the sweep never needs to arbitrate it.
+    #[test]
+    fn discovery_reports_carried_before_excluded() {
+        let verdicts = triage_discovered(
+            &found(),
+            &HashSet::from([7]),
+            &[excluding(7, Some("stale"))],
+        );
+        assert_eq!(verdicts[0].2, Discovered::AlreadyCarried);
     }
 }

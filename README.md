@@ -11,8 +11,14 @@ targets — while the assembled branch is disposable compiled output. See
 ```
 fork-fold add mine:custom-snooze
 fork-fold add --pr 3984
+fork-fold exclude --pr 3970 --reason "superseded by 3984"
 fork-fold build
 ```
+
+Excluding is how the manifest says no. Deleting an entry records nothing:
+`add --prs-from USER` re-appends every open PR it finds, so a target that must
+stay out — a PR superseded by a combined one that already contains it, say —
+needs its refusal written down where a sweep will see it.
 
 The Rust CLI implements build, update, append, repair, status, and prune
 workflows. The `t3code-assembly` repository is the reference real-world

@@ -166,6 +166,16 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         );
     }
 
+    // Exclusions are manifest intent with no pin and no step, so they print
+    // after the stack rather than in it: what the build will never reach, and
+    // what discovery must not re-admit.
+    if !m.excludes.is_empty() {
+        println!("\nexcluded:");
+        for exclusion in &m.excludes {
+            println!("  {}", exclusion.describe());
+        }
+    }
+
     match &lock.build {
         Some(build) => {
             println!("\nlast build: commit {}", short(&build.commit));

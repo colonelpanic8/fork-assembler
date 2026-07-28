@@ -53,6 +53,29 @@ The manifest is an ordered list of entries. There are exactly three kinds:
 There is no separate "epilogue" phase — an epilogue is just a patch entry that
 happens to sit at the end.
 
+### Exclusions
+
+An exclusion names a target — the same three shapes an entry can take — that
+the stack deliberately does not carry.
+
+It exists because absence records nothing. Discovery (`add --prs-from`)
+appends every open PR it finds, so deleting an entry or commenting it out is
+not a decision the manifest remembers: the next sweep puts it back. The
+motivating case is a combined PR that merges two others and builds on both —
+carrying either parent alongside it duplicates that parent's commits, and the
+parents stay open, so they keep resurfacing. An exclusion is the positive
+statement that a target must stay out, and the only one a sweep will honor.
+
+Exclusions are intent with no step: no pin, no position, no fixup, no effect
+on any assembled tree. They constrain what may enter the entry list, nothing
+more. Carrying and excluding the same target is therefore not a precedence
+question — it is two contradictory statements of intent, and `load` rejects
+it rather than picking a winner.
+
+A `reason` is optional and not load-bearing, but recording one is most of the
+point: an exclusion nobody can justify six months later is indistinguishable
+from an oversight. It is quoted wherever the refusal is reported.
+
 ### Coherence fixups
 
 Branch and pr entries may additionally carry `fixup = "patches/thing.patch"`:
@@ -179,6 +202,10 @@ fixup = "patches/renumber-migration.patch"   # applied inside THIS entry's step
 
 [[entry]]
 patch = "patches/site-local-branding.patch"  # standalone, at its own position
+
+[[exclude]]
+pr = 3970                       # deliberately not carried; discovery skips it
+reason = "superseded by 3984, which already contains it"
 ```
 
 ### Append machinery / incremental builds
@@ -233,7 +260,14 @@ triggers a rebuild from there — detectable via the lock, never surprising.
 - `add` — append a branch/pr/patch entry to the manifest. Idempotent: adding
   an entry that is already present is a reported no-op. `--prs-from USER`
   appends every open PR authored by USER on the base repo that is not already
-  carried — safe to re-run any time to pick up only the new ones.
+  carried or excluded — safe to re-run any time to pick up only the new ones.
+  Naming an excluded target explicitly is an error rather than a silent skip:
+  a sweep is impersonal, but an explicit add is a decision, and it deserves to
+  learn that it contradicts a recorded refusal.
+- `exclude` — record a target as deliberately not carried. Idempotent, and it
+  never touches the lock, so nothing needs rebuilding after one. Refuses a
+  target that is currently carried: dropping it invalidates every later
+  entry's build, and that consequence belongs to `remove`, which reports it.
 - `remove` — remove an entry. Reports any coherence fixup it carried, leaving
   the patch file on disk for re-homing.
 - `prune [--dry-run]` — drop entries whose changes have landed in the base:
