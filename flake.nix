@@ -15,6 +15,7 @@
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeCheckInputs = [ pkgs.git ];
           postInstall = ''
             wrapProgram $out/bin/fork-fold --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
           '';
