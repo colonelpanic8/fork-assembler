@@ -20,7 +20,10 @@ re-resolution), and whether the last build completed.
 ## Appending to the stack
 
 1. `fork-fold add REMOTE:BRANCH` (or `--pr N`, or `--patch FILE`). For a new
-   fork, first add it under `[remotes]` in `manifest.toml`.
+   fork, first add it under `[remotes]` in `manifest.toml`. To carry all of a
+   user's open PRs, `fork-fold add --prs-from USER` — idempotent, appends
+   only the ones not already carried, so re-run it any time to pick up new
+   PRs.
 2. `fork-fold build` — appends build incrementally from the last assembled
    commit.
 3. If it completes: commit `manifest.toml` and `manifest.lock.json` together
@@ -40,6 +43,22 @@ re-resolution), and whether the last build completed.
 A stop marked PROPOSED means a stale resolution was replayed 3-way: review
 the staged result carefully before `fork-fold continue` — inputs moved since
 it was recorded.
+
+## Bumping to current upstream (the repair cycle)
+
+`build` never moves existing pins. To refresh:
+
+1. `fork-fold update` (all pins) or `fork-fold update ENTRY...` (selective).
+2. `fork-fold build` — unchanged merges replay from recorded resolutions;
+   drifted ones stop as staged 3-way proposals to confirm one at a time.
+3. Commit manifest, lock, and rewritten resolutions together.
+
+## When a PR merges upstream
+
+`fork-fold status` flags entries whose changes are contained in the base.
+In the same repair cycle: `fork-fold update` the base past the merge, then
+`fork-fold prune` (use `--dry-run` first) to drop the dead entries, then
+`build`. Report which entries were pruned and why.
 
 ## Verification
 

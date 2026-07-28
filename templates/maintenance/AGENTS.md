@@ -33,13 +33,22 @@ topic branches into a single branch, with tracked conflict resolutions.
 ## Operations
 
 ```sh
-fork-fold status                 # lock vs. manifest vs. live refs
+fork-fold status                 # lock vs. manifest vs. live refs; flags merged entries
 fork-fold add REMOTE:BRANCH      # append a topic branch entry
 fork-fold add --pr N             # append a PR entry
 fork-fold add --patch FILE       # append a patch entry
-fork-fold build                  # fetch and assemble; incremental for appends
-fork-fold build --locked         # reproduce from pinned OIDs, no fetching
+fork-fold add --prs-from USER    # append USER's open PRs not already carried (idempotent)
+fork-fold build                  # assemble from lock pins; incremental for appends
+fork-fold build --locked         # reproduce exactly; no network, no new pins
+fork-fold update [ENTRY...]      # batch bump: repin base + entries to live heads
+fork-fold prune [--dry-run]      # drop entries whose changes landed in the base
 ```
+
+`build` never moves existing pins; `update` is the only verb that does. The
+repair cycle after a bump is: `update`, then `build`, confirming or fixing
+each proposed resolution as the build stops. When a PR merges upstream,
+`update` the base past the merge and `prune` the dead entry in the same
+cycle.
 
 When a build stops on a conflict:
 

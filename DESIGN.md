@@ -126,10 +126,17 @@ triggers a rebuild from there — detectable via the lock, never surprising.
 
 ## Verbs (v1)
 
-- `build` — fetch tracked refs, check out the base, merge entries in order,
-  applying tracked resolutions (exact or proposed) as needed. Stops in the
-  build worktree on an unresolved conflict. `--locked` builds from the lock's
-  OIDs without fetching.
+- `build` — assemble the stack from the lock's pinned OIDs (fetching objects
+  as needed), applying tracked resolutions (exact or proposed). Entries not
+  yet in the lock are pinned from live refs on their first build. Stops in
+  the build worktree on an unresolved conflict. `--locked` additionally
+  refuses to touch the network or pin anything new.
+- `update [ENTRY...]` — the pin bump: repin the base and all entries (or only
+  the named ones) to their live remote heads. `build` never moves existing
+  pins; `update` is the only verb that does. After a batch bump, `build`
+  repairs incrementally — merges whose recorded inputs still match replay
+  non-interactively, and drifted resolutions come back as staged 3-way
+  proposals to confirm entry by entry.
 - `continue` — resume after the human resolves/confirms a conflict; records or
   rewrites the resolution sidecar files.
 - `init` — scaffold a maintenance repository: `manifest.toml`, `resolutions/`,
@@ -139,12 +146,28 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   it in the manifest as the base-object source (an optional sourcing strategy,
   never a requirement). The same layout is available as a nix flake template
   (`nix flake init -t github:colonelpanic8/fork-fold`).
-- `add` — append a branch/pr/patch entry to the manifest.
+- `add` — append a branch/pr/patch entry to the manifest. Idempotent: adding
+  an entry that is already present is a reported no-op. `--prs-from USER`
+  appends every open PR authored by USER on the base repo that is not already
+  carried — safe to re-run any time to pick up only the new ones.
 - `remove` — remove an entry.
+- `prune [--dry-run]` — drop entries whose changes have landed in the base:
+  PR entries via the PR's merged state, branch entries via patch-id
+  containment (`git cherry`) against the pinned base.
 - `status` — lock vs. manifest vs. live refs: what's stale, what an incremental
-  build would do.
+  build would do, and which entries look merged upstream (prune candidates).
 
 Builds run in a dedicated worktree under `.worktrees/` in the consuming repo.
+
+### Merged topics
+
+When a topic lands upstream, its entry becomes dead weight: once `update`
+moves the base past the merge, the entry's merge is an effective no-op (or,
+worse, a conflict against its own squash-merged form). `status` flags such
+entries and `prune` removes them. Removing an entry invalidates the suffix of
+the lock as usual, but after a base bump that contains the merge, the suffix
+normally replays cleanly — merged-topic removal and base update belong in the
+same repair cycle.
 
 ## Consuming repository layout
 
