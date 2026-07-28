@@ -82,6 +82,17 @@ Properties:
 `manifest.lock.json` is **fact** (which OIDs the last build used, the assembled
 commit, and its tree hash). Cargo/Bundler semantics.
 
+Concretely the lock has two parts: `pins` (base OID plus per-entry-name OID —
+patch entries pin the file's blob hash; moved only by `update` or an entry's
+first build) and `build` (the last completed build: `commit`,
+`pre_provenance_commit`, `tree` — the pre-provenance content tree, the
+reproducibility invariant — `built_tree`, per-entry results with
+merged/absorbed/empty/applied status plus conflict/resolution info, and a
+snapshot of the manifest entries used to detect prefix-extension). Branch
+entries may carry `pr = N` as pure metadata: the PR the branch is published
+as, feeding provenance links and `add --prs-from` dedup without changing
+merge behavior.
+
 ```toml
 # manifest.toml
 [remotes]

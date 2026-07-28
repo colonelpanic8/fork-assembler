@@ -16,6 +16,8 @@ ref = "main"
 #
 # [[entry]]
 # branch = "mine:some-topic"      # a live topic branch on a named remote
+# pr = 1234                       # optional metadata: the PR this branch is
+#                                 # published as (provenance link + dedup)
 #
 # [[entry]]
 # pr = 1234                       # refs/pull/1234/head; remote = "upstream" by default

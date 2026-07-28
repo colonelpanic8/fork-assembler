@@ -146,6 +146,9 @@ fn prepare_worktree(ctx: &Ctx, at: &str) -> Result<()> {
             ],
         );
     }
+    // A deleted-but-registered worktree (e.g. the directory was rm -rf'd)
+    // blocks re-adding at the same path.
+    let _ = git::raw(&ctx.repo, &["worktree", "prune"]);
     if let Some(parent) = ctx.worktree.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -218,8 +221,7 @@ fn apply_patch_entry(ctx: &Ctx, entry: &Entry, rel: &str) -> Result<Option<&'sta
 fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
     let entries = &ctx.manifest.entries;
     let total = entries.len();
-    for index in start..total {
-        let entry = &entries[index];
+    for (index, entry) in entries.iter().enumerate().skip(start) {
         let label = format!("[{:2}/{total}] {:<24}", index + 1, entry.name);
         let oid = st
             .pins
