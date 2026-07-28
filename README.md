@@ -14,5 +14,6 @@ fork-fold add --pr 3984
 fork-fold build
 ```
 
-Status: design phase. The reference prototype for these semantics is the
-`t3code-assembly` repository's Python tooling.
+The Rust CLI implements build, update, append, repair, status, and prune
+workflows. The `t3code-assembly` repository is the reference real-world
+consumer.

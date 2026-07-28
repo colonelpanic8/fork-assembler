@@ -20,8 +20,8 @@ The only durable sources of truth are:
 
 1. **Clean topic branches** — each a minimal diff against upstream, rebased and
    upstreamed independently.
-2. **Tracked resolution files** — the recorded outcome of each conflicted
-   merge between topics.
+2. **Tracked resolution files** — the recorded rerere pairs for each
+   conflicted merge between topics.
 
 The assembled branch is **compiled output**. It is never developed on, never
 merged back, and never reconciled with upstream directly. Upstream
@@ -54,27 +54,43 @@ happens to sit at the end.
 
 ### Resolutions
 
-When merging entry *E* conflicts, the resolution is stored as a tracked sidecar
-pair keyed by entry name:
+The single resolution mechanism is **git rerere with repo-tracked storage**:
 
 ```
-resolutions/<entry>.toml    # exact-match key: first-parent tree, topic OID, resolved tree
-resolutions/<entry>.patch   # binary-safe full diff: first-parent tree -> resolved tree
+resolutions/rerere/<conflict-hash>/preimage    # git's own rr-cache entry format
+resolutions/rerere/<conflict-hash>/postimage
+resolutions/rerere/INDEX.toml                  # informational: which entry's merge
+                                               # produced which hashes
 ```
 
-Properties:
+Mechanics:
 
-- The patch is a **full tree diff** (first parent → resolved merge), including
-  cleanly-merged paths, so replay never depends on conflict-marker placement or
-  fuzzy patch context.
-- **Exact match** (parent tree + topic OID both match): apply the patch,
-  verify the resulting tree hash, continue non-interactively.
-- **Stale** (inputs drifted because upstream or a topic moved): replay the old
-  patch as a 3-way merge and stop with the result staged as a *proposal*; the
-  human confirms or fixes, and `fork-fold continue` rewrites the sidecar files
-  in place. Resolutions self-maintain across refreshes instead of invalidating.
-- Git `rerere` is explicitly disabled during builds — resolutions must come
-  from tracked files only, never from a machine-local cache.
+- **Seeding** — every build wipes the build worktree's rr-cache (the source
+  repo's shared git-dir `rr-cache/`) and reseeds it *exclusively* from the
+  tracked pairs. Nothing ambient leaks in; the operator's own rr-cache is
+  never consulted. rerere is enabled only per-command (`-c rerere.enabled=true
+  -c rerere.autoUpdate=true` on build operations), never persistently.
+- **Auto-resolve** — on a conflicted merge, rerere replays recognized hunks
+  and `autoUpdate` stages them. If no unresolved paths remain, the merge is
+  committed and the build continues, recording the entry as
+  conflicted+auto-resolved in the lock. Otherwise the build stops (exit 2)
+  for manual resolution.
+- **Harvest** — after `continue` commits a manual resolution, new or updated
+  preimage/postimage pairs are copied from the worktree rr-cache into
+  `resolutions/rerere/` and attributed in INDEX.toml. The index is for
+  auditability only; replay uses the pair directories, verification uses the
+  lock's tree hash.
+- **Drift tolerance** — rerere keys on the normalized conflict hunks, not on
+  tree hashes, so unrelated drift elsewhere (or elsewhere in the same file)
+  still auto-resolves. A changed conflict hunk falls back to a manual stop,
+  and the new resolution is harvested alongside the old pair.
+
+Known limitation, by design: rerere pairs capture only **conflicted-hunk**
+resolutions. Edits made outside conflict hunks while resolving, and conflicts
+rerere cannot handle (delete/modify, binary), are not captured — such content
+belongs in patch entries. The end-of-build lock tree hash remains the sole
+verification invariant, so any uncaptured edit surfaces as a tree mismatch on
+reproduction, never as silent drift.
 
 ### Manifest and lock
 
@@ -138,18 +154,17 @@ triggers a rebuild from there — detectable via the lock, never surprising.
 ## Verbs (v1)
 
 - `build` — assemble the stack from the lock's pinned OIDs (fetching objects
-  as needed), applying tracked resolutions (exact or proposed). Entries not
-  yet in the lock are pinned from live refs on their first build. Stops in
-  the build worktree on an unresolved conflict. `--locked` additionally
+  as needed), auto-resolving conflicts from the tracked rerere pairs. Entries
+  not yet in the lock are pinned from live refs on their first build. Stops
+  in the build worktree on an unrecognized conflict. `--locked` additionally
   refuses to touch the network or pin anything new.
 - `update [ENTRY...]` — the pin bump: repin the base and all entries (or only
   the named ones) to their live remote heads. `build` never moves existing
   pins; `update` is the only verb that does. After a batch bump, `build`
-  repairs incrementally — merges whose recorded inputs still match replay
-  non-interactively, and drifted resolutions come back as staged 3-way
-  proposals to confirm entry by entry.
-- `continue` — resume after the human resolves/confirms a conflict; records or
-  rewrites the resolution sidecar files.
+  repairs incrementally — unchanged conflict hunks auto-resolve from the
+  tracked pairs, and changed hunks stop for manual resolution entry by entry.
+- `continue` — resume after the human resolves a conflict; commits the merge
+  and harvests the new pairs into `resolutions/rerere/`.
 - `init` — scaffold a maintenance repository: `manifest.toml`, `resolutions/`,
   `patches/`, `flake.nix` (consuming `fork-fold.lib.mkMaintenanceShell`),
   `.envrc`, justfile. `--upstream URL` fills in the base remote; `--submodule`
@@ -232,9 +247,10 @@ humans. Consequences:
 - `gh` used only for PR-entry conveniences, and only when a PR entry is
   present.
 - Reference semantics: `t3code-assembly/bin/*.py` (the prototype). Its
-  hard-won decisions to preserve: exact input matching before non-interactive
-  replay, rerere disabled, full-tree-diff resolutions, tree verification after
-  every replayed merge.
+  hard-won decision to preserve: end-of-build tree verification against the
+  lock. Its exact-match full-tree-diff sidecar records were replaced by
+  tracked rerere pairs — one mechanism instead of two, with the tree hash
+  still catching anything rerere replays wrongly.
 
 ## Explicitly deferred (not v1)
 

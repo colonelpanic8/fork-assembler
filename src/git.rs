@@ -48,20 +48,6 @@ pub fn out(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Run git, requiring success; returns raw stdout bytes (binary-safe).
-pub fn out_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = raw(dir, args)?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed in {}:\n{}",
-            args.join(" "),
-            dir.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(output.stdout)
-}
-
 /// True when the git command exits zero.
 pub fn ok(dir: &Path, args: &[&str]) -> bool {
     raw(dir, args).map(|o| o.status.success()).unwrap_or(false)

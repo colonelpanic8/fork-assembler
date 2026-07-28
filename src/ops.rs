@@ -98,7 +98,10 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         if let Some(ctx) = &ctx {
             let head = engine::fetch_base(ctx)?;
             if Some(&head) != lock.pins.base.as_ref() {
-                println!("      live head {} -- run `fork-fold update base`", short(&head));
+                println!(
+                    "      live head {} -- run `fork-fold update base`",
+                    short(&head)
+                );
             }
         }
     }
@@ -108,12 +111,13 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         .as_ref()
         .map(|b| b.results.iter().map(|r| (r.name.as_str(), r)).collect())
         .unwrap_or_default();
+    let recorded = crate::rerere::index_entry_names(root)?;
 
     for entry in &m.entries {
         let pin = lock.pins.entries.get(&entry.name);
         let mut flags = Vec::new();
-        if crate::resolution::load(root, &entry.name)?.is_some() {
-            flags.push("resolution".to_string());
+        if recorded.contains(&entry.name) {
+            flags.push("rerere resolution".to_string());
         }
         if let Some(result) = results.get(entry.name.as_str()) {
             if result.status != "merged" && result.status != "applied" {
@@ -138,13 +142,21 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
                 }
             }
         }
-        let pin_text = pin.map(|p| short(p).to_string()).unwrap_or("UNPINNED".into());
+        let pin_text = pin
+            .map(|p| short(p).to_string())
+            .unwrap_or("UNPINNED".into());
         let flag_text = if flags.is_empty() {
             String::new()
         } else {
             format!("  [{}]", flags.join("; "))
         };
-        println!("  {:<24} {} ({}){}", entry.name, pin_text, entry.source(), flag_text);
+        println!(
+            "  {:<24} {} ({}){}",
+            entry.name,
+            pin_text,
+            entry.source(),
+            flag_text
+        );
     }
 
     match &lock.build {

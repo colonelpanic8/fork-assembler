@@ -11,11 +11,15 @@ topic branches into a single branch, with tracked conflict resolutions.
 - `manifest.lock.json` is FACT: the OIDs the last build used, the assembled
   commit, and its tree hash. The tree hash is the reproducibility invariant;
   commit IDs are not.
-- `resolutions/<entry>.toml` + `resolutions/<entry>.patch` replay each
-  conflicted merge: a full first-parent-tree to resolved-tree diff, applied
-  only when the recorded inputs match, proposed via 3-way merge when stale.
+- `resolutions/rerere/<hash>/{preimage,postimage}` are tracked git-rerere
+  pairs replaying each conflicted merge's hunks. Every build seeds the build
+  worktree's rr-cache exclusively from them (wiped first, so nothing ambient
+  leaks in) and auto-resolves recognized conflicts.
+  `resolutions/rerere/INDEX.toml` records which entry produced which pairs —
+  informational only, never load-bearing.
 - `patches/` holds patch entries: the escape hatch for cross-topic semantic
-  fixes with no home on any single branch.
+  fixes with no home on any single branch, including edits a resolution
+  needs OUTSIDE conflict hunks (rerere pairs cannot capture those).
 
 ## Invariants — do not violate
 
@@ -24,8 +28,14 @@ topic branches into a single branch, with tracked conflict resolutions.
 - Topic branches stay minimal diffs against upstream; they are still
   candidates for upstream merge. Fix topic-specific problems on the topic
   branch, not in a resolution or patch entry.
-- Conflict knowledge lives only in tracked resolution files. Git rerere is
-  disabled during builds; never re-enable it or rely on a local cache.
+- Conflict knowledge lives only in the tracked pairs under
+  `resolutions/rerere/`. Builds enable rerere per-command and reseed its
+  cache from the tracked pairs every run; never enable rerere persistently
+  or let a machine-local cache feed a build.
+- Rerere pairs capture only conflicted-hunk resolutions. If a correct
+  resolution also needs edits outside the conflict hunks, put those edits in
+  a patch entry — a rebuild will otherwise surface them as a tree mismatch.
+  The lock's tree hash is the sole verification invariant.
 - Appending entries is cheap (incremental build of the tail). Reordering or
   removing entries invalidates every later entry's build — expect
   re-resolution from that point.
@@ -45,22 +55,21 @@ fork-fold prune [--dry-run]      # drop entries whose changes landed in the base
 ```
 
 `build` never moves existing pins; `update` is the only verb that does. The
-repair cycle after a bump is: `update`, then `build`, confirming or fixing
-each proposed resolution as the build stops. When a PR merges upstream,
-`update` the base past the merge and `prune` the dead entry in the same
-cycle.
+repair cycle after a bump is: `update`, then `build`, fixing each unrecognized
+conflict as the build stops. Recognized conflict hunks resolve automatically
+from the tracked pairs. When a PR merges upstream, `update` the base past the
+merge and `prune` the dead entry in the same cycle.
 
 When a build stops on a conflict:
 
 1. Resolve the conflicted files in the build worktree it reports (under
    `.worktrees/`).
 2. Stage the resolutions with `git add`.
-3. Run `fork-fold continue` — it records or rewrites the entry's resolution
-   sidecar files under `resolutions/`.
-4. Commit the manifest, lock, and resolution files together.
-
-When a build stops with a PROPOSED resolution (a stale record replayed
-3-way), review the staged result, fix it if needed, then `fork-fold continue`.
+3. Run `fork-fold continue` — it harvests the conflict's preimage/postimage
+   pair into `resolutions/rerere/` and updates the informational index.
+4. Run `fork-fold build --locked` after the repair completes to prove the
+   tracked pairs reproduce the lock's tree.
+5. Commit the manifest, lock, and tracked pairs together.
 
 ## Skills
 

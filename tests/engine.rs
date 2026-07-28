@@ -148,11 +148,30 @@ fn clean_build_then_noop() {
 
     // Locked reproduction from pins rebuilds and verifies the same tree.
     let out3 = ff_ok(&fx.root, &["build", "--locked"]);
-    assert!(out3.contains("verified: reproduced the lock's tree exactly"), "{out3}");
+    assert!(
+        out3.contains("verified: reproduced the lock's tree exactly"),
+        "{out3}"
+    );
+}
+
+/// Hash directories under resolutions/rerere/ (tracked pair entries).
+fn pair_dirs(root: &Path) -> Vec<PathBuf> {
+    let dir = root.join("resolutions/rerere");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().unwrap().is_dir())
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 #[test]
-fn conflict_resolve_continue_then_replay() {
+fn conflict_harvest_then_rebuild_autoresolves() {
     let fx = fixture();
     topic(&fx, "t1", "b.txt", "one\nT1\nthree\n");
     topic(&fx, "t2", "b.txt", "one\nT2\nthree\n");
@@ -163,31 +182,92 @@ fn conflict_resolve_continue_then_replay() {
     assert!(out.contains("CONFLICT"), "{out}");
     assert!(out.contains("b.txt"), "{out}");
 
-    // Resolve by combining both sides, stage, continue.
+    // Resolve by combining both sides, stage, continue: the resolved
+    // conflict is harvested as a tracked rerere pair.
     let wt = fx.root.join(".worktrees/build");
     fs::write(wt.join("b.txt"), "one\nT1+T2\nthree\n").unwrap();
     git(&wt, &["add", "b.txt"]);
     let out = ff_ok(&fx.root, &["continue"]);
-    assert!(out.contains("resolved; recorded resolutions/t2.patch"), "{out}");
+    assert!(out.contains("harvested 1 pair(s)"), "{out}");
 
-    assert!(fx.root.join("resolutions/t2.toml").exists());
-    assert!(fx.root.join("resolutions/t2.patch").exists());
+    let pairs = pair_dirs(&fx.root);
+    assert_eq!(pairs.len(), 1, "one tracked pair expected");
+    assert!(pairs[0].join("preimage").exists());
+    assert!(pairs[0].join("postimage").exists());
+    let index = fs::read_to_string(fx.root.join("resolutions/rerere/INDEX.toml")).unwrap();
+    assert!(index.contains("entry = \"t2\""), "{index}");
+    assert!(index.contains("b.txt"), "{index}");
+
     let lock = lock_json(&fx.root);
     let tree = lock["build"]["tree"].as_str().unwrap().to_string();
     let results = lock["build"]["results"].as_array().unwrap();
     assert_eq!(results[1]["conflicted"], true);
+    assert!(results[1]["resolution"]
+        .as_str()
+        .unwrap()
+        .starts_with("rerere:"));
 
-    // Wipe the worktree; locked reproduction must replay the recorded
-    // resolution non-interactively and land on the identical tree.
+    // Wipe the worktree; locked reproduction must auto-resolve from the
+    // seeded tracked pairs and land on the identical tree.
     fs::remove_dir_all(fx.root.join(".worktrees/build")).unwrap();
     let out = ff_ok(&fx.root, &["build", "--locked"]);
-    assert!(out.contains("replayed recorded resolution"), "{out}");
-    assert!(out.contains("verified: reproduced the lock's tree exactly"), "{out}");
+    assert!(out.contains("seeded 1 tracked rerere pair(s)"), "{out}");
+    assert!(
+        out.contains("auto-resolved from tracked rerere pairs"),
+        "{out}"
+    );
+    assert!(
+        out.contains("verified: reproduced the lock's tree exactly"),
+        "{out}"
+    );
     assert_eq!(lock_json(&fx.root)["build"]["tree"].as_str().unwrap(), tree);
 }
 
 #[test]
-fn stale_record_proposes_then_rerecords() {
+fn drift_outside_conflict_hunks_still_autoresolves() {
+    let fx = fixture();
+    // A file long enough that a change at the top stays out of the
+    // conflict hunk's context at the bottom.
+    let base = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+    fs::write(fx.upstream.join("e.txt"), base).unwrap();
+    git(&fx.upstream, &["add", "-A"]);
+    git(&fx.upstream, &["commit", "-q", "-m", "add e.txt"]);
+
+    topic(&fx, "t1", "e.txt", &base.replace("l8", "T1"));
+    topic(&fx, "t2", "e.txt", &base.replace("l8", "T2"));
+    add_branch(&fx, "t1");
+    add_branch(&fx, "t2");
+
+    ff_stopped(&fx.root, &["build"]);
+    let wt = fx.root.join(".worktrees/build");
+    fs::write(wt.join("e.txt"), base.replace("l8", "T1+T2")).unwrap();
+    git(&wt, &["add", "e.txt"]);
+    let out = ff_ok(&fx.root, &["continue"]);
+    assert!(out.contains("harvested 1 pair(s)"), "{out}");
+
+    // t0 changes the same file far from the conflict, plus another file.
+    let drifted = base.replace("l1", "L1-drift");
+    topic(&fx, "t0", "e.txt", &drifted);
+    // Reorder so t0 lands BEFORE the conflicting pair: trees differ from the
+    // recorded build, but the conflict hunks are identical.
+    ff_ok(&fx.root, &["remove", "t1"]);
+    ff_ok(&fx.root, &["remove", "t2"]);
+    add_branch(&fx, "t0");
+    add_branch(&fx, "t1");
+    add_branch(&fx, "t2");
+
+    let out = ff_ok(&fx.root, &["build"]);
+    assert!(
+        out.contains("auto-resolved from tracked rerere pairs"),
+        "{out}"
+    );
+    let body = fs::read_to_string(wt.join("e.txt")).unwrap();
+    assert!(body.contains("L1-drift"), "{body}");
+    assert!(body.contains("T1+T2"), "{body}");
+}
+
+#[test]
+fn changed_conflict_hunks_fall_back_to_manual() {
     let fx = fixture();
     topic(&fx, "t1", "b.txt", "one\nT1\nthree\n");
     topic(&fx, "t2", "b.txt", "one\nT2\nthree\n");
@@ -199,31 +279,27 @@ fn stale_record_proposes_then_rerecords() {
     fs::write(wt.join("b.txt"), "one\nT1+T2\nthree\n").unwrap();
     git(&wt, &["add", "b.txt"]);
     ff_ok(&fx.root, &["continue"]);
-    let old_theirs =
-        fs::read_to_string(fx.root.join("resolutions/t2.toml")).unwrap();
+    assert_eq!(pair_dirs(&fx.root).len(), 1);
 
-    // t2 moves: same conflicting hunk, new content. update repins it.
+    // t2 moves: the conflict hunk itself changes, so the tracked pair no
+    // longer matches and the build must stop for manual resolution.
     git(&fx.upstream, &["checkout", "-q", "t2"]);
     fs::write(fx.upstream.join("b.txt"), "one\nT2v2\nthree\n").unwrap();
     git(&fx.upstream, &["add", "-A"]);
     git(&fx.upstream, &["commit", "-q", "-m", "t2 v2"]);
     git(&fx.upstream, &["checkout", "-q", "main"]);
-    let out = ff_ok(&fx.root, &["update", "t2"]);
-    assert!(out.contains("t2: "), "{out}");
+    ff_ok(&fx.root, &["update", "t2"]);
 
-    // Build stops with the stale record staged as a proposal.
     let out = ff_stopped(&fx.root, &["build"]);
-    assert!(out.contains("PROPOSED"), "{out}");
+    assert!(out.contains("CONFLICT"), "{out}");
+    assert!(!out.contains("auto-resolved"), "{out}");
 
-    // The human fixes the proposal to account for v2, stages, continues.
-    let wt = fx.root.join(".worktrees/build");
     fs::write(wt.join("b.txt"), "one\nT1+T2v2\nthree\n").unwrap();
     git(&wt, &["add", "b.txt"]);
     let out = ff_ok(&fx.root, &["continue"]);
-    assert!(out.contains("resolved; recorded"), "{out}");
-
-    let new_theirs = fs::read_to_string(fx.root.join("resolutions/t2.toml")).unwrap();
-    assert_ne!(old_theirs, new_theirs, "sidecar must be rewritten");
+    assert!(out.contains("harvested 1 pair(s)"), "{out}");
+    // The new conflict hashes differently: both pairs are now tracked.
+    assert_eq!(pair_dirs(&fx.root).len(), 2);
 }
 
 #[test]
@@ -290,7 +366,10 @@ fn absorbed_and_empty_are_flagged() {
     let fx = fixture();
     // absorbed: topic merged into main before the first build.
     topic(&fx, "landed", "c.txt", "landed\n");
-    git(&fx.upstream, &["merge", "-q", "--no-ff", "-m", "land it", "landed"]);
+    git(
+        &fx.upstream,
+        &["merge", "-q", "--no-ff", "-m", "land it", "landed"],
+    );
     // empty: a change plus its exact revert -> tree identical to base.
     git(&fx.upstream, &["checkout", "-q", "-b", "noop", "main"]);
     fs::write(fx.upstream.join("a.txt"), "changed\n").unwrap();

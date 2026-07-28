@@ -3,7 +3,7 @@ mod git;
 mod lock;
 mod manifest;
 mod ops;
-mod resolution;
+mod rerere;
 mod source;
 mod state;
 
@@ -60,7 +60,7 @@ enum Command {
         /// Entries to repin (default: base and all entries)
         entries: Vec<String>,
     },
-    /// Resume a build stopped on a conflict; record or rewrite its resolution
+    /// Resume a build stopped on a conflict; harvest its rerere pairs
     Continue,
     /// Append entries to the manifest (idempotent)
     Add {
@@ -156,7 +156,7 @@ fn init(dir: PathBuf, upstream: Option<String>, base_ref: String, submodule: boo
             std::os::unix::fs::symlink("../../.agents/skills/fork-fold", &link)?;
         }
     }
-    for sub in ["resolutions", "patches"] {
+    for sub in ["resolutions/rerere", "patches"] {
         let path = dir.join(sub);
         fs::create_dir_all(&path)?;
         fs::write(path.join(".gitkeep"), "")?;
@@ -247,13 +247,26 @@ fn base_repo_slug(doc: &DocumentMut) -> Result<String> {
 fn open_prs_by(slug: &str, author: &str) -> Result<Vec<(i64, String)>> {
     let out = Process::new("gh")
         .args([
-            "pr", "list", "-R", slug, "--author", author, "--state", "open", "--json",
-            "number,title", "--limit", "500",
+            "pr",
+            "list",
+            "-R",
+            slug,
+            "--author",
+            author,
+            "--state",
+            "open",
+            "--json",
+            "number,title",
+            "--limit",
+            "500",
         ])
         .output()
         .context("failed to run gh")?;
     if !out.status.success() {
-        bail!("gh pr list failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let mut prs = Vec::new();
@@ -338,7 +351,11 @@ fn add(
 
     if appended > 0 {
         fs::write(&path, doc.to_string())?;
-        println!("{appended} entr{} appended to {}", if appended == 1 { "y" } else { "ies" }, path.display());
+        println!(
+            "{appended} entr{} appended to {}",
+            if appended == 1 { "y" } else { "ies" },
+            path.display()
+        );
     } else {
         println!("manifest unchanged");
     }

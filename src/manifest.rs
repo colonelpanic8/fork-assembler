@@ -128,10 +128,16 @@ impl Manifest {
     }
 }
 
-/// Entry names key resolution sidecar filenames; keep them path-safe.
+/// Keep entry-derived names path-safe for refs and generated labels.
 pub fn sanitize_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c == '/' || c.is_whitespace() { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 

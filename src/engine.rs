@@ -14,7 +14,7 @@ use chrono::Utc;
 use crate::git;
 use crate::lock::{self, EntryResult, Lock, Prefix};
 use crate::manifest::{self, Entry, Kind, Manifest};
-use crate::resolution::{self, Replay};
+use crate::rerere;
 use crate::source;
 use crate::state::{self, State};
 
@@ -174,7 +174,7 @@ fn merge_entry(ctx: &Ctx, entry: &Entry, oid: &str) -> Result<bool> {
     let message = format!("fork-fold: merge {}", entry.name);
     let out = git::raw(
         &ctx.worktree,
-        &["merge", "--no-ff", "--no-edit", "-m", &message, oid],
+        &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, oid]),
     )?;
     Ok(out.status.success())
 }
@@ -201,10 +201,7 @@ fn apply_patch_entry(ctx: &Ctx, entry: &Entry, rel: &str) -> Result<Option<&'sta
 
     let applied = git::raw(&ctx.worktree, &["apply", "--3way", &patch_str])?;
     if !applied.status.success() {
-        eprintln!(
-            "{}",
-            String::from_utf8_lossy(&applied.stderr).trim_end()
-        );
+        eprintln!("{}", String::from_utf8_lossy(&applied.stderr).trim_end());
         return Ok(None);
     }
     git::out(&ctx.worktree, &["add", "-A"])?;
@@ -275,42 +272,36 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
 
         if !clean {
             st.conflicts += 1;
-            match resolution::replay(&ctx.root, &ctx.worktree, &entry.name, &oid)? {
-                Replay::Exact => {
-                    println!("  {label} replayed recorded resolution");
-                    st.results.push(EntryResult {
-                        name: entry.name.clone(),
-                        oid,
-                        status: "merged".into(),
-                        conflicted: true,
-                        resolution: Some(resolution::patch_rel(&entry.name)),
-                    });
-                    st.next_index = index + 1;
-                    state::write(&ctx.worktree, st)?;
-                    continue;
-                }
-                Replay::Proposed => {
-                    st.next_index = index;
-                    state::write(&ctx.worktree, st)?;
-                    println!("\n  {label} CONFLICT -- PROPOSED resolution staged from a stale record");
-                    println!("  Inputs moved since it was recorded; review the staged result in:");
-                    println!("    {}", ctx.worktree.display());
-                    println!("  Fix if needed, `git add` any changes, then: fork-fold continue");
-                    return Ok(Some(STOPPED));
-                }
-                Replay::None => {
-                    st.next_index = index;
-                    state::write(&ctx.worktree, st)?;
-                    let files = conflicted_files(&ctx.worktree)?;
-                    println!("\n  {label} CONFLICT in {} file(s):", files.len());
-                    for file in &files {
-                        println!("      {file}");
-                    }
-                    println!("\n  Resolve in: {}", ctx.worktree.display());
-                    println!("  Stage with `git add`, then: fork-fold continue");
-                    return Ok(Some(STOPPED));
-                }
+            let unresolved = conflicted_files(&ctx.worktree)?;
+            if unresolved.is_empty() {
+                // rerere recognized every conflict hunk and staged the
+                // recorded resolutions (autoUpdate); commit and continue.
+                let hashes: Vec<String> = rerere::merge_rr(&ctx.worktree)?
+                    .into_iter()
+                    .map(|(hash, _)| hash)
+                    .collect();
+                git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+                println!("  {label} auto-resolved from tracked rerere pairs");
+                st.results.push(EntryResult {
+                    name: entry.name.clone(),
+                    oid,
+                    status: "merged".into(),
+                    conflicted: true,
+                    resolution: Some(rerere::label(&hashes)),
+                });
+                st.next_index = index + 1;
+                state::write(&ctx.worktree, st)?;
+                continue;
             }
+            st.next_index = index;
+            state::write(&ctx.worktree, st)?;
+            println!("\n  {label} CONFLICT in {} file(s):", unresolved.len());
+            for file in &unresolved {
+                println!("      {file}");
+            }
+            println!("\n  Resolve in: {}", ctx.worktree.display());
+            println!("  Stage with `git add`, then: fork-fold continue");
+            return Ok(Some(STOPPED));
         }
 
         let after = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
@@ -463,9 +454,9 @@ fn finalize(ctx: &Ctx, st: &State, previous: Option<&Lock>, write_lock: bool) ->
             Some(expected) if *expected == tree => {
                 println!("verified: reproduced the lock's tree exactly")
             }
-            Some(expected) => bail!(
-                "reproduction FAILED: built tree {tree} but the lock records {expected}"
-            ),
+            Some(expected) => {
+                bail!("reproduction FAILED: built tree {tree} but the lock records {expected}")
+            }
             None => println!("(no lock to verify against; lock not written in --locked mode)"),
         }
     }
@@ -494,7 +485,9 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         Some(base) => {
             if !git::has_commit(&ctx.repo, &base) {
                 if locked {
-                    bail!("pinned base {base} is not present locally and --locked forbids fetching");
+                    bail!(
+                        "pinned base {base} is not present locally and --locked forbids fetching"
+                    );
                 }
                 fetch_base(&ctx)?;
                 if !git::has_commit(&ctx.repo, &base) {
@@ -548,7 +541,11 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
                 println!(
                     "extending the locked build ({} new entr{})",
                     snapshot.len() - prefix_len,
-                    if snapshot.len() - prefix_len == 1 { "y" } else { "ies" }
+                    if snapshot.len() - prefix_len == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
                 );
                 start = prefix_len;
                 results = build.results.clone();
@@ -566,6 +563,10 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     }
 
     prepare_worktree(&ctx, &start_commit)?;
+    let seeded = rerere::seed(&ctx.root, &ctx.worktree)?;
+    if seeded > 0 {
+        println!("seeded {seeded} tracked rerere pair(s)");
+    }
     let mut st = State {
         next_index: start,
         base: base.clone(),
@@ -606,32 +607,47 @@ pub fn cont(root: &Path) -> Result<i32> {
 
     let stalled = st.next_index;
     if git_dir.join("MERGE_HEAD").exists() {
-        git::out(&ctx.worktree, &["commit", "--no-edit"])?;
         let entry = &ctx.manifest.entries[stalled];
-        resolution::record_from_merge_head(&ctx.root, &ctx.worktree, &entry.name)?;
+        // Read MERGE_RR before committing: the rerere-enabled commit records
+        // the postimages and clears it.
+        let merge_rr = rerere::merge_rr(&ctx.worktree)?;
+        git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+        let harvested = rerere::harvest(&ctx.root, &ctx.worktree)?;
+        rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
         let oid = git::out(&ctx.worktree, &["rev-parse", "HEAD^2"])?;
-        println!(
-            "  [{:2}/{}] {:<24} resolved; recorded {}",
-            stalled + 1,
-            ctx.manifest.entries.len(),
-            entry.name,
-            resolution::patch_rel(&entry.name)
-        );
+        if harvested.is_empty() {
+            println!(
+                "  [{:2}/{}] {:<24} resolved; WARNING: no rerere pair captured \
+                 (unrecognizable conflict) -- a rebuild will stop here again",
+                stalled + 1,
+                ctx.manifest.entries.len(),
+                entry.name,
+            );
+        } else {
+            println!(
+                "  [{:2}/{}] {:<24} resolved; harvested {} pair(s) into {}",
+                stalled + 1,
+                ctx.manifest.entries.len(),
+                entry.name,
+                harvested.len(),
+                rerere::DIR,
+            );
+        }
         st.results.push(EntryResult {
             name: entry.name.clone(),
             oid,
             status: "merged".into(),
             conflicted: true,
-            resolution: Some(resolution::patch_rel(&entry.name)),
+            resolution: Some(rerere::label(&harvested)),
         });
         // Persist the advance IMMEDIATELY: if the very next entry errors, a
         // stale index would re-merge this one and falsely report it EMPTY.
         st.next_index = stalled + 1;
         state::write(&ctx.worktree, &st)?;
-    } else if git_dir.join("MERGE_MSG").exists() || !git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty() {
-        // A stalled patch entry (or a proposed resolution the human staged
-        // without a merge in progress was already handled above): commit the
-        // staged patch-entry result.
+    } else if git_dir.join("MERGE_MSG").exists()
+        || !git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty()
+    {
+        // A stalled patch entry: commit the staged patch-entry result.
         let entry = &ctx.manifest.entries[stalled];
         if let Kind::Patch { .. } = &entry.kind {
             let message = format!("fork-fold: {}", entry.name);

@@ -6,7 +6,7 @@ into a single branch with tracked conflict resolutions.
 
 - `manifest.toml` -- intent: remotes, base, ordered entries.
 - `manifest.lock.json` -- fact: the OIDs and tree hash of the last build.
-- `resolutions/` -- tracked sidecar files replaying each conflicted merge.
+- `resolutions/rerere/` -- tracked rerere pairs replaying conflicted merges.
 - `patches/` -- patch entries (escape hatch for cross-topic semantic fixes).
 
 Common operations:

@@ -3,8 +3,9 @@
 //! If `[base].submodule` is set, that checkout is the source. Otherwise the
 //! base remote is auto-cloned into `.worktrees/source` on first use. Either
 //! way, every `[remotes]` name is materialized as a real git remote and
-//! rerere is explicitly disabled: resolutions must come from tracked files
-//! only, never from a machine-local cache.
+//! rerere is disabled in the repo config: builds enable it per-command and
+//! seed its cache exclusively from tracked pairs (see `rerere.rs`), so
+//! nothing ambient is ever recorded or consulted.
 
 use std::fs;
 use std::path::{Path, PathBuf};
