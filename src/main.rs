@@ -1,3 +1,12 @@
+mod engine;
+mod git;
+mod lock;
+mod manifest;
+mod ops;
+mod resolution;
+mod source;
+mod state;
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,8 +85,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Compare lock vs. manifest vs. live refs
-    Status,
+    /// Compare lock vs. manifest (offline; --live also checks remote heads)
+    Status {
+        /// Fetch live heads and report pins that are behind
+        #[arg(long)]
+        live: bool,
+    },
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
@@ -228,15 +241,7 @@ fn base_repo_slug(doc: &DocumentMut) -> Result<String> {
         .and_then(|r| r.get(base_remote))
         .and_then(Item::as_str)
         .with_context(|| format!("remote {base_remote:?} not defined under [remotes]"))?;
-    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    let tail = trimmed.rsplit(':').next().unwrap_or(trimmed);
-    let mut parts = tail.rsplit('/');
-    let repo = parts.next();
-    let owner = parts.next();
-    match (owner, repo) {
-        (Some(o), Some(r)) if !o.is_empty() && !r.is_empty() => Ok(format!("{o}/{r}")),
-        _ => bail!("cannot derive owner/repo from remote url {url:?}"),
-    }
+    manifest::slug_from_url(url)
 }
 
 fn open_prs_by(slug: &str, author: &str) -> Result<Vec<(i64, String)>> {
@@ -360,11 +365,25 @@ fn main() -> Result<()> {
             patch,
             prs_from,
         } => add(target, pr, patch, prs_from),
-        Command::Build { .. } => bail!("not yet implemented"),
-        Command::Update { .. } => bail!("not yet implemented"),
-        Command::Continue => bail!("not yet implemented"),
-        Command::Remove { .. } => bail!("not yet implemented"),
-        Command::Prune { .. } => bail!("not yet implemented"),
-        Command::Status => bail!("not yet implemented"),
+        Command::Build { locked } => {
+            let code = engine::build(&std::env::current_dir()?, locked)?;
+            std::process::exit(code);
+        }
+        Command::Update { entries } => ops::update(&std::env::current_dir()?, &entries),
+        Command::Continue => {
+            let code = engine::cont(&std::env::current_dir()?)?;
+            std::process::exit(code);
+        }
+        Command::Remove { name } => {
+            let root = std::env::current_dir()?;
+            let earliest = manifest::remove_entries(&root, &[name])?;
+            println!(
+                "entry removed; the build suffix from position {} is invalidated -- run `fork-fold build`",
+                earliest + 1
+            );
+            Ok(())
+        }
+        Command::Prune { dry_run } => ops::prune(&std::env::current_dir()?, dry_run),
+        Command::Status { live } => ops::status(&std::env::current_dir()?, live),
     }
 }
