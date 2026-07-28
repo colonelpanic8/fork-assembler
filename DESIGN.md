@@ -173,6 +173,21 @@ Beyond `packages` and `devShells`, the fork-fold flake exports:
   `templates/maintenance/` and shared verbatim with `fork-fold init` via
   `include_str!`.
 
+## Agent-first operation
+
+fork-fold assumes its day-to-day operators are coding agents as much as
+humans. Consequences:
+
+- The maintenance template ships `AGENTS.md` (model + invariants +
+  operations), a `CLAUDE.md` pointer, and a project skill at
+  `.claude/skills/fork-fold/` covering status, appends, and the
+  conflict-resolution loop. These live canonically in
+  `templates/maintenance/` so `init`, the flake template, and any template
+  mirror cannot drift.
+- CLI output is written to be parsed by an agent mid-workflow: explicit
+  stopped-state messages naming the worktree and the next command, and
+  (planned) `status --json`.
+
 ## Implementation
 
 - **Rust**, single static binary, clap CLI, packaged via the flake.

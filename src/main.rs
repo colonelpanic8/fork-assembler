@@ -11,6 +11,9 @@ const TPL_GITIGNORE: &str = include_str!("../templates/maintenance/.gitignore");
 const TPL_JUSTFILE: &str = include_str!("../templates/maintenance/justfile");
 const TPL_README: &str = include_str!("../templates/maintenance/README.md");
 const TPL_MANIFEST: &str = include_str!("../templates/maintenance/manifest.toml");
+const TPL_AGENTS: &str = include_str!("../templates/maintenance/AGENTS.md");
+const TPL_CLAUDE: &str = include_str!("../templates/maintenance/CLAUDE.md");
+const TPL_SKILL: &str = include_str!("../templates/maintenance/.claude/skills/fork-fold/SKILL.md");
 
 #[derive(Parser)]
 #[command(name = "fork-fold", version, about)]
@@ -99,9 +102,15 @@ fn init(dir: PathBuf, upstream: Option<String>, base_ref: String, submodule: boo
         (".gitignore", TPL_GITIGNORE),
         ("justfile", TPL_JUSTFILE),
         ("README.md", TPL_README),
+        ("AGENTS.md", TPL_AGENTS),
+        ("CLAUDE.md", TPL_CLAUDE),
+        (".claude/skills/fork-fold/SKILL.md", TPL_SKILL),
     ];
     for (name, content) in static_files {
         let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         if !path.exists() {
             fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
         }
