@@ -13,7 +13,7 @@ const TPL_README: &str = include_str!("../templates/maintenance/README.md");
 const TPL_MANIFEST: &str = include_str!("../templates/maintenance/manifest.toml");
 const TPL_AGENTS: &str = include_str!("../templates/maintenance/AGENTS.md");
 const TPL_CLAUDE: &str = include_str!("../templates/maintenance/CLAUDE.md");
-const TPL_SKILL: &str = include_str!("../templates/maintenance/.claude/skills/fork-fold/SKILL.md");
+const TPL_SKILL: &str = include_str!("../templates/maintenance/.agents/skills/fork-fold/SKILL.md");
 
 #[derive(Parser)]
 #[command(name = "fork-fold", version, about)]
@@ -104,7 +104,7 @@ fn init(dir: PathBuf, upstream: Option<String>, base_ref: String, submodule: boo
         ("README.md", TPL_README),
         ("AGENTS.md", TPL_AGENTS),
         ("CLAUDE.md", TPL_CLAUDE),
-        (".claude/skills/fork-fold/SKILL.md", TPL_SKILL),
+        (".agents/skills/fork-fold/SKILL.md", TPL_SKILL),
     ];
     for (name, content) in static_files {
         let path = dir.join(name);
@@ -116,6 +116,16 @@ fn init(dir: PathBuf, upstream: Option<String>, base_ref: String, submodule: boo
         }
     }
     fs::write(&manifest_path, manifest)?;
+    // Per-agent skill discovery paths point at the canonical .agents/skills.
+    #[cfg(unix)]
+    for agent_dir in [".claude/skills", ".codex/skills"] {
+        let link_dir = dir.join(agent_dir);
+        fs::create_dir_all(&link_dir)?;
+        let link = link_dir.join("fork-fold");
+        if !link.exists() && fs::symlink_metadata(&link).is_err() {
+            std::os::unix::fs::symlink("../../.agents/skills/fork-fold", &link)?;
+        }
+    }
     for sub in ["resolutions", "patches"] {
         let path = dir.join(sub);
         fs::create_dir_all(&path)?;

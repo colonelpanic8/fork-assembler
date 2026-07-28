@@ -53,6 +53,14 @@ When a build stops on a conflict:
 When a build stops with a PROPOSED resolution (a stale record replayed
 3-way), review the staged result, fix it if needed, then `fork-fold continue`.
 
+## Skills
+
+Reusable operation guides live under `.agents/skills/` in the open
+[Agent Skills](https://agentskills.io) format (`SKILL.md` with YAML
+frontmatter). `.claude/skills/` and `.codex/skills/` are symlinks into it so
+Claude Code and Codex discover the same skills; agents without a skills
+mechanism should read `.agents/skills/*/SKILL.md` directly.
+
 ## Committing
 
 Commit `manifest.toml`, `manifest.lock.json`, `resolutions/`, and `patches/`

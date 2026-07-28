@@ -179,11 +179,13 @@ fork-fold assumes its day-to-day operators are coding agents as much as
 humans. Consequences:
 
 - The maintenance template ships `AGENTS.md` (model + invariants +
-  operations), a `CLAUDE.md` pointer, and a project skill at
-  `.claude/skills/fork-fold/` covering status, appends, and the
-  conflict-resolution loop. These live canonically in
-  `templates/maintenance/` so `init`, the flake template, and any template
-  mirror cannot drift.
+  operations), a `CLAUDE.md` pointer, and a project skill covering status,
+  appends, and the conflict-resolution loop. The skill lives canonically at
+  `.agents/skills/fork-fold/` in the open Agent Skills format
+  (agentskills.io); `.claude/skills/` and `.codex/skills/` are relative
+  symlinks into it, so Claude Code and Codex share one copy and other agents
+  find it via AGENTS.md. All of this lives in `templates/maintenance/` so
+  `init`, the flake template, and any template mirror cannot drift.
 - CLI output is written to be parsed by an agent mid-workflow: explicit
   stopped-state messages naming the worktree and the next command, and
   (planned) `status --json`.
