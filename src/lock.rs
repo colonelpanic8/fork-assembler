@@ -77,6 +77,12 @@ pub struct SnapshotEntry {
     pub kind: String,
     pub source: String,
     pub pin: String,
+    /// Blob hash of the entry's coherence fixup, when it carries one. Part of
+    /// the snapshot so editing a fixup invalidates the suffix from its entry
+    /// and the next `build` redoes exactly that much — no `update` needed,
+    /// since a fixup is repo-local content, not a tracked remote ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixup: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -90,6 +96,10 @@ pub struct EntryResult {
     pub conflicted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+    /// Blob hash of the coherence fixup applied at the end of this entry's
+    /// step, when it carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixup: Option<String>,
 }
 
 pub fn load(root: &Path) -> Result<Option<Lock>> {
@@ -109,7 +119,13 @@ pub fn save(root: &Path, lock: &Lock) -> Result<()> {
     fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-pub fn snapshot(entries: &[Entry], pins: &BTreeMap<String, String>) -> Vec<SnapshotEntry> {
+/// `fixups` maps entry name -> fixup blob hash (see `engine::fixup_blobs`);
+/// entries without a fixup are simply absent.
+pub fn snapshot(
+    entries: &[Entry],
+    pins: &BTreeMap<String, String>,
+    fixups: &BTreeMap<String, String>,
+) -> Vec<SnapshotEntry> {
     entries
         .iter()
         .map(|entry| SnapshotEntry {
@@ -117,6 +133,7 @@ pub fn snapshot(entries: &[Entry], pins: &BTreeMap<String, String>) -> Vec<Snaps
             kind: entry.kind.kind_str().to_string(),
             source: entry.source(),
             pin: pins.get(&entry.name).cloned().unwrap_or_default(),
+            fixup: fixups.get(&entry.name).cloned(),
         })
         .collect()
 }
@@ -152,11 +169,20 @@ pub fn prefix_relation(lock: &Lock, current: &[SnapshotEntry], base_pin: &str) -
     }
     for (idx, locked) in build.manifest_entries.iter().enumerate() {
         if &current[idx] != locked {
-            return Prefix::Diverged(format!(
-                "entry {} ({}) changed, moved, or was repinned since the last build",
-                idx + 1,
-                locked.name
-            ));
+            // A fixup-only difference is the common repair-cycle case; naming
+            // it beats reporting a generic "changed, moved, or repinned".
+            let mut without_fixup = current[idx].clone();
+            without_fixup.fixup = locked.fixup.clone();
+            let reason = if current[idx].fixup != locked.fixup && without_fixup == *locked {
+                format!("entry {} ({})'s fixup changed", idx + 1, locked.name)
+            } else {
+                format!(
+                    "entry {} ({}) changed, moved, or was repinned since the last build",
+                    idx + 1,
+                    locked.name
+                )
+            };
+            return Prefix::Diverged(reason);
         }
     }
     if current.len() == build.manifest_entries.len() {

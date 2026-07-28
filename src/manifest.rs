@@ -44,6 +44,7 @@ struct RawEntry {
     pr: Option<i64>,
     remote: Option<String>,
     patch: Option<String>,
+    fixup: Option<String>,
     summary: Option<String>,
     note: Option<String>,
 }
@@ -66,6 +67,15 @@ pub struct Base {
 pub struct Entry {
     pub name: String,
     pub kind: Kind,
+    /// Coherence fixup: a tracked patch applied as part of THIS entry's step,
+    /// immediately after its merge commits. It exists because admitting this
+    /// entry alongside the ones before it breaks something no single branch
+    /// owns (two topics claiming one migration number, a resolution needing
+    /// an edit outside any conflict hunk). Binding it to the entry — rather
+    /// than to a standalone patch entry sitting later in the order — keeps
+    /// every entry boundary a coherent tree and makes the dependency visible
+    /// to `remove`/`prune`.
+    pub fixup: Option<String>,
     pub summary: Option<String>,
     pub note: Option<String>,
 }
@@ -187,9 +197,16 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
     if name.is_empty() || name == "base" {
         bail!("invalid entry name {name:?} (empty and \"base\" are reserved)");
     }
+    if raw.fixup.is_some() && matches!(kind, Kind::Patch { .. }) {
+        bail!(
+            "entry {name:?}: patch entries cannot carry a `fixup` \
+             (a patch that needs fixing up is just a patch that needs editing)"
+        );
+    }
     Ok(Entry {
         name,
         kind,
+        fixup: raw.fixup,
         summary: raw.summary,
         note: raw.note,
     })
@@ -259,9 +276,21 @@ pub fn slug_from_url(url: &str) -> Result<String> {
     }
 }
 
+/// What removing entries detached along with them.
+pub struct Removal {
+    /// Position of the earliest removed entry: the suffix invalidated.
+    pub earliest: usize,
+    /// (entry name, fixup path) for each removed entry that carried a
+    /// coherence fixup. The files are left on disk: a fixup is owned by the
+    /// *interaction* between entries, so when one side of that interaction
+    /// leaves (typically because it landed upstream), the incoherence it
+    /// repaired often persists and the patch needs re-homing rather than
+    /// deleting. Callers must surface these.
+    pub orphaned_fixups: Vec<(String, String)>,
+}
+
 /// Remove the named entries from manifest.toml (comment-preserving).
-/// Returns the position of the earliest removed entry.
-pub fn remove_entries(root: &Path, names: &[String]) -> Result<usize> {
+pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
     let manifest = load(root)?;
     let all = manifest.names();
     let mut indices = Vec::new();
@@ -275,6 +304,13 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<usize> {
     indices.sort_unstable();
     indices.dedup();
     let earliest = indices[0];
+    let orphaned_fixups = indices
+        .iter()
+        .filter_map(|idx| {
+            let entry = &manifest.entries[*idx];
+            entry.fixup.clone().map(|path| (entry.name.clone(), path))
+        })
+        .collect();
 
     let path = root.join(FILE);
     let mut doc = fs::read_to_string(&path)?
@@ -288,5 +324,45 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<usize> {
         arr.remove(*idx);
     }
     fs::write(&path, doc.to_string())?;
-    Ok(earliest)
+    Ok(Removal {
+        earliest,
+        orphaned_fixups,
+    })
+}
+
+/// Attach (`Some`) or detach (`None`) an entry's coherence fixup in
+/// manifest.toml. Returns the entry's position: the suffix a rebuild must
+/// redo, since the entry's own step now produces a different tree.
+pub fn set_fixup(root: &Path, name: &str, fixup: Option<&str>) -> Result<usize> {
+    let manifest = load(root)?;
+    let index = manifest
+        .entries
+        .iter()
+        .position(|e| e.name == name)
+        .with_context(|| format!("no entry named {name:?} in the manifest"))?;
+    if matches!(manifest.entries[index].kind, Kind::Patch { .. }) {
+        bail!(
+            "{name}: patch entries cannot carry a fixup; edit {} instead",
+            manifest.entries[index].source()
+        );
+    }
+
+    let path = root.join(FILE);
+    let mut doc = fs::read_to_string(&path)?
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let table = doc
+        .get_mut("entry")
+        .and_then(Item::as_array_of_tables_mut)
+        .context("manifest has no [[entry]] tables")?
+        .get_mut(index)
+        .context("entry vanished between load and edit")?;
+    match fixup {
+        Some(rel) => table["fixup"] = toml_edit::value(rel),
+        None => {
+            table.remove("fixup");
+        }
+    }
+    fs::write(&path, doc.to_string())?;
+    Ok(index)
 }

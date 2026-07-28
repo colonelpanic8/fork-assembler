@@ -44,13 +44,61 @@ The manifest is an ordered list of entries. There are exactly three kinds:
 - **branch** — `remote:branch`, the normal case: a live topic branch.
 - **pr** — a GitHub PR number, sugar for `refs/pull/N/head` on a named remote.
   Convenience for carrying other people's unmerged work.
-- **patch** — a tracked patch file applied on top. The escape hatch for
-  *semantic* conflicts between topics (e.g. two topics claim the same migration
-  number) that have no home on any single branch. A patch entry that exists
-  because a merge wasn't resolved properly is a smell; prefer a resolution.
+- **patch** — a standalone tracked patch file applied at its own position.
+  This is for content that genuinely belongs to no entry: site-local
+  customization that is not upstreamable and not anyone's merge fallout. A
+  patch entry that exists because a merge wasn't resolved properly is a smell;
+  prefer a resolution or a fixup.
 
 There is no separate "epilogue" phase — an epilogue is just a patch entry that
 happens to sit at the end.
+
+### Coherence fixups
+
+Branch and pr entries may additionally carry `fixup = "patches/thing.patch"`:
+a tracked patch applied **inside that entry's own step**, immediately after
+its merge commits, before the next entry merges.
+
+A fixup exists because admitting this entry alongside the ones before it
+breaks something no single branch owns — two topics claiming one migration
+number, a resolution needing an edit outside every conflict hunk. That is the
+same event as a conflicted merge, so it gets the same home: bound to the
+entry, harvested and replayed as part of its step. The `patch` entry kind
+stays for standalone content; a fixup is not a peer of the entries around it.
+
+Binding it there buys three things a trailing patch entry cannot:
+
+- **Every entry boundary is a coherent tree.** The invariant is per-entry, not
+  per-commit (the merge commit inside a step can still be momentarily
+  invalid) — which is exactly the granularity the lock and prefix-extension
+  already work at.
+- **The dependency is machine-readable.** `remove` and `prune` can see that a
+  patch existed to reconcile *this* entry and report it, instead of leaving an
+  anonymous patch entry to fail to apply — or, worse, apply cleanly and do
+  something no longer meaningful.
+- **One repair loop.** A build stops the same way for an unrecognized conflict
+  and for a fixup that no longer applies, and `fork-fold fixup ENTRY PATH
+  --capture` turns whatever the human did in the build worktree back into the
+  tracked patch.
+
+Fixups are **not pinned**. Their blob hash rides in the lock's manifest
+snapshot, so editing one invalidates from its entry exactly as repinning that
+entry would, and the next `build` picks it up with no `update` step — a fixup
+is repo-local content, not a tracked remote ref.
+
+Known limitation, by design: a fixup is really owned by an **edge**, not a
+node. "These two topics both claim migration 0042" is a property of the pair;
+attaching it to the later of the two is the only well-defined choice given
+manifest order, and it is visibly an approximation when that entry lands
+upstream and gets pruned while the incoherence survives. So removal never
+deletes a fixup file — it reports it as orphaned and leaves re-homing to the
+human. Better than a silent orphan; not the same as tracking the pair.
+
+Attachment *expresses* coherence; it does not *enforce* it. Nothing verifies
+that an entry boundary actually builds — a textually clean merge that is
+semantically broken still sails through, and the fixup mechanism only gives
+the eventual repair a correct home. Enforcement would be a per-entry check
+hook; see "Explicitly deferred".
 
 ### Resolutions
 
@@ -88,7 +136,8 @@ Mechanics:
 Known limitation, by design: rerere pairs capture only **conflicted-hunk**
 resolutions. Edits made outside conflict hunks while resolving, and conflicts
 rerere cannot handle (delete/modify, binary), are not captured — such content
-belongs in patch entries. The end-of-build lock tree hash remains the sole
+belongs in the entry's coherence fixup, which is applied in the same step as
+the resolution it completes. The end-of-build lock tree hash remains the sole
 verification invariant, so any uncaptured edit surfaces as a tree mismatch on
 reproduction, never as silent drift.
 
@@ -104,10 +153,10 @@ first build) and `build` (the last completed build: `commit`,
 `pre_provenance_commit`, `tree` — the pre-provenance content tree, the
 reproducibility invariant — `built_tree`, per-entry results with
 merged/absorbed/empty/applied status plus conflict/resolution info, and a
-snapshot of the manifest entries used to detect prefix-extension). Branch
-entries may carry `pr = N` as pure metadata: the PR the branch is published
-as, feeding provenance links and `add --prs-from` dedup without changing
-merge behavior.
+snapshot of the manifest entries used to detect prefix-extension, each
+carrying its entry's fixup blob hash when it has one). Branch entries may
+carry `pr = N` as pure metadata: the PR the branch is published as, feeding
+provenance links and `add --prs-from` dedup without changing merge behavior.
 
 ```toml
 # manifest.toml
@@ -126,9 +175,10 @@ branch = "mine:custom-snooze"
 [[entry]]
 pr = 3984                       # refs/pull/3984/head on `upstream` by default
 remote = "upstream"
+fixup = "patches/renumber-migration.patch"   # applied inside THIS entry's step
 
 [[entry]]
-patch = "patches/renumber-migration.patch"
+patch = "patches/site-local-branding.patch"  # standalone, at its own position
 ```
 
 ### Append machinery / incremental builds
@@ -164,7 +214,15 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   repairs incrementally — unchanged conflict hunks auto-resolve from the
   tracked pairs, and changed hunks stop for manual resolution entry by entry.
 - `continue` — resume after the human resolves a conflict; commits the merge
-  and harvests the new pairs into `resolutions/rerere/`.
+  and harvests the new pairs into `resolutions/rerere/`, then runs that
+  entry's fixup, since a resolution and its fixup are one step. Also resumes
+  a build stopped on a fixup that no longer applies, committing only the
+  fixup — the merge already happened and is never replayed.
+- `fixup ENTRY [PATH]` — attach a coherence fixup to an entry, `--capture` it
+  from the build worktree (its uncommitted changes, which at a fixup stall are
+  exactly the corrected patch; otherwise the entry's existing fixup commit),
+  or `--remove` to detach it. Attaching or editing a fixup changes what that
+  entry's step produces, so the next `build` redoes it.
 - `init` — scaffold a maintenance repository: `manifest.toml`, `resolutions/`,
   `patches/`, `flake.nix` (consuming `fork-fold.lib.mkMaintenanceShell`),
   `.envrc`, justfile. `--upstream URL` fills in the base remote; `--submodule`
@@ -176,10 +234,13 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   an entry that is already present is a reported no-op. `--prs-from USER`
   appends every open PR authored by USER on the base repo that is not already
   carried — safe to re-run any time to pick up only the new ones.
-- `remove` — remove an entry.
+- `remove` — remove an entry. Reports any coherence fixup it carried, leaving
+  the patch file on disk for re-homing.
 - `prune [--dry-run]` — drop entries whose changes have landed in the base:
   PR entries via the PR's merged state, branch entries via patch-id
-  containment (`git cherry`) against the pinned base.
+  containment (`git cherry`) against the pinned base. Reports orphaned fixups
+  the same way `remove` does — a topic landing upstream rarely dissolves the
+  incoherence its fixup repaired.
 - `status` — lock vs. manifest vs. live refs: what's stale, what an incremental
   build would do, and which entries look merged upstream (prune candidates).
 
@@ -261,6 +322,17 @@ humans. Consequences:
 
 ## Explicitly deferred (not v1)
 
+- **Per-entry checks** — the enforcement half of coherence fixups: a
+  `check = "cargo test"` run at each entry boundary during `build`, turning
+  "every boundary is coherent" from a convention into a verified property.
+  Deferred because it is O(n) test runs per assembly; it should be opt-in
+  (`build --check`) and ideally skip boundaries whose inputs did not move.
+- **Residue harvesting** — auto-capturing the out-of-hunk part of a manual
+  resolution into the entry's fixup. Computable: replay the merge with the
+  harvested rerere pairs seeded and diff against what was actually committed;
+  whatever differs is the residue. Deferred because a wrong auto-generated
+  patch is worse than an absent one. Today `continue` warns instead, and
+  `fixup --capture` makes recording it a single command.
 - **Groups** — nested manifests whose assembled branch is one entry in a
   parent manifest. Add when a consumer has a repeatedly-conflicting subsystem
   cluster.

@@ -17,9 +17,13 @@ topic branches into a single branch, with tracked conflict resolutions.
   leaks in) and auto-resolves recognized conflicts.
   `resolutions/rerere/INDEX.toml` records which entry produced which pairs —
   informational only, never load-bearing.
-- `patches/` holds patch entries: the escape hatch for cross-topic semantic
-  fixes with no home on any single branch, including edits a resolution
-  needs OUTSIDE conflict hunks (rerere pairs cannot capture those).
+- `patches/` holds two things. A **coherence fixup** (`fixup = "..."` on a
+  branch or pr entry) is applied inside THAT entry's own step, right after
+  its merge: it repairs what admitting the entry alongside the earlier ones
+  broke — a cross-topic semantic clash, or an edit a resolution needs OUTSIDE
+  the conflict hunks (rerere pairs cannot capture those). A standalone
+  **patch entry** (`patch = "..."`) applies at its own position and is for
+  content belonging to no entry, such as site-local customization.
 
 ## Invariants — do not violate
 
@@ -34,11 +38,18 @@ topic branches into a single branch, with tracked conflict resolutions.
   or let a machine-local cache feed a build.
 - Rerere pairs capture only conflicted-hunk resolutions. If a correct
   resolution also needs edits outside the conflict hunks, put those edits in
-  a patch entry — a rebuild will otherwise surface them as a tree mismatch.
-  The lock's tree hash is the sole verification invariant.
+  the entry's coherence fixup — a rebuild will otherwise surface them as a
+  tree mismatch. The lock's tree hash is the sole verification invariant.
+- Every entry boundary should be a coherent tree. A cross-entry repair
+  belongs on the entry that made it necessary (its `fixup`), not in a patch
+  entry parked at the end of the stack.
+- A fixup repairs an interaction BETWEEN entries. When `remove` or `prune`
+  reports one as orphaned, decide explicitly whether to re-home it onto the
+  surviving entry or delete it — a topic landing upstream usually does not
+  dissolve the incoherence.
 - Appending entries is cheap (incremental build of the tail). Reordering or
-  removing entries invalidates every later entry's build — expect
-  re-resolution from that point.
+  removing entries, or editing a fixup, invalidates every later entry's
+  build — expect re-resolution from that point.
 
 ## Operations
 
@@ -46,8 +57,11 @@ topic branches into a single branch, with tracked conflict resolutions.
 fork-fold status                 # lock vs. manifest vs. live refs; flags merged entries
 fork-fold add REMOTE:BRANCH      # append a topic branch entry
 fork-fold add --pr N             # append a PR entry
-fork-fold add --patch FILE       # append a patch entry
+fork-fold add --patch FILE       # append a standalone patch entry
 fork-fold add --prs-from USER    # append USER's open PRs not already carried (idempotent)
+fork-fold fixup ENTRY FILE       # attach a coherence fixup to ENTRY's own step
+fork-fold fixup ENTRY FILE --capture   # ...writing FILE from the build worktree
+fork-fold fixup ENTRY --remove   # detach it (the patch file stays on disk)
 fork-fold build                  # assemble from lock pins; incremental for appends
 fork-fold build --locked         # reproduce exactly; no network, no new pins
 fork-fold update [ENTRY...]      # batch bump: repin base + entries to live heads
@@ -66,10 +80,17 @@ When a build stops on a conflict:
    `.worktrees/`).
 2. Stage the resolutions with `git add`.
 3. Run `fork-fold continue` — it harvests the conflict's preimage/postimage
-   pair into `resolutions/rerere/` and updates the informational index.
+   pair into `resolutions/rerere/`, updates the informational index, and runs
+   that entry's fixup if it has one.
 4. Run `fork-fold build --locked` after the repair completes to prove the
    tracked pairs reproduce the lock's tree.
 5. Commit the manifest, lock, and tracked pairs together.
+
+When a build stops on a fixup that no longer applies, the entry's merge is
+already committed and only the fixup is owed. Repair the worktree, then
+`fork-fold fixup ENTRY FILE --capture` and rebuild, so the patch file matches
+what ships. `git add` plus `fork-fold continue` commits the resolution once
+but leaves the patch stale, and the next rebuild stops in the same place.
 
 ## Skills
 

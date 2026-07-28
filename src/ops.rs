@@ -119,6 +119,13 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         if recorded.contains(&entry.name) {
             flags.push("rerere resolution".to_string());
         }
+        if let Some(fixup) = &entry.fixup {
+            if root.join(fixup).exists() {
+                flags.push(format!("fixup {fixup}"));
+            } else {
+                flags.push(format!("fixup {fixup} MISSING -- build will fail"));
+            }
+        }
         if let Some(result) = results.get(entry.name.as_str()) {
             if result.status != "merged" && result.status != "applied" {
                 flags.push(format!("last build: {}", result.status.to_uppercase()));
@@ -163,7 +170,8 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         Some(build) => {
             println!("\nlast build: commit {}", short(&build.commit));
             println!("  tree {} ({} conflicts)", build.tree, build.conflicts);
-            let snapshot = lock::snapshot(&m.entries, &lock.pins.entries);
+            let fixups = engine::fixup_blobs(root, &m.entries, false)?;
+            let snapshot = lock::snapshot(&m.entries, &lock.pins.entries, &fixups);
             let base_pin = lock.pins.base.clone().unwrap_or_default();
             match lock::prefix_relation(&lock, &snapshot, &base_pin) {
                 Prefix::Exact => println!("  manifest matches the lock: `build` is a no-op"),
@@ -218,12 +226,111 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
         );
         return Ok(());
     }
-    let earliest = manifest::remove_entries(root, &dead)?;
+    let removal = manifest::remove_entries(root, &dead)?;
     println!(
         "removed {} entr{}; the build suffix from position {} is invalidated -- run `fork-fold build`",
         dead.len(),
         if dead.len() == 1 { "y" } else { "ies" },
-        earliest + 1
+        removal.earliest + 1
+    );
+    report_orphaned_fixups(&removal);
+    Ok(())
+}
+
+/// A coherence fixup repairs an interaction BETWEEN entries, so removing one
+/// side does not mean the incoherence is gone — an entry that landed upstream
+/// usually still clashes with the topic it clashed with before. Surface the
+/// detached patch instead of letting it silently vanish from the build.
+pub fn report_orphaned_fixups(removal: &manifest::Removal) {
+    for (name, path) in &removal.orphaned_fixups {
+        println!(
+            "  NOTE: {name} carried the coherence fixup {path}, now unreferenced.\n  \
+             {path} is left on disk: if the incoherence it repaired survives the removal, \
+             re-home it with `fork-fold fixup OTHER_ENTRY {path}`; otherwise delete it."
+        );
+    }
+}
+
+/// Attach, re-capture, or detach an entry's coherence fixup.
+pub fn fixup(
+    root: &Path,
+    name: &str,
+    path: Option<&str>,
+    capture: bool,
+    remove: bool,
+) -> Result<()> {
+    if remove {
+        let index = manifest::set_fixup(root, name, None)?;
+        println!("detached {name}'s coherence fixup (the patch file is left in place)");
+        println!("entry {} changed -- run `fork-fold build`", index + 1);
+        return Ok(());
+    }
+    let Some(rel) = path else {
+        bail!("pass the fixup's patch path, or --remove to detach it");
+    };
+
+    if capture {
+        let worktree = root.join(engine::WORKTREE);
+        if !worktree.exists() {
+            bail!(
+                "no build worktree at {} to capture from; run `fork-fold build` first",
+                worktree.display()
+            );
+        }
+        let dest = root.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let (diff, source) = capture_diff(&worktree, name)?;
+        if diff.is_empty() {
+            bail!(
+                "nothing to capture: the build worktree has no uncommitted changes and no \
+                 `fork-fold: fixup {name}` commit"
+            );
+        }
+        std::fs::write(&dest, diff)?;
+        println!("captured {rel} from {source}");
+        // A capture during a stalled build supersedes that build: the fixup
+        // blob just changed, so the stalled worktree can only be rebuilt.
+        let _ = crate::state::clear(&worktree);
+    } else if !root.join(rel).exists() {
+        bail!(
+            "patch file {rel} does not exist (pass --capture to write it from the build worktree)"
+        );
+    }
+
+    let index = manifest::set_fixup(root, name, Some(rel))?;
+    println!("{name}: coherence fixup set to {rel}");
+    println!(
+        "entry {} now produces a different tree -- run `fork-fold build`",
+        index + 1
     );
     Ok(())
+}
+
+/// The diff a capture should record: the build worktree's uncommitted changes
+/// when there are any (the state at a fixup stall — precisely the corrected
+/// fixup), else the entry's already-committed fixup commit (the state after
+/// `continue` committed a manual resolution).
+fn capture_diff(worktree: &Path, name: &str) -> Result<(Vec<u8>, String)> {
+    // Intent-to-add so newly created files appear in the diff.
+    let _ = git::raw(worktree, &["add", "-A", "-N"]);
+    let pending = git::bytes(worktree, &["diff", "--binary", "HEAD"])?;
+    if !pending.is_empty() {
+        return Ok((pending, "the build worktree's uncommitted changes".into()));
+    }
+    let subject = format!("fork-fold: fixup {name}");
+    let log = git::out(worktree, &["log", "--format=%H%x1f%s"])?;
+    let commit = log
+        .lines()
+        .find_map(|line| line.split_once('\x1f').filter(|(_, s)| *s == subject))
+        .map(|(hash, _)| hash.to_string());
+    let Some(commit) = commit else {
+        return Ok((Vec::new(), String::new()));
+    };
+    let diff = git::bytes(worktree, &["show", "--binary", "--format=", &commit])?;
+    Ok((
+        diff,
+        format!("commit {} ({subject})", &commit[..12.min(commit.len())]),
+    ))
 }

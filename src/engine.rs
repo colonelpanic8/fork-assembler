@@ -80,6 +80,30 @@ pub fn patch_blob(root: &Path, rel: &str) -> Result<String> {
     git::out(root, &["hash-object", &path.to_string_lossy()])
 }
 
+/// Blob hash per entry carrying a coherence fixup, for lock snapshots.
+/// `strict` fails on a missing file (what `build` wants); otherwise the entry
+/// is left out of the map (what `status` wants, so it can still report).
+pub fn fixup_blobs(
+    root: &Path,
+    entries: &[Entry],
+    strict: bool,
+) -> Result<BTreeMap<String, String>> {
+    let mut blobs = BTreeMap::new();
+    for entry in entries {
+        let Some(rel) = &entry.fixup else { continue };
+        match patch_blob(root, rel) {
+            Ok(blob) => {
+                blobs.insert(entry.name.clone(), blob);
+            }
+            Err(err) if strict => {
+                return Err(err.context(format!("{}: coherence fixup", entry.name)))
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(blobs)
+}
+
 /// Resolve the pin for one entry, pinning from live refs when permitted.
 fn ensure_pin(
     ctx: &Ctx,
@@ -179,9 +203,10 @@ fn merge_entry(ctx: &Ctx, entry: &Entry, oid: &str) -> Result<bool> {
     Ok(out.status.success())
 }
 
-/// Apply one patch entry. Ok(true) = applied or already applied; Ok(false) =
-/// failed, conflict left for the human.
-fn apply_patch_entry(ctx: &Ctx, entry: &Entry, rel: &str) -> Result<Option<&'static str>> {
+/// Apply a tracked patch file and commit it as `message`. `Some(outcome)` =
+/// applied or already applied; `None` = failed, conflict left for the human.
+/// Shared by patch entries and coherence fixups.
+fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Option<&'static str>> {
     let patch = ctx.root.join(rel);
     let patch_str = patch.to_string_lossy().to_string();
 
@@ -208,9 +233,56 @@ fn apply_patch_entry(ctx: &Ctx, entry: &Entry, rel: &str) -> Result<Option<&'sta
     if git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty() {
         return Ok(Some("already applied"));
     }
-    let message = format!("fork-fold: {}", entry.name);
-    git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
+    git::out(&ctx.worktree, &["commit", "-q", "-m", message])?;
     Ok(Some("applied"))
+}
+
+/// Complete an entry's step: apply its coherence fixup, if any, then record
+/// the result and advance. Applying the fixup HERE — inside the entry's step,
+/// not as a later standalone entry — is what makes every entry boundary a
+/// coherent tree.
+///
+/// Returns false when the fixup needs a human. The merge is already committed
+/// at that point, so the merge's result is held in `state.pending`: its
+/// presence is how `continue` knows to resume at the fixup rather than
+/// re-running the merge.
+fn finish_entry(
+    ctx: &Ctx,
+    st: &mut State,
+    index: usize,
+    entry: &Entry,
+    label: &str,
+    mut result: EntryResult,
+) -> Result<bool> {
+    if let Some(rel) = &entry.fixup {
+        let blob = patch_blob(&ctx.root, rel)?;
+        let message = format!("fork-fold: fixup {}", entry.name);
+        match apply_patch_file(ctx, rel, &message)? {
+            Some(outcome) => {
+                println!("  {label} fixup {rel}: {outcome}");
+                result.fixup = Some(blob);
+            }
+            None => {
+                st.pending = Some(result);
+                st.next_index = index;
+                state::write(&ctx.worktree, st)?;
+                println!("\n  {label} fixup {rel} FAILED to apply");
+                println!("  The merge is committed; only the fixup is outstanding.");
+                println!("  Resolve the markers in: {}", ctx.worktree.display());
+                println!("  Then re-capture the corrected fixup and rebuild:");
+                println!("      fork-fold fixup {} {rel} --capture", entry.name);
+                println!("      fork-fold build");
+                println!("  Or commit this resolution once, leaving {rel} stale:");
+                println!("      git add -A && fork-fold continue");
+                return Ok(false);
+            }
+        }
+    }
+    st.results.push(result);
+    st.pending = None;
+    st.next_index = index + 1;
+    state::write(&ctx.worktree, st)?;
+    Ok(true)
 }
 
 /// The core loop: process entries[start..], persisting state after each.
@@ -228,16 +300,21 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
 
         if let Kind::Patch { path } = &entry.kind {
             let rel = path.clone();
-            match apply_patch_entry(ctx, entry, &rel)? {
+            let message = format!("fork-fold: {}", entry.name);
+            match apply_patch_file(ctx, &rel, &message)? {
                 Some(outcome) => {
                     println!("  {label} {outcome}");
-                    st.results.push(EntryResult {
+                    let result = EntryResult {
                         name: entry.name.clone(),
                         oid,
                         status: "applied".into(),
                         conflicted: false,
                         resolution: None,
-                    });
+                        fixup: None,
+                    };
+                    // Patch entries cannot carry a fixup (manifest rejects
+                    // it), so this only records and advances.
+                    finish_entry(ctx, st, index, entry, &label, result)?;
                 }
                 None => {
                     st.next_index = index;
@@ -248,22 +325,26 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
                     return Ok(Some(STOPPED));
                 }
             }
-            st.next_index = index + 1;
-            state::write(&ctx.worktree, st)?;
             continue;
         }
 
         if git::ok(&ctx.repo, &["merge-base", "--is-ancestor", &oid, &st.base]) {
             println!("  {label} ABSORBED upstream -- drop candidate");
-            st.results.push(EntryResult {
+            // The fixup still runs: this entry's content reaching the tree via
+            // the base rather than via a merge does not mean the incoherence
+            // it repaired went away. If it did, the fixup reports "already
+            // applied"; if it did not, it applies as usual.
+            let result = EntryResult {
                 name: entry.name.clone(),
                 oid,
                 status: "absorbed".into(),
                 conflicted: false,
                 resolution: None,
-            });
-            st.next_index = index + 1;
-            state::write(&ctx.worktree, st)?;
+                fixup: None,
+            };
+            if !finish_entry(ctx, st, index, entry, &label, result)? {
+                return Ok(Some(STOPPED));
+            }
             continue;
         }
 
@@ -282,15 +363,17 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
                     .collect();
                 git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
                 println!("  {label} auto-resolved from tracked rerere pairs");
-                st.results.push(EntryResult {
+                let result = EntryResult {
                     name: entry.name.clone(),
                     oid,
                     status: "merged".into(),
                     conflicted: true,
                     resolution: Some(rerere::label(&hashes)),
-                });
-                st.next_index = index + 1;
-                state::write(&ctx.worktree, st)?;
+                    fixup: None,
+                };
+                if !finish_entry(ctx, st, index, entry, &label, result)? {
+                    return Ok(Some(STOPPED));
+                }
                 continue;
             }
             st.next_index = index;
@@ -312,15 +395,17 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
             println!("  {label} merged {}", &oid[..12.min(oid.len())]);
             "merged"
         };
-        st.results.push(EntryResult {
+        let result = EntryResult {
             name: entry.name.clone(),
             oid,
             status: status.into(),
             conflicted: false,
             resolution: None,
-        });
-        st.next_index = index + 1;
-        state::write(&ctx.worktree, st)?;
+            fixup: None,
+        };
+        if !finish_entry(ctx, st, index, entry, &label, result)? {
+            return Ok(Some(STOPPED));
+        }
     }
     Ok(None)
 }
@@ -350,6 +435,9 @@ fn provenance_json(ctx: &Ctx, st: &State, base: &str) -> Result<serde_json::Valu
             }
             if let Kind::Branch { branch, .. } = &entry.kind {
                 obj.insert("branch".into(), json!(branch));
+            }
+            if let Some(fixup) = &entry.fixup {
+                obj.insert("fixup".into(), json!(fixup));
             }
             if let Some(summary) = &entry.summary {
                 obj.insert("summary".into(), json!(summary));
@@ -443,7 +531,11 @@ fn finalize(ctx: &Ctx, st: &State, previous: Option<&Lock>, write_lock: bool) ->
             previous_tree: previous_tree.clone(),
             tree_changed: previous_tree.as_deref() != Some(tree.as_str()),
             conflicts: st.conflicts,
-            manifest_entries: lock::snapshot(&ctx.manifest.entries, &st.pins),
+            manifest_entries: lock::snapshot(
+                &ctx.manifest.entries,
+                &st.pins,
+                &fixup_blobs(&ctx.root, &ctx.manifest.entries, true)?,
+            ),
             results: st.results.clone(),
         });
         lock::save(&ctx.root, &lock)?;
@@ -510,8 +602,11 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         ensure_pin(&ctx, entry, &mut pins, locked)?;
     }
 
-    // Decide full rebuild vs incremental extension vs up-to-date.
-    let snapshot = lock::snapshot(&ctx.manifest.entries, &pins);
+    // Decide full rebuild vs incremental extension vs up-to-date. Fixup blobs
+    // ride in the snapshot, so editing one invalidates from its entry exactly
+    // as repinning that entry would.
+    let fixups = fixup_blobs(&ctx.root, &ctx.manifest.entries, true)?;
+    let snapshot = lock::snapshot(&ctx.manifest.entries, &pins, &fixups);
     let mut start = 0usize;
     let mut extended_from = None;
     let mut results: Vec<EntryResult> = Vec::new();
@@ -574,6 +669,7 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         results,
         conflicts: 0,
         extended_from,
+        pending: None,
     };
     state::write(&ctx.worktree, &st)?;
 
@@ -606,7 +702,48 @@ pub fn cont(root: &Path) -> Result<i32> {
     }
 
     let stalled = st.next_index;
-    if git_dir.join("MERGE_HEAD").exists() {
+    let total = ctx.manifest.entries.len();
+    let label = |index: usize, name: &str| format!("[{:2}/{total}] {name:<24}", index + 1);
+
+    if let Some(mut pending) = st.pending.take() {
+        // Stalled in a fixup: the merge is already committed, so only the
+        // fixup's staged content needs a commit. Re-running the merge here
+        // would duplicate it.
+        let entry = &ctx.manifest.entries[stalled];
+        let rel = entry.fixup.clone().with_context(|| {
+            format!(
+                "{}: the build stalled in a coherence fixup but the manifest no longer \
+                 declares one; abandon the worktree and rebuild",
+                entry.name
+            )
+        })?;
+        if git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty() {
+            bail!(
+                "{}: nothing staged for the fixup {rel}; resolve it and `git add`, \
+                 or detach it with `fork-fold fixup {} --remove`",
+                entry.name,
+                entry.name
+            );
+        }
+        let message = format!("fork-fold: fixup {}", entry.name);
+        git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
+        pending.fixup = Some(patch_blob(&ctx.root, &rel)?);
+        st.results.push(pending);
+        st.next_index = stalled + 1;
+        state::write(&ctx.worktree, &st)?;
+        println!(
+            "  {} fixup committed as resolved",
+            label(stalled, &entry.name)
+        );
+        // The lock now pins a fixup blob whose patch does NOT reproduce what
+        // was just committed, so a rebuild stalls here again. Say so plainly.
+        println!(
+            "  WARNING: {rel} still holds the version that failed; re-capture it with \
+             `fork-fold fixup {} {rel} --capture` after this build, or the next \
+             rebuild stops here again",
+            entry.name
+        );
+    } else if git_dir.join("MERGE_HEAD").exists() {
         let entry = &ctx.manifest.entries[stalled];
         // Read MERGE_RR before committing: the rerere-enabled commit records
         // the postimages and clears it.
@@ -615,35 +752,34 @@ pub fn cont(root: &Path) -> Result<i32> {
         let harvested = rerere::harvest(&ctx.root, &ctx.worktree)?;
         rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
         let oid = git::out(&ctx.worktree, &["rev-parse", "HEAD^2"])?;
+        let label = label(stalled, &entry.name);
         if harvested.is_empty() {
             println!(
-                "  [{:2}/{}] {:<24} resolved; WARNING: no rerere pair captured \
-                 (unrecognizable conflict) -- a rebuild will stop here again",
-                stalled + 1,
-                ctx.manifest.entries.len(),
-                entry.name,
+                "  {label} resolved; WARNING: no rerere pair captured \
+                 (unrecognizable conflict) -- a rebuild will stop here again"
             );
         } else {
             println!(
-                "  [{:2}/{}] {:<24} resolved; harvested {} pair(s) into {}",
-                stalled + 1,
-                ctx.manifest.entries.len(),
-                entry.name,
+                "  {label} resolved; harvested {} pair(s) into {}",
                 harvested.len(),
                 rerere::DIR,
             );
         }
-        st.results.push(EntryResult {
+        let result = EntryResult {
             name: entry.name.clone(),
             oid,
             status: "merged".into(),
             conflicted: true,
             resolution: Some(rerere::label(&harvested)),
-        });
-        // Persist the advance IMMEDIATELY: if the very next entry errors, a
-        // stale index would re-merge this one and falsely report it EMPTY.
-        st.next_index = stalled + 1;
-        state::write(&ctx.worktree, &st)?;
+            fixup: None,
+        };
+        // finish_entry persists the advance IMMEDIATELY: if the very next
+        // entry errors, a stale index would re-merge this one and falsely
+        // report it EMPTY. It also runs this entry's fixup, which can stall
+        // in turn — the resolution and its fixup are one step.
+        if !finish_entry(&ctx, &mut st, stalled, entry, &label, result)? {
+            return Ok(STOPPED);
+        }
     } else if git_dir.join("MERGE_MSG").exists()
         || !git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty()
     {
@@ -659,6 +795,7 @@ pub fn cont(root: &Path) -> Result<i32> {
                 status: "applied".into(),
                 conflicted: true,
                 resolution: None,
+                fixup: None,
             });
             st.next_index = stalled + 1;
             state::write(&ctx.worktree, &st)?;

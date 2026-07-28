@@ -39,9 +39,40 @@ build completed.
 4. Commit the new tracked pairs under `resolutions/rerere/`, their
    informational `INDEX.toml`, the manifest, and the lock together.
 
-Rerere pairs capture only conflicted hunks. If correctness requires an edit
-outside those hunks, put that change in a tracked patch entry; the tree
-invariant will otherwise expose the missing edit.
+## Coherence fixups
+
+Rerere pairs capture only conflicted hunks. When correctness needs something
+those pairs cannot hold — an edit outside every conflict hunk, or a semantic
+clash between topics that is textually clean (two topics claiming one
+migration number) — record it as the entry's **coherence fixup**, not as a
+patch entry sitting later in the order:
+
+```sh
+fork-fold fixup ENTRY patches/thing.patch --capture   # from the build worktree
+fork-fold build
+```
+
+Attach it to the entry whose admission caused the problem — normally the
+later of the interacting entries. It is then applied inside that entry's own
+step, right after its merge, so no entry boundary is ever an invalid tree.
+Reserve standalone `--patch` entries for content that belongs to no entry at
+all, such as site-local customization.
+
+`--capture` writes the patch from the build worktree: its uncommitted changes
+when there are any (at a fixup stall, precisely the corrected patch), else the
+entry's existing `fork-fold: fixup ENTRY` commit. Fixups are not pinned, so
+editing one needs no `update` — the next `build` picks it up.
+
+When a build stops on a fixup that no longer applies, the entry's merge is
+already committed and only the fixup is outstanding. Repair the worktree,
+re-capture, and rebuild. You may instead `git add` and `fork-fold continue` to
+commit that resolution once, but the patch file then no longer describes what
+shipped and the next rebuild stops in the same place — re-capture afterwards.
+
+When `remove` or `prune` reports an orphaned fixup, decide explicitly: a fixup
+repairs an interaction *between* entries, so a topic landing upstream usually
+does not dissolve the incoherence. Re-home the patch onto the surviving entry
+or delete it; do not leave the question open.
 
 ## Bumping to current upstream
 
@@ -60,7 +91,8 @@ invariant will otherwise expose the missing edit.
 Run `fork-fold status --live` to identify entries contained in the updated
 base. In the same repair cycle, update the base past the merge, run
 `fork-fold prune --dry-run`, prune the dead entries, and rebuild. Report which
-entries were pruned and why.
+entries were pruned and why, and resolve any orphaned fixups the prune
+reported.
 
 ## Verification
 

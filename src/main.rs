@@ -60,7 +60,7 @@ enum Command {
         /// Entries to repin (default: base and all entries)
         entries: Vec<String>,
     },
-    /// Resume a build stopped on a conflict; harvest its rerere pairs
+    /// Resume a build stopped on a conflict or a fixup; harvest its rerere pairs
     Continue,
     /// Append entries to the manifest (idempotent)
     Add {
@@ -69,13 +69,29 @@ enum Command {
         /// PR number (refs/pull/N/head on the base remote)
         #[arg(long)]
         pr: Option<u64>,
-        /// Tracked patch file applied on top
+        /// Standalone patch entry at its own position (for a cross-entry
+        /// repair, attach a fixup to the responsible entry instead)
         #[arg(long)]
         patch: Option<String>,
         /// Append every open PR authored by this user on the base repo that
         /// is not already carried
         #[arg(long, value_name = "USER")]
         prs_from: Option<String>,
+    },
+    /// Attach a coherence fixup to an entry: a patch applied as part of that
+    /// entry's own merge step, so the entry boundary is never an invalid tree
+    Fixup {
+        /// Entry the fixup belongs to (the one whose admission broke coherence)
+        entry: String,
+        /// Patch file, relative to the repository root
+        path: Option<String>,
+        /// Write PATH from the build worktree first: its uncommitted changes,
+        /// or the entry's existing fixup commit when the worktree is clean
+        #[arg(long, requires = "path")]
+        capture: bool,
+        /// Detach the entry's fixup (the patch file is left in place)
+        #[arg(long, conflicts_with_all = ["path", "capture"])]
+        remove: bool,
     },
     /// Remove an entry from the manifest
     Remove { name: String },
@@ -391,13 +407,26 @@ fn main() -> Result<()> {
             let code = engine::cont(&std::env::current_dir()?)?;
             std::process::exit(code);
         }
+        Command::Fixup {
+            entry,
+            path,
+            capture,
+            remove,
+        } => ops::fixup(
+            &std::env::current_dir()?,
+            &entry,
+            path.as_deref(),
+            capture,
+            remove,
+        ),
         Command::Remove { name } => {
             let root = std::env::current_dir()?;
-            let earliest = manifest::remove_entries(&root, &[name])?;
+            let removal = manifest::remove_entries(&root, &[name])?;
             println!(
                 "entry removed; the build suffix from position {} is invalidated -- run `fork-fold build`",
-                earliest + 1
+                removal.earliest + 1
             );
+            ops::report_orphaned_fixups(&removal);
             Ok(())
         }
         Command::Prune { dry_run } => ops::prune(&std::env::current_dir()?, dry_run),

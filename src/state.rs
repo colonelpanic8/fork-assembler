@@ -28,6 +28,12 @@ pub struct State {
     pub conflicts: u32,
     /// Set when the run resumed an incremental extension.
     pub extended_from: Option<String>,
+    /// The result of entry `next_index`'s merge, held back because its
+    /// coherence fixup then failed to apply. Its presence is what tells
+    /// `continue` the stall is in the fixup and the merge has ALREADY
+    /// committed — re-running the merge would be wrong.
+    #[serde(default)]
+    pub pending: Option<EntryResult>,
 }
 
 fn state_path(worktree: &Path) -> Result<PathBuf> {
