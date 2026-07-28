@@ -23,5 +23,9 @@
           pkgs = nixpkgs.legacyPackages.${system};
         };
       });
+
+      # The checked-in skill is only a discovery stub. Its full instructions
+      # are loaded from this value, which follows the pinned fork-fold input.
+      lib.forkFoldAgentGuide = fork-fold.lib.agentGuide;
     };
 }

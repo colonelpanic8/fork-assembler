@@ -43,6 +43,11 @@
     // {
       overlays.default = final: prev: { fork-fold = mkForkFold final; };
 
+      # Authoritative agent instructions. Consuming maintenance flakes
+      # re-export this text so their tiny discovery skill always loads the
+      # guide from the exact fork-fold revision they pin.
+      lib.agentGuide = builtins.readFile ./AGENT_GUIDE.md;
+
       # Dev shell for a maintenance repo that consumes fork-fold: the compiled
       # tool plus the commands its workflows shell out to.
       lib.mkMaintenanceShell = { pkgs, extraPackages ? [ ] }:

@@ -79,6 +79,12 @@ frontmatter). `.claude/skills/` and `.codex/skills/` are symlinks into it so
 Claude Code and Codex discover the same skills; agents without a skills
 mechanism should read `.agents/skills/*/SKILL.md` directly.
 
+The checked-in skill is deliberately only a stable discovery stub. It tells
+the agent to load `lib.forkFoldAgentGuide`, which this repository's flake
+re-exports directly from its pinned `fork-fold` input. The full instructions
+therefore change with `flake.lock`; do not copy their output into this
+repository.
+
 ## Committing
 
 Commit `manifest.toml`, `manifest.lock.json`, `resolutions/`, and `patches/`

@@ -221,6 +221,10 @@ Beyond `packages` and `devShells`, the fork-fold flake exports:
 - `templates.default` — the maintenance-repo scaffold, kept in
   `templates/maintenance/` and shared verbatim with `fork-fold init` via
   `include_str!`.
+- `lib.agentGuide` — the authoritative agent operating guide as text.
+  Maintenance flakes re-export it from their pinned `fork-fold` input, letting
+  a stable local discovery stub load version-matched instructions with
+  `nix eval` rather than vendoring a copy.
 
 ## Agent-first operation
 
@@ -232,9 +236,12 @@ humans. Consequences:
   appends, and the conflict-resolution loop. The skill lives canonically at
   `.agents/skills/fork-fold/` in the open Agent Skills format
   (agentskills.io); `.claude/skills/` and `.codex/skills/` are relative
-  symlinks into it, so Claude Code and Codex share one copy and other agents
-  find it via AGENTS.md. All of this lives in `templates/maintenance/` so
-  `init`, the flake template, and any template mirror cannot drift.
+  symlinks into it, so Claude Code and Codex share one entry point and other
+  agents find it via AGENTS.md. That local skill is a small, stable discovery
+  stub. It evaluates `lib.forkFoldAgentGuide`, re-exported directly from the
+  repository's pinned `fork-fold` input, so the substantive instructions
+  cannot drift independently of the tool. The unavoidable local stub contains
+  only discovery metadata and that loading protocol.
 - CLI output is written to be parsed by an agent mid-workflow: explicit
   stopped-state messages naming the worktree and the next command, and
   (planned) `status --json`.

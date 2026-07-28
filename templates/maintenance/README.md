@@ -19,3 +19,8 @@ fork-fold status                 # lock vs. manifest vs. live refs
 
 The assembled branch is compiled output. Never develop on it, never merge it
 back into a topic.
+
+The checked-in agent skill is only a stable discovery stub. It loads the full
+operating guide from `lib.forkFoldAgentGuide`, which is re-exported directly
+from the `fork-fold` revision in `flake.lock`. Updating that input therefore
+updates the guide without copying or synchronizing it into this repository.

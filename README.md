@@ -17,3 +17,8 @@ fork-fold build
 The Rust CLI implements build, update, append, repair, status, and prune
 workflows. The `t3code-assembly` repository is the reference real-world
 consumer.
+
+Maintenance repositories check in only a stable agent-skill discovery stub.
+The full guide is exported by—and loaded directly from—the `fork-fold`
+revision pinned in their `flake.lock`, so changing that input changes the
+instructions without a synchronization step.
