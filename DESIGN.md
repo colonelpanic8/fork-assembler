@@ -65,6 +65,8 @@ motivating case is a combined PR that merges two others and builds on both —
 carrying either parent alongside it duplicates that parent's commits, and the
 parents stay open, so they keep resurfacing. An exclusion is the positive
 statement that a target must stay out, and the only one a sweep will honor.
+(For that particular case there is now a better answer than an exclusion:
+declare the parents. See "Derived entries" below.)
 
 Exclusions are intent with no step: no pin, no position, no fixup, no effect
 on any assembled tree. They constrain what may enter the entry list, nothing
@@ -75,6 +77,110 @@ it rather than picking a winner.
 A `reason` is optional and not load-bearing, but recording one is most of the
 point: an exclusion nobody can justify six months later is indistinguishable
 from an oversight. It is quoted wherever the refusal is reported.
+
+### Derived entries
+
+A **derived** entry is one that declares what it merged in:
+
+```toml
+[[entry]]
+pr = 4102
+parents = [{ pr = 2525 }, { branch = "mine:auth-refactor" }]
+```
+
+It is the combined-PR case from the section above, promoted from something the
+manifest works around into something it knows. Excluding the parents keeps them
+out of the stack, which is necessary but is only half the truth: the other half
+is that this entry *contains* them, so when a parent moves, this entry is stale,
+and nothing about an exclusion says that or says what to do about it. The pin
+records a commit that was built against whatever the parents were that day, and
+merging it is merging history that no longer exists anywhere else.
+
+Declaring the relationship lets `build` rebuild the entry instead of merging a
+stale pin. For a derived entry it:
+
+1. detaches a second worktree (`.worktrees/derive`) at the pinned base,
+2. merges each parent pin in manifest order, `--no-ff`,
+3. replays the entry's own commits — its **delta** — on top, one cherry-pick at
+   a time,
+4. merges *that* into the stack in place of the pin.
+
+Both phases use the same rerere machinery as an ordinary merge, so a conflict
+between two parents is recorded and replayed exactly like a conflict between
+two entries, and is attributed to the entry that declared them. The entry's
+result still records its pin: the pin is what the manifest tracks and what
+`update` moves. The reconstruction is recorded beside it.
+
+Parents are neither entries nor exclusions. They are carried — inside the entry
+that merged them — so the manifest refuses to also carry one as an entry, and
+refuses to also exclude one: the declaration already keeps discovery away, and
+says why more precisely than a reason string could. Two entries may share a
+parent; each reconstruction is standalone, and identical content merges
+cleanly.
+
+#### The anchor, and why not `git cherry`
+
+Everything above depends on knowing which commits are the entry's own. The
+obvious answers are wrong. Both `git cherry` (patch-id equivalence) and
+`rev-list C ^A ^B` (reachability) define "C's own commits" against the parents'
+**live tips** — which is exactly the comparison that a rebased parent breaks.
+After the rebase, the copies of A's commits inside C's history match nothing
+reachable from the new A, so they are classified as C's own work and replayed
+on top of the new A: the content the rebase replaced comes back, silently, in
+the assembled tree.
+
+So the lock records an **anchor** instead: a commit inside C's own history,
+after which C's own commits start. The delta is then
+`rev-list --reverse --no-merges <pin> ^<anchor>`, which is exact and cannot be
+perturbed by anything happening on a parent branch.
+
+The anchor is established whenever the entry's pin is — by `update`, or by the
+entry's first build — and by nothing else, for the same reason `build` never
+moves a pin: what a build replays must not depend on when it ran. Three rules,
+in order, and which one fired is always printed, because a wrong boundary
+duplicates or drops work and the operator is the only one who can see that
+before it lands:
+
+1. **The last reconstruction's parent merge is an ancestor of the new pin.**
+   The operator pushed the reconstructed tip and the PR then gained commits —
+   review fixes, typically. That merge *is* the boundary, and everything above
+   it is the entry's own work, including the delta that was replayed to build
+   it. Nothing is replayed twice.
+2. **The recorded anchor is still an ancestor of the new pin.** The entry grew
+   normally; the old boundary still marks the same place. Keep it.
+3. **Detect.** Walk the pin's first-parent chain to the first commit that is a
+   merge, or that the base or a parent already contains. Above it is the
+   entry's own work. The tip itself qualifying means the entry is a pure merge
+   of its parents and its delta is empty.
+
+If the walk reaches the root without a hit, the build stops and says so: the
+branch does not look like a merge of its parents, and there is no boundary to
+find.
+
+Known limitations, by design:
+
+- **Parents must be merged in, not cherry-picked.** The anchor is a merge
+  commit or a contained commit; a branch that rebases its parents' work onto
+  itself keeps no record of where they end, and detection fails rather than
+  guessing.
+- **Detection stops at the first merge, whatever it merged.** A branch that
+  merges its parents, adds work, and *then* merges upstream (or a third topic)
+  anchors on that later merge, so the work below it is not in the delta and is
+  not replayed. Rule 3 is a heuristic over a shape it cannot verify, which is
+  why the anchor is printed every time it is chosen and shown by `status`:
+  check the delta count against what the branch actually added. Rules 1 and 2
+  mean the boundary only has to be right once — after that it is a recorded
+  fact, and correcting a bad one is an edit to `pins.anchors` in the lock,
+  which `build` then consumes like any other pin.
+- **The delta may not contain merges.** Replaying is a sequence of
+  cherry-picks, which cannot reproduce a merge. Merge commits above the anchor
+  are skipped, so a derived entry whose own work merges something is outside
+  what this reconstructs — carry it as an ordinary entry, or declare that
+  something as a parent too.
+- **Reproducibility is in trees, not commits.** Reconstruction generates fresh
+  commits with real timestamps, so the same inputs give the same trees and
+  different OIDs — the same bargain the assembled branch already makes, and the
+  lock's tree hash still catches anything replayed wrongly.
 
 ### Coherence fixups
 
@@ -171,13 +277,17 @@ reproduction, never as silent drift.
 commit, and its tree hash). Cargo/Bundler semantics.
 
 Concretely the lock has two parts: `pins` (base OID plus per-entry-name OID —
-patch entries pin the file's blob hash; moved only by `update` or an entry's
-first build) and `build` (the last completed build: `commit`,
+patch entries pin the file's blob hash; derived entries additionally pin each
+parent and their anchor; moved only by `update` or an entry's first build) and
+`build` (the last completed build: `commit`,
 `pre_provenance_commit`, `tree` — the pre-provenance content tree, the
 reproducibility invariant — `built_tree`, per-entry results with
-merged/absorbed/empty/applied status plus conflict/resolution info, and a
-snapshot of the manifest entries used to detect prefix-extension, each
-carrying its entry's fixup blob hash when it has one). Branch entries may
+merged/absorbed/empty/applied status plus conflict/resolution info — and, for a
+derived entry, the two commits its reconstruction produced — and a snapshot of
+the manifest entries used to detect prefix-extension, each carrying its entry's
+fixup blob hash, parent pins, and anchor when it has them, so that editing a
+fixup, repinning a parent, or re-anchoring invalidates the suffix from that
+entry exactly as repinning the entry would). Branch entries may
 carry `pr = N` as pure metadata: the PR the branch is published as, feeding
 provenance links and `add --prs-from` dedup without changing merge behavior.
 
@@ -199,13 +309,19 @@ branch = "mine:custom-snooze"
 pr = 3984                       # refs/pull/3984/head on `upstream` by default
 remote = "upstream"
 fixup = "patches/renumber-migration.patch"   # applied inside THIS entry's step
+parents = [{ pr = 3970 }, { branch = "mine:custom-snooze-base" }]
+                                # 3984 merges these and builds on them: `build`
+                                # re-merges them onto the base and replays
+                                # 3984's own commits on top. Declaring a parent
+                                # keeps discovery away from it, so it must NOT
+                                # also be carried or excluded.
 
 [[entry]]
 patch = "patches/site-local-branding.patch"  # standalone, at its own position
 
 [[exclude]]
-pr = 3970                       # deliberately not carried; discovery skips it
-reason = "superseded by 3984, which already contains it"
+pr = 3971                       # deliberately not carried; discovery skips it
+reason = "abandoned by its author; the fix landed in 3984"
 ```
 
 ### Append machinery / incremental builds
@@ -232,12 +348,17 @@ triggers a rebuild from there — detectable via the lock, never surprising.
 
 - `build` — assemble the stack from the lock's pinned OIDs (fetching objects
   as needed), auto-resolving conflicts from the tracked rerere pairs. Entries
-  not yet in the lock are pinned from live refs on their first build. Stops
-  in the build worktree on an unrecognized conflict. `--locked` additionally
-  refuses to touch the network or pin anything new.
+  not yet in the lock are pinned from live refs on their first build. Derived
+  entries are reconstructed first, in a second worktree, and the reconstruction
+  is merged in place of the pin. Stops in the build worktree — or, during a
+  reconstruction, in the derive worktree, which it names — on an unrecognized
+  conflict. `--locked` additionally refuses to touch the network or pin
+  anything new.
 - `update [ENTRY...]` — the pin bump: repin the base and all entries (or only
-  the named ones) to their live remote heads. `build` never moves existing
-  pins; `update` is the only verb that does. After a batch bump, `build`
+  the named ones) to their live remote heads, including each derived entry's
+  parents, after which it re-establishes that entry's anchor and reports which
+  rule chose it. `build` never moves existing pins; `update` is the only verb
+  that does. After a batch bump, `build`
   repairs incrementally — unchanged conflict hunks auto-resolve from the
   tracked pairs, and changed hunks stop for manual resolution entry by entry.
 - `continue` — resume after the human resolves a conflict; commits the merge
@@ -368,8 +489,12 @@ humans. Consequences:
   patch is worse than an absent one. Today `continue` warns instead, and
   `fixup --capture` makes recording it a single command.
 - **Groups** — nested manifests whose assembled branch is one entry in a
-  parent manifest. Add when a consumer has a repeatedly-conflicting subsystem
-  cluster.
+  parent manifest. Derived entries are the one case of this that shipped: a
+  combined PR *is* a nested assembly, but one somebody else already maintains
+  and publishes, so fork-fold only has to know its inputs and rebuild it, not
+  own its order, resolutions, or lock. General groups are still deferred; add
+  them when a consumer has a repeatedly-conflicting subsystem cluster that no
+  upstream branch already combines.
 - **Freeze/vendor** — hermetic mode: vendored bundles (base + topics) so a
   clone reproduces with no network. The t3code workflow may want this back;
   the default is live refs + lock pins.

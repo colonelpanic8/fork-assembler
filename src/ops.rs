@@ -50,11 +50,74 @@ pub fn update(root: &Path, names: &[String]) -> Result<()> {
             Some(old) => println!("  {}: {} -> {}", entry.name, short(&old), short(&new)),
             None => println!("  {}: pinned {}", entry.name, short(&new)),
         }
-        lock.pins.entries.insert(entry.name.clone(), new);
+        lock.pins.entries.insert(entry.name.clone(), new.clone());
+        if !entry.parents.is_empty() {
+            update_derived(&ctx, &mut lock, entry, &new)?;
+        }
     }
 
     lock::save(root, &lock)?;
     println!("wrote {}", lock::FILE);
+    Ok(())
+}
+
+/// Repin a derived entry's parents and re-establish its anchor, in that order.
+///
+/// Both belong to `update` for the same reason the entry pin does: they say
+/// what the next build reconstructs from, and a `build` that moved them could
+/// produce a different tree from the same lock. The anchor comes last because
+/// two of its three rules are questions about the pins this just moved, and
+/// which rule fired is printed because the anchor decides which commits count
+/// as the entry's own — an operator who cannot audit that boundary cannot tell
+/// duplicated work from replayed work until it is in the tree.
+fn update_derived(
+    ctx: &Ctx,
+    lock: &mut lock::Lock,
+    entry: &manifest::Entry,
+    pin: &str,
+) -> Result<()> {
+    let mut pins = lock
+        .pins
+        .parents
+        .get(&entry.name)
+        .cloned()
+        .unwrap_or_default();
+    for parent in &entry.parents {
+        let new = engine::fetch_parent(ctx, entry, parent)?;
+        match pins.get(&parent.name) {
+            Some(old) if *old == new => {
+                println!("    parent {}: unchanged ({})", parent.name, short(&new))
+            }
+            Some(old) => println!(
+                "    parent {}: {} -> {}",
+                parent.name,
+                short(old),
+                short(&new)
+            ),
+            None => println!("    parent {}: pinned {}", parent.name, short(&new)),
+        }
+        pins.insert(parent.name.clone(), new);
+    }
+    pins.retain(|name, _| entry.parents.iter().any(|p| &p.name == name));
+
+    let previous_base_tip = lock
+        .build
+        .as_ref()
+        .and_then(|b| b.results.iter().find(|r| r.name == entry.name))
+        .and_then(|r| r.derived.as_ref())
+        .map(|d| d.base_tip.clone());
+    let anchor = engine::resolve_anchor(
+        &ctx.repo,
+        entry,
+        pin,
+        lock.pins.base.as_deref(),
+        &pins,
+        lock.pins.anchors.get(&entry.name).map(String::as_str),
+        previous_base_tip.as_deref(),
+    )?;
+    println!("    anchor {} -- {}", short(&anchor.oid), anchor.describe());
+    lock.pins.parents.insert(entry.name.clone(), pins);
+    lock.pins.anchors.insert(entry.name.clone(), anchor.oid);
     Ok(())
 }
 
@@ -164,6 +227,53 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
             entry.source(),
             flag_text
         );
+
+        // A derived entry's parents are not entries and never will be, so they
+        // print beneath it: they are part of what this one step reconstructs,
+        // and the anchor says where its own work starts.
+        for parent in &entry.parents {
+            let pin = lock
+                .pins
+                .parents
+                .get(&entry.name)
+                .and_then(|pins| pins.get(&parent.name));
+            let mut flags = Vec::new();
+            if let (Some(pin), Some(base), Some(repo)) =
+                (pin, lock.pins.base.as_ref(), repo.as_ref())
+            {
+                if git::has_commit(repo, pin) && contained(repo, pin, base) {
+                    flags
+                        .push("absorbed upstream -- consider removing it from parents".to_string());
+                }
+            }
+            if let Some(ctx) = ctx.as_ref().filter(|_| live) {
+                let head = engine::fetch_parent(ctx, entry, parent)?;
+                if Some(&head) != pin {
+                    flags.push(format!("live head {} -- pin is behind", short(&head)));
+                }
+            }
+            println!(
+                "    {:<22} {} ({}){}",
+                format!("parent {}", parent.name),
+                pin.map(|p| short(p).to_string())
+                    .unwrap_or("UNPINNED".into()),
+                parent.source(),
+                if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", flags.join("; "))
+                }
+            );
+        }
+        if !entry.parents.is_empty() {
+            match lock.pins.anchors.get(&entry.name) {
+                Some(anchor) => println!("    {:<22} {}", "anchor", short(anchor)),
+                None => println!(
+                    "    {:<22} UNRESOLVED -- the next build detects it",
+                    "anchor"
+                ),
+            }
+        }
     }
 
     // Exclusions are manifest intent with no pin and no step, so they print
@@ -181,7 +291,7 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
             println!("\nlast build: commit {}", short(&build.commit));
             println!("  tree {} ({} conflicts)", build.tree, build.conflicts);
             let fixups = engine::fixup_blobs(root, &m.entries, false)?;
-            let snapshot = lock::snapshot(&m.entries, &lock.pins.entries, &fixups);
+            let snapshot = lock::snapshot(&m.entries, &lock.pins, &fixups);
             let base_pin = lock.pins.base.clone().unwrap_or_default();
             match lock::prefix_relation(&lock, &snapshot, &base_pin) {
                 Prefix::Exact => println!("  manifest matches the lock: `build` is a no-op"),
@@ -244,6 +354,7 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
         removal.earliest + 1
     );
     report_orphaned_fixups(&removal);
+    report_orphaned_parents(&removal);
     Ok(())
 }
 
@@ -257,6 +368,23 @@ pub fn report_orphaned_fixups(removal: &manifest::Removal) {
             "  NOTE: {name} carried the coherence fixup {path}, now unreferenced.\n  \
              {path} is left on disk: if the incoherence it repaired survives the removal, \
              re-home it with `fork-fold fixup OTHER_ENTRY {path}`; otherwise delete it."
+        );
+    }
+}
+
+/// A parent was kept out of the entry list by the declaration that just left
+/// with its entry. Unlike a fixup it leaves no file to re-home — it leaves a
+/// silence, and a silence is exactly what discovery overwrites: an open PR
+/// that was somebody's parent yesterday is an ordinary candidate today.
+pub fn report_orphaned_parents(removal: &manifest::Removal) {
+    for (name, parents) in &removal.orphaned_parents {
+        println!(
+            "  NOTE: {name} declared {} as parent(s); nothing references them now.\n  \
+             Their commits left the stack with {name}. If they are still open PRs, the next \
+             `add --prs-from` sweep will offer them again -- carry them as entries if they \
+             should be in the stack on their own, or `fork-fold exclude` them with a reason \
+             if they should not.",
+            parents.join(", ")
         );
     }
 }

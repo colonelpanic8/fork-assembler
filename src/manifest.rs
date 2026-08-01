@@ -50,6 +50,21 @@ struct RawEntry {
     fixup: Option<String>,
     summary: Option<String>,
     note: Option<String>,
+    /// Inline `parents = [{ pr = N }, ...]` and nested `[[entry.parents]]`
+    /// tables are the same array to serde, so both spellings land here.
+    #[serde(default)]
+    parents: Vec<RawParent>,
+}
+
+#[derive(Deserialize)]
+struct RawParent {
+    name: Option<String>,
+    branch: Option<String>,
+    pr: Option<i64>,
+    remote: Option<String>,
+    /// Never valid; accepted by the parser only so the rejection can explain
+    /// itself instead of arriving as "unknown field".
+    patch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,8 +103,63 @@ pub struct Entry {
     /// every entry boundary a coherent tree and makes the dependency visible
     /// to `remove`/`prune`.
     pub fixup: Option<String>,
+    /// Live refs whose commits this entry already contains, in the order it
+    /// merged them. Empty for an ordinary entry; non-empty makes the entry
+    /// **derived**, and `build` reconstructs it rather than merging its pin.
+    pub parents: Vec<Parent>,
     pub summary: Option<String>,
     pub note: Option<String>,
+}
+
+/// A live ref whose commits a derived entry already contains.
+///
+/// The motivating shape is a combined PR: it merges two other PRs and adds its
+/// own work on top. The manifest carries only the combination and keeps the
+/// parents out, which leaves the most interesting fact about it unrecorded —
+/// when a parent moves, nothing knows the combination is stale, and nothing
+/// knows how to rebuild it. Declaring the parents states the relationship, and
+/// a stated relationship is one `build` can act on: re-merge the parents onto
+/// the pinned base, replay the entry's own commits on top, and merge that
+/// reconstruction into the stack.
+///
+/// A parent takes the shapes an entry takes minus `patch`. A patch has no
+/// commits to re-merge, so it can be nobody's parent.
+#[derive(Clone)]
+pub struct Parent {
+    pub name: String,
+    pub kind: Kind,
+}
+
+impl Parent {
+    /// Stable human identity of what this parent tracks, for lock snapshots —
+    /// the same spelling `Entry::source` uses, since they name the same kinds
+    /// of thing.
+    pub fn source(&self) -> String {
+        match &self.kind {
+            Kind::Branch { remote, branch, .. } => format!("{remote}:{branch}"),
+            Kind::Pr { remote, number } => format!("{remote}#{number}"),
+            Kind::Patch { path } => path.clone(),
+        }
+    }
+
+    pub fn pr_number(&self) -> Option<i64> {
+        match &self.kind {
+            Kind::Branch { pr, .. } => *pr,
+            Kind::Pr { number, .. } => Some(*number),
+            Kind::Patch { .. } => None,
+        }
+    }
+
+    /// The target this parent names, so refusals can talk about it in `add`'s
+    /// vocabulary.
+    pub fn target(&self) -> Target {
+        match &self.kind {
+            Kind::Pr { number, .. } => Target::Pr { number: *number },
+            _ => Target::Branch {
+                spec: self.source(),
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +204,20 @@ impl Entry {
             Kind::Pr { number, .. } => Some(*number),
             Kind::Patch { .. } => None,
         }
+    }
+
+    /// Does this entry track the same live ref `parent` names? The same
+    /// question `Exclusion::matches` asks, asked of a parent declaration:
+    /// a PR number wherever each side surfaces it, or the same branch spec.
+    pub fn tracks_parent(&self, parent: &Parent) -> bool {
+        if let (Some(mine), Some(theirs)) = (self.pr_number(), parent.pr_number()) {
+            if mine == theirs {
+                return true;
+            }
+        }
+        matches!(self.kind, Kind::Branch { .. })
+            && matches!(parent.kind, Kind::Branch { .. })
+            && self.source() == parent.source()
     }
 }
 
@@ -219,6 +303,17 @@ impl Exclusion {
         }
     }
 
+    /// Does `parent` name what this exclusion refuses? Matched exactly as an
+    /// entry is: a parent has the same identity a carried target has, and the
+    /// collision it creates is the same kind of contradiction.
+    pub fn matches_parent(&self, parent: &Parent) -> bool {
+        match (&self.target, &parent.kind) {
+            (Target::Pr { number }, _) => parent.pr_number() == Some(*number),
+            (Target::Branch { spec }, Kind::Branch { .. }) => &parent.source() == spec,
+            _ => false,
+        }
+    }
+
     /// Label plus the recorded reason: what every message reporting this
     /// exclusion prints, so the refusal always arrives with its justification.
     pub fn describe(&self) -> String {
@@ -285,6 +380,51 @@ pub fn entry_name(
     bail!("an entry must name a `branch`, a `pr`, or a `patch`");
 }
 
+/// One `parents` element: the entry shapes minus `patch`, named by the same
+/// rules an entry is named by, so a parent and the entry it could have been
+/// answer to the same name.
+fn convert_parent(raw: RawParent, base_remote: &str, entry: &str) -> Result<Parent> {
+    if let Some(path) = &raw.patch {
+        bail!(
+            "entry {entry:?}: parent {path:?} is a patch; a parent is a live ref whose \
+             commits this entry merged in, and a patch has no commits to re-merge"
+        );
+    }
+    let kind = match (&raw.branch, raw.pr) {
+        (Some(spec), pr) => {
+            if raw.remote.is_some() {
+                bail!(
+                    "entry {entry:?}: parent {spec:?} names its remote as REMOTE:BRANCH; \
+                     drop the `remote` field"
+                );
+            }
+            let Some((remote, branch)) = spec.split_once(':') else {
+                bail!("entry {entry:?}: parent {spec:?}: branch parents are REMOTE:BRANCH");
+            };
+            Kind::Branch {
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+                pr,
+            }
+        }
+        (None, Some(number)) => Kind::Pr {
+            remote: raw
+                .remote
+                .clone()
+                .unwrap_or_else(|| base_remote.to_string()),
+            number,
+        },
+        (None, None) => bail!(
+            "entry {entry:?}: a parent must name a `branch = \"remote:branch\"` or a `pr = N`"
+        ),
+    };
+    let name = entry_name(raw.name.as_deref(), raw.branch.as_deref(), raw.pr, None)?;
+    if name.is_empty() {
+        bail!("entry {entry:?}: a parent's name cannot be empty");
+    }
+    Ok(Parent { name, kind })
+}
+
 fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
     let kind = match (&raw.branch, raw.pr, &raw.patch) {
         (Some(spec), pr, None) => {
@@ -331,10 +471,30 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
              (a patch that needs fixing up is just a patch that needs editing)"
         );
     }
+    if !raw.parents.is_empty() && matches!(kind, Kind::Patch { .. }) {
+        bail!(
+            "entry {name:?}: patch entries cannot carry `parents` \
+             (parents describe commits a branch merged in, and a patch has no history \
+             to reconstruct)"
+        );
+    }
+    let mut parents = Vec::new();
+    let mut named = BTreeSet::new();
+    for raw_parent in raw.parents {
+        let parent = convert_parent(raw_parent, base_remote, &name)?;
+        if !named.insert(parent.name.clone()) {
+            bail!(
+                "entry {name:?}: duplicate parent name {:?}; set an explicit `name` on one of them",
+                parent.name
+            );
+        }
+        parents.push(parent);
+    }
     Ok(Entry {
         name,
         kind,
         fixup: raw.fixup,
+        parents,
         summary: raw.summary,
         note: raw.note,
     })
@@ -388,6 +548,39 @@ pub fn load(root: &Path) -> Result<Manifest> {
         }
     }
 
+    // A parent is already carried -- by the entry that merged it. Carrying it
+    // again as an entry of its own merges the same commits twice, which is the
+    // exact duplication the parent declaration exists to describe. Two entries
+    // may share a parent (each reconstruction is standalone, and identical
+    // content merges cleanly); an entry and a parent may not name one target.
+    for entry in &entries {
+        for parent in &entry.parents {
+            if let Some(carried) = entries.iter().find(|e| e.tracks_parent(parent)) {
+                bail!(
+                    "{} is carried both as entry {:?} and as a parent of {:?} -- drop one; \
+                     a derived entry already contains its parents' commits, so carrying a \
+                     parent alongside it merges them twice",
+                    parent.target().label(),
+                    carried.name,
+                    entry.name
+                );
+            }
+            if let Some(exclusion) = excludes.iter().find(|x| x.matches_parent(parent)) {
+                bail!(
+                    "{} is declared as a parent of {:?} and also refused by an [[exclude]] \
+                     ({}) -- delete the exclusion; declaring a parent already keeps discovery \
+                     away from it, and states why",
+                    parent.target().label(),
+                    entry.name,
+                    exclusion
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "no reason recorded".into()),
+                );
+            }
+        }
+    }
+
     let manifest = Manifest {
         remotes: raw.remotes,
         base: Base {
@@ -403,11 +596,13 @@ pub fn load(root: &Path) -> Result<Manifest> {
 
     manifest.remote_url(&manifest.base.remote)?;
     for entry in &manifest.entries {
-        match &entry.kind {
-            Kind::Branch { remote, .. } | Kind::Pr { remote, .. } => {
-                manifest.remote_url(remote)?;
+        for kind in std::iter::once(&entry.kind).chain(entry.parents.iter().map(|p| &p.kind)) {
+            match kind {
+                Kind::Branch { remote, .. } | Kind::Pr { remote, .. } => {
+                    manifest.remote_url(remote)?;
+                }
+                Kind::Patch { .. } => {}
             }
-            Kind::Patch { .. } => {}
         }
     }
     Ok(manifest)
@@ -437,6 +632,12 @@ pub struct Removal {
     /// repaired often persists and the patch needs re-homing rather than
     /// deleting. Callers must surface these.
     pub orphaned_fixups: Vec<(String, String)>,
+    /// (entry name, parent labels) for each removed derived entry. A parent
+    /// was kept out of the entry list by the declaration that just vanished,
+    /// so unlike a fixup it leaves no file behind — it leaves a hole in the
+    /// manifest's intent, and an open PR discovery will offer again. Callers
+    /// must surface these.
+    pub orphaned_parents: Vec<(String, Vec<String>)>,
 }
 
 /// Remove the named entries from manifest.toml (comment-preserving).
@@ -461,6 +662,14 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
             entry.fixup.clone().map(|path| (entry.name.clone(), path))
         })
         .collect();
+    let orphaned_parents = indices
+        .iter()
+        .filter_map(|idx| {
+            let entry = &manifest.entries[*idx];
+            let labels: Vec<String> = entry.parents.iter().map(|p| p.target().label()).collect();
+            (!labels.is_empty()).then(|| (entry.name.clone(), labels))
+        })
+        .collect();
 
     let path = root.join(FILE);
     let mut doc = fs::read_to_string(&path)?
@@ -477,6 +686,7 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
     Ok(Removal {
         earliest,
         orphaned_fixups,
+        orphaned_parents,
     })
 }
 

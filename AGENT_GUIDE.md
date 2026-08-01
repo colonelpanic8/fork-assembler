@@ -39,10 +39,11 @@ remembers. To keep a target out, say so:
 fork-fold exclude --pr 3970 --reason "superseded by 3984, which contains it"
 ```
 
-The case that forces this: a combined PR that merges two others and builds on
-top of both. Carrying either parent alongside it duplicates that parent's
-commits, and the parents usually stay open, so every sweep offers them again.
-Exclude both, naming the combined PR in the reason.
+The case that forces this used to be a combined PR that merges two others and
+builds on top of both. That case now has a better answer — declare the parents,
+see below — and an exclusion is what remains for targets nothing carries:
+abandoned PRs, work superseded by an upstream change, anything a sweep would
+otherwise offer forever.
 
 Always record a `--reason`. An exclusion nobody can justify later is
 indistinguishable from an oversight, and the reason is quoted wherever the
@@ -57,6 +58,44 @@ Exclude a closed or superseded PR too, even though discovery only sees open
 ones. The exclusion is what answers "why isn't this carried?" without git
 archaeology.
 
+## Derived entries: carrying a combined PR
+
+When an entry merges other PRs and adds work on top, say so instead of
+excluding them:
+
+```sh
+fork-fold add --pr 4102 --parent 2525 --parent mine:auth-refactor
+```
+
+That writes `parents = [{ pr = 2525 }, { branch = "mine:auth-refactor" }]` on
+the entry, in the order it merged them. The entry is now **derived**, and:
+
+- Discovery skips those PRs with "carried as a parent of ENTRY". Do not also
+  add or exclude them — the manifest rejects both, because the parent
+  declaration already keeps them out and says why.
+- `build` reconstructs the entry: it re-merges each parent onto the pinned base
+  in a second worktree (`.worktrees/derive`), replays the entry's own commits —
+  its *delta* — on top, and merges that result into the stack instead of the
+  entry's pin. The lock still records the pin as what the entry tracks.
+- `update` repins each parent alongside the entry, then re-establishes the
+  **anchor**: the commit in the entry's history after which its own commits
+  start. Report the anchor line it prints. It names which of three rules fired
+  — the reconstructed tip was pushed, the recorded anchor still holds, or the
+  boundary was detected by a first-parent walk — and that line is the only
+  audit of what will be replayed as the entry's own work.
+- `status` lists the parents indented under their entry with their pins, flags
+  a parent the base has absorbed ("consider removing it from parents"), and
+  shows the anchor.
+
+The entry's branch must genuinely *merge* its parents. One that cherry-picks or
+rebases them onto itself has no boundary to anchor on, and the build says so
+rather than guessing. Delta commits that are themselves merges are skipped.
+
+If you push the reconstructed tip to the entry's branch, say so in the report:
+the next `update` will notice (rule 1) and treat everything above it as the
+entry's own work, which is what makes review commits on a published
+reconstruction work without duplicating anything.
+
 ## When a build stops on a conflict
 
 1. Go to the build worktree reported by the command, under `.worktrees/`.
@@ -68,6 +107,16 @@ archaeology.
    from the maintenance repository root.
 4. Commit the new tracked pairs under `resolutions/rerere/`, their
    informational `INDEX.toml`, the manifest, and the lock together.
+
+A stop inside a reconstruction says **DERIVE worktree** and names
+`.worktrees/derive`. Resolve there, not in the build worktree: the build
+worktree is paused behind the reconstruction and holds nothing to fix. The loop
+is otherwise identical — `git add`, then `fork-fold continue`, which finishes
+the parent merge or the cherry-pick, harvests the pair under the *entry's*
+name, and carries on through the rest of the reconstruction and into the stack
+merge. Judge these resolutions against what each parent intends; the combined
+PR's author already made this decision once, so prefer reproducing their
+resolution over inventing a new one.
 
 ## Coherence fixups
 
@@ -123,6 +172,13 @@ base. In the same repair cycle, update the base past the merge, run
 `fork-fold prune --dry-run`, prune the dead entries, and rebuild. Report which
 entries were pruned and why, and resolve any orphaned fixups the prune
 reported.
+
+Pruning a derived entry also reports its parents: they left the stack with it,
+and the declaration that kept discovery away from them left too. Decide
+explicitly whether each parent should now be carried as an entry of its own or
+excluded with a reason. When only a *parent* lands upstream, nothing prunes —
+`status` flags it as absorbed, and the right move is to drop it from the
+`parents` list, which is a manifest edit and a rebuild.
 
 The same applies when the base picks up someone else's fix for a problem a
 carried entry also solves: the entry is now redundant, not merged, so `prune`

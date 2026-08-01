@@ -7,7 +7,7 @@ mod rerere;
 mod source;
 mod state;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -73,6 +73,12 @@ enum Command {
         /// repair, attach a fixup to the responsible entry instead)
         #[arg(long)]
         patch: Option<String>,
+        /// A PR number or REMOTE:BRANCH this entry merged in and builds on.
+        /// Repeatable, in the order the entry merged them. Declaring parents
+        /// makes the entry derived: `build` reconstructs it from them instead
+        /// of merging its pin, and discovery stops offering them
+        #[arg(long = "parent", value_name = "P")]
+        parents: Vec<String>,
         /// Append every open PR authored by this user on the base repo that
         /// is not already carried
         #[arg(long, value_name = "USER")]
@@ -224,6 +230,48 @@ struct ExistingEntries {
     branches: HashSet<String>,
     prs: HashSet<i64>,
     patches: HashSet<String>,
+    /// Targets some entry already contains as a parent, mapped to that entry's
+    /// name. They are carried — by the entry that merged them — so nothing may
+    /// carry them again, and the refusal has to be able to say by whom.
+    parent_prs: HashMap<i64, String>,
+    parent_branches: HashMap<String, String>,
+}
+
+/// The parent declarations on one `[[entry]]` table, in either spelling:
+/// `parents = [{ pr = N }]` reads as an array of inline tables, nested
+/// `[[entry.parents]]` as an array of tables, and the typed load treats them
+/// as one thing — so the document readers must too.
+fn parent_tables(entry: &Table) -> Vec<(Option<i64>, Option<String>)> {
+    let from_inline = entry
+        .get("parents")
+        .and_then(Item::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_inline_table())
+                .map(|t| {
+                    (
+                        t.get("pr").and_then(|v| v.as_integer()),
+                        t.get("branch").and_then(|v| v.as_str()).map(str::to_string),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let from_tables = entry
+        .get("parents")
+        .and_then(Item::as_array_of_tables)
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    (
+                        t.get("pr").and_then(Item::as_integer),
+                        t.get("branch").and_then(Item::as_str).map(str::to_string),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    from_inline.into_iter().chain(from_tables).collect()
 }
 
 fn existing_entries(doc: &DocumentMut) -> ExistingEntries {
@@ -231,6 +279,8 @@ fn existing_entries(doc: &DocumentMut) -> ExistingEntries {
         branches: HashSet::new(),
         prs: HashSet::new(),
         patches: HashSet::new(),
+        parent_prs: HashMap::new(),
+        parent_branches: HashMap::new(),
     };
     if let Some(entries) = doc.get("entry").and_then(Item::as_array_of_tables) {
         for t in entries {
@@ -242,6 +292,21 @@ fn existing_entries(doc: &DocumentMut) -> ExistingEntries {
             }
             if let Some(p) = t.get("patch").and_then(Item::as_str) {
                 e.patches.insert(p.to_string());
+            }
+            let carrier = manifest::entry_name(
+                t.get("name").and_then(Item::as_str),
+                t.get("branch").and_then(Item::as_str),
+                t.get("pr").and_then(Item::as_integer),
+                t.get("patch").and_then(Item::as_str),
+            )
+            .unwrap_or_else(|_| "<unnamed>".to_string());
+            for (pr, branch) in parent_tables(t) {
+                if let Some(n) = pr {
+                    e.parent_prs.insert(n, carrier.clone());
+                }
+                if let Some(spec) = branch {
+                    e.parent_branches.insert(spec, carrier.clone());
+                }
             }
         }
     }
@@ -282,6 +347,29 @@ fn reject_if_excluded(exclusions: &[manifest::Exclusion], target: &manifest::Tar
                 .reason
                 .clone()
                 .unwrap_or_else(|| "no reason recorded".into())
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a target that some entry already carries as a parent.
+///
+/// The same shape as the exclusion refusal, for the same reason: a sweep is
+/// impersonal and skips such a PR with a note, but naming one explicitly is a
+/// decision, and it deserves to learn that the target is already in the stack
+/// inside the entry that merged it.
+fn reject_if_parent(existing: &ExistingEntries, target: &manifest::Target) -> Result<()> {
+    let carrier = match target {
+        manifest::Target::Pr { number } => existing.parent_prs.get(number),
+        manifest::Target::Branch { spec } => existing.parent_branches.get(spec),
+        manifest::Target::Patch { .. } => None,
+    };
+    if let Some(entry) = carrier {
+        bail!(
+            "{} is carried as a parent of entry {entry:?}: its commits are reconstructed \
+             into that entry on every build, so carrying it again would merge them twice\n\
+             drop that entry's `parents` declaration first if the relationship no longer holds",
+            target.label()
         );
     }
     Ok(())
@@ -354,23 +442,30 @@ fn open_prs_by(slug: &str, author: &str) -> Result<Vec<(i64, String)>> {
 enum Discovered {
     Append,
     AlreadyCarried,
+    /// Carried inside the named entry, which merged it and builds on it. Not
+    /// an exclusion: the entry says why this PR stays out of the list, and
+    /// says it more precisely than any reason string could.
+    CarriedAsParent(String),
     Excluded(String),
 }
 
-/// Sort discovered PRs into append / already-carried / excluded.
+/// Sort discovered PRs into append / already-carried / parent / excluded.
 ///
 /// Split out from the sweep so the decision is testable without `gh`: this is
-/// the whole of what `--prs-from` decides, and the exclusion rule is the part
-/// worth proving.
+/// the whole of what `--prs-from` decides, and the rules that keep a target
+/// out are the part worth proving.
 fn triage_discovered(
     prs: &[(i64, String)],
     carried: &HashSet<i64>,
+    parents: &HashMap<i64, String>,
     exclusions: &[manifest::Exclusion],
 ) -> Vec<(i64, String, Discovered)> {
     prs.iter()
         .map(|(number, title)| {
             let verdict = if carried.contains(number) {
                 Discovered::AlreadyCarried
+            } else if let Some(entry) = parents.get(number) {
+                Discovered::CarriedAsParent(entry.clone())
             } else if let Some(exclusion) = exclusions
                 .iter()
                 .find(|x| x.target == manifest::Target::Pr { number: *number })
@@ -424,50 +519,121 @@ fn exclude(
     Ok(())
 }
 
+/// One `--parent` argument: a PR number, or a REMOTE:BRANCH.
+fn parse_parent(spec: &str) -> Result<manifest::Target> {
+    if !spec.is_empty() && spec.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(manifest::Target::Pr {
+            number: spec.parse()?,
+        });
+    }
+    if !spec.contains(':') {
+        bail!("--parent {spec:?}: parents are a PR number or REMOTE:BRANCH");
+    }
+    Ok(manifest::Target::Branch {
+        spec: spec.to_string(),
+    })
+}
+
+/// Render `parents = [{ pr = 2525 }, { branch = "mine:foo" }]` — the inline
+/// form, because a parent list is one fact about one entry and reads better
+/// beside it than as a run of nested tables.
+fn parents_array(parents: &[manifest::Target]) -> toml_edit::Array {
+    let mut array = toml_edit::Array::new();
+    for target in parents {
+        let mut table = toml_edit::InlineTable::new();
+        match target {
+            manifest::Target::Pr { number } => {
+                table.insert("pr", (*number).into());
+            }
+            manifest::Target::Branch { spec } => {
+                table.insert("branch", spec.as_str().into());
+            }
+            // `add` never builds a patch target for a parent: parse_parent
+            // cannot produce one.
+            manifest::Target::Patch { path } => {
+                table.insert("patch", path.as_str().into());
+            }
+        }
+        array.push(table);
+    }
+    array
+}
+
 fn add(
     target: Option<String>,
     pr: Option<u64>,
     patch: Option<String>,
+    parents: Vec<String>,
     prs_from: Option<String>,
 ) -> Result<()> {
     if target.is_none() && pr.is_none() && patch.is_none() && prs_from.is_none() {
         bail!("nothing to add: pass REMOTE:BRANCH, --pr, --patch, or --prs-from");
+    }
+    // Parents belong to one entry, in the order that entry merged them, so
+    // there has to be exactly one entry for them to belong to. A patch has no
+    // history to reconstruct, and a sweep appends entries it cannot name.
+    let one_entry = (target.is_some() ^ pr.is_some()) && patch.is_none() && prs_from.is_none();
+    if !parents.is_empty() && !one_entry {
+        bail!(
+            "--parent describes what ONE entry merged in, so it applies to exactly one \
+             REMOTE:BRANCH or --pr target: name that entry by itself, without --patch \
+             or --prs-from"
+        );
     }
     let (path, mut doc) = load_manifest()?;
     let existing = existing_entries(&doc);
     let exclusions = existing_exclusions(&doc)?;
     let mut appended = 0usize;
 
+    let declared: Vec<manifest::Target> = parents
+        .iter()
+        .map(|spec| parse_parent(spec))
+        .collect::<Result<_>>()?;
+    let parents_item = |t: &mut Table| {
+        if !declared.is_empty() {
+            t["parents"] = Item::Value(parents_array(&declared).into());
+        }
+    };
+
     if let Some(branch) = target {
         if !branch.contains(':') {
             bail!("branch entries are REMOTE:BRANCH (remote names come from [remotes])");
         }
-        reject_if_excluded(
-            &exclusions,
-            &manifest::Target::Branch {
-                spec: branch.clone(),
-            },
-        )?;
+        let target = manifest::Target::Branch {
+            spec: branch.clone(),
+        };
+        reject_if_excluded(&exclusions, &target)?;
+        reject_if_parent(&existing, &target)?;
         if existing.branches.contains(&branch) {
             println!("already carried: {branch}");
         } else {
             push_entry(&mut doc, |t| {
                 t["branch"] = value(&branch);
+                parents_item(t);
             });
             println!("added branch {branch}");
+            for parent in &declared {
+                println!("  parent: {}", parent.label());
+            }
             appended += 1;
         }
     }
     if let Some(n) = pr {
         let n = n as i64;
-        reject_if_excluded(&exclusions, &manifest::Target::Pr { number: n })?;
+        let target = manifest::Target::Pr { number: n };
+        reject_if_excluded(&exclusions, &target)?;
+        reject_if_parent(&existing, &target)?;
         if existing.prs.contains(&n) {
             println!("already carried: pr {n}");
         } else {
             push_entry(&mut doc, |t| {
                 t["pr"] = value(n);
+                parents_item(t);
             });
             println!("added pr {n}");
+            for parent in &declared {
+                println!("  parent: {}", parent.label());
+            }
             appended += 1;
         }
     }
@@ -489,9 +655,14 @@ fn add(
         if prs.is_empty() {
             println!("no open PRs by {author} on {slug}");
         }
-        for (n, title, verdict) in triage_discovered(&prs, &existing.prs, &exclusions) {
+        for (n, title, verdict) in
+            triage_discovered(&prs, &existing.prs, &existing.parent_prs, &exclusions)
+        {
             match verdict {
                 Discovered::AlreadyCarried => println!("already carried: pr {n} ({title})"),
+                Discovered::CarriedAsParent(entry) => {
+                    println!("carried as a parent of {entry}: pr {n} ({title}) -- not added")
+                }
                 Discovered::Excluded(reason) => {
                     println!("excluded: pr {n} ({title}) -- not added: {reason}")
                 }
@@ -538,8 +709,9 @@ fn main() -> Result<()> {
             target,
             pr,
             patch,
+            parents,
             prs_from,
-        } => add(target, pr, patch, prs_from),
+        } => add(target, pr, patch, parents, prs_from),
         Command::Exclude {
             target,
             pr,
@@ -575,6 +747,7 @@ fn main() -> Result<()> {
                 removal.earliest + 1
             );
             ops::report_orphaned_fixups(&removal);
+            ops::report_orphaned_parents(&removal);
             Ok(())
         }
         Command::Prune { dry_run } => ops::prune(&std::env::current_dir()?, dry_run),
@@ -607,7 +780,7 @@ mod tests {
     fn discovery_skips_excluded_prs_and_appends_the_rest() {
         let carried = HashSet::from([8]);
         let excludes = vec![excluding(7, Some("superseded by 10"))];
-        let verdicts = triage_discovered(&found(), &carried, &excludes);
+        let verdicts = triage_discovered(&found(), &carried, &HashMap::new(), &excludes);
         assert_eq!(
             verdicts.iter().map(|(n, _, v)| (*n, v)).collect::<Vec<_>>(),
             vec![
@@ -621,7 +794,12 @@ mod tests {
     /// An exclusion without a reason still bites; only the message changes.
     #[test]
     fn discovery_skips_an_exclusion_with_no_reason() {
-        let verdicts = triage_discovered(&found(), &HashSet::new(), &[excluding(7, None)]);
+        let verdicts = triage_discovered(
+            &found(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &[excluding(7, None)],
+        );
         assert_eq!(
             verdicts[0].2,
             Discovered::Excluded("no reason recorded".into())
@@ -635,8 +813,62 @@ mod tests {
         let verdicts = triage_discovered(
             &found(),
             &HashSet::from([7]),
+            &HashMap::new(),
             &[excluding(7, Some("stale"))],
         );
         assert_eq!(verdicts[0].2, Discovered::AlreadyCarried);
+    }
+
+    /// A PR some entry merged in is already carried, inside that entry. The
+    /// sweep must skip it without an exclusion: the `parents` declaration is
+    /// the record of why it stays out, and naming the carrier is what makes
+    /// the skip auditable.
+    #[test]
+    fn discovery_skips_prs_carried_as_parents() {
+        let parents = HashMap::from([(7, "combined".to_string())]);
+        let verdicts = triage_discovered(&found(), &HashSet::new(), &parents, &[]);
+        assert_eq!(
+            verdicts.iter().map(|(n, _, v)| (*n, v)).collect::<Vec<_>>(),
+            vec![
+                (7, &Discovered::CarriedAsParent("combined".into())),
+                (8, &Discovered::Append),
+                (9, &Discovered::Append),
+            ]
+        );
+    }
+
+    /// A parent declaration is more specific than an exclusion, so it is what
+    /// the sweep reports when a manifest somehow carries both.
+    #[test]
+    fn a_parent_declaration_outranks_an_exclusion_in_the_report() {
+        let parents = HashMap::from([(7, "combined".to_string())]);
+        let verdicts = triage_discovered(
+            &found(),
+            &HashSet::new(),
+            &parents,
+            &[excluding(7, Some("stale"))],
+        );
+        assert_eq!(
+            verdicts[0].2,
+            Discovered::CarriedAsParent("combined".into())
+        );
+    }
+
+    /// `parents = [{ pr = N }]` and nested `[[entry.parents]]` are one thing
+    /// to the typed load, so the document reader must find both.
+    #[test]
+    fn parent_targets_are_read_in_both_spellings() {
+        let doc: DocumentMut = "[[entry]]\nbranch = \"mine:combined\"\n\
+             parents = [{ pr = 11 }, { branch = \"mine:topic\" }]\n\n\
+             [[entry]]\npr = 42\n\n[[entry.parents]]\npr = 12\n"
+            .parse()
+            .expect("manifest parses");
+        let existing = existing_entries(&doc);
+        assert_eq!(existing.parent_prs.get(&11), Some(&"combined".to_string()));
+        assert_eq!(existing.parent_prs.get(&12), Some(&"pr-42".to_string()));
+        assert_eq!(
+            existing.parent_branches.get("mine:topic"),
+            Some(&"combined".to_string())
+        );
     }
 }
