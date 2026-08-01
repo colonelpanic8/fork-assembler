@@ -1198,9 +1198,14 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
             ensure_parent_pins(&ctx, entry, &mut pins.parents, locked)?;
         }
     }
-    // Parent pins and anchors for entries the manifest no longer carries are
-    // not facts about anything; carrying them forward would leave the lock
-    // asserting relationships that nothing declares.
+    // Pins for entries the manifest no longer carries are not facts about
+    // anything; carrying them forward would leave the lock asserting
+    // relationships that nothing declares — and a stale entry pin is actively
+    // misleading when the same ref later reappears as a parent, pinned
+    // elsewhere at a different OID. A removed entry that returns simply pins
+    // fresh, which is what its first build would do anyway.
+    pins.entries
+        .retain(|name, _| ctx.manifest.entries.iter().any(|e| &e.name == name));
     pins.parents
         .retain(|name, _| ctx.manifest.entries.iter().any(|e| &e.name == name));
     pins.anchors

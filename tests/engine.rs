@@ -1626,3 +1626,23 @@ fn build_replays_from_the_recorded_anchor_without_re_detecting() {
     assert!(!wt.join("own1.txt").exists(), "the delta was not honored");
     assert_eq!(read(wt.join("own2.txt")), "own2\n");
 }
+
+/// A removed entry's pin is not a fact about anything, and a stale one is
+/// actively misleading once the same ref reappears as a parent pinned
+/// elsewhere. The next build drops it; a re-added entry pins fresh.
+#[test]
+fn removing_an_entry_drops_its_pin_from_the_lock() {
+    let fx = fixture();
+    topic(&fx, "a", "c.txt", "from a\n");
+    topic(&fx, "b", "d.txt", "from b\n");
+    add_branch(&fx, "a");
+    add_branch(&fx, "b");
+    ff_ok(&fx.root, &["build"]);
+    assert!(lock_json(&fx.root)["pins"]["entries"]["a"].is_string());
+
+    ff_ok(&fx.root, &["remove", "a"]);
+    ff_ok(&fx.root, &["build"]);
+    let lock = lock_json(&fx.root);
+    assert!(lock["pins"]["entries"]["a"].is_null(), "{lock}");
+    assert!(lock["pins"]["entries"]["b"].is_string(), "{lock}");
+}
