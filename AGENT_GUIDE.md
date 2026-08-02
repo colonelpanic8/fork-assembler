@@ -77,6 +77,11 @@ the entry, in the order it merged them. The entry is now **derived**, and:
   in a second worktree (`.worktrees/derive`), replays the entry's own commits —
   its *delta* — on top, and merges that result into the stack instead of the
   entry's pin. The lock still records the pin as what the entry tracks.
+- Add `reconstruction_publish = "mine:review-branch"` when a completed
+  reconstruction should also update a writable review branch. This is explicit
+  because a `pr = N` source only identifies the forge's read-only PR head, not
+  its fork and branch. A normal build publishes only after the complete stack
+  succeeds, with a force-with-lease; `build --locked` always skips publication.
 - `update` repins each parent alongside the entry, then re-establishes the
   **anchor**: the commit in the entry's history after which its own commits
   start. Report the anchor line it prints. It names which of three rules fired
@@ -91,10 +96,10 @@ The entry's branch must genuinely *merge* its parents. One that cherry-picks or
 rebases them onto itself has no boundary to anchor on, and the build says so
 rather than guessing. Delta commits that are themselves merges are skipped.
 
-If you push the reconstructed tip to the entry's branch, say so in the report:
-the next `update` will notice (rule 1) and treat everything above it as the
-entry's own work, which is what makes review commits on a published
-reconstruction work without duplicating anything.
+Whether pushed manually or by `reconstruction_publish`, the next `update` will
+notice the reconstructed tip (rule 1) and treat everything above it as the
+entry's own work. That makes review commits on a published reconstruction work
+without duplicating anything.
 
 ## When a build stops on a conflict
 

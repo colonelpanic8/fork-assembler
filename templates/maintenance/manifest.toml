@@ -2,6 +2,8 @@
 # manifest.lock.json records FACT: the OIDs the last build used and the
 # assembled tree hash. The assembled branch is compiled output; never develop
 # on it or merge it back.
+# Derived entries may opt into updating a writable review branch after a full
+# successful build with: reconstruction_publish = "remote:branch".
 
 [remotes]
 # upstream = "https://github.com/OWNER/REPO"

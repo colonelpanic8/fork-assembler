@@ -86,6 +86,9 @@ A **derived** entry is one that declares what it merged in:
 [[entry]]
 pr = 4102
 parents = [{ pr = 2525 }, { branch = "mine:auth-refactor" }]
+# Optional: publish the rebuilt result to the combined PR's writable head.
+# Required for PR entries because refs/pull/N/head does not name that branch.
+reconstruction_publish = "mine:combined-auth-refactor"
 ```
 
 It is the combined-PR case from the section above, promoted from something the
@@ -110,6 +113,14 @@ between two parents is recorded and replayed exactly like a conflict between
 two entries, and is attributed to the entry that declared them. The entry's
 result still records its pin: the pin is what the manifest tracks and what
 `update` moves. The reconstruction is recorded beside it.
+
+`reconstruction_publish = "REMOTE:BRANCH"` opts a derived entry into updating
+that writable branch after a *complete* successful build. This supports a
+combined PR whose source is `pr = N`: the PR ref is fetch-only, so the manifest
+must name its writable fork branch explicitly. Publication uses a
+force-with-lease, so a concurrent review update aborts the build's publication
+instead of being overwritten. `build --locked` is read-only and always skips
+the requested publication.
 
 Parents are neither entries nor exclusions. They are carried — inside the entry
 that merged them — so the manifest refuses to also carry one as an entry, and
@@ -352,8 +363,9 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   entries are reconstructed first, in a second worktree, and the reconstruction
   is merged in place of the pin. Stops in the build worktree — or, during a
   reconstruction, in the derive worktree, which it names — on an unrecognized
-  conflict. `--locked` additionally refuses to touch the network or pin
-  anything new.
+  conflict. After all entries succeed, configured derived entries publish their
+  reconstruction to their explicit writable branches. `--locked` additionally
+  refuses to touch the network, pin anything new, or publish a reconstruction.
 - `update [ENTRY...]` — the pin bump: repin the base and all entries (or only
   the named ones) to their live remote heads, including each derived entry's
   parents, after which it re-establishes that entry's anchor and reports which

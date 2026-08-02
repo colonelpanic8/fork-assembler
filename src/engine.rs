@@ -1066,6 +1066,77 @@ fn provenance_json(ctx: &Ctx, st: &State, base: &str) -> Result<serde_json::Valu
     Ok(top)
 }
 
+/// Publish completed derived-entry reconstructions only after every entry has
+/// assembled successfully. This keeps a later stack conflict from updating a
+/// review branch with a reconstruction that never became an assembled build.
+///
+/// A locked build is a read-only reproducibility check: it deliberately skips
+/// this network write even when the manifest requests publication.
+fn publish_reconstructions(ctx: &Ctx, st: &State, locked: bool) -> Result<()> {
+    for entry in &ctx.manifest.entries {
+        let Some(target) = &entry.reconstruction_publish else {
+            continue;
+        };
+        let Some(tip) = st
+            .results
+            .iter()
+            .find(|result| result.name == entry.name)
+            .and_then(|result| result.derived.as_ref())
+            .map(|derived| derived.tip.as_str())
+        else {
+            // An absorbed or empty entry has no newly reconstructed branch to
+            // publish. Its normal build result already explains why.
+            continue;
+        };
+        if locked {
+            println!(
+                "  {} reconstruction publication to {} skipped (--locked)",
+                entry.name,
+                target.source()
+            );
+            continue;
+        }
+
+        let destination = format!("refs/heads/{}", target.branch);
+        let out = git::raw(
+            &ctx.repo,
+            &["ls-remote", "--heads", &target.remote, &destination],
+        )?;
+        if !out.status.success() {
+            bail!(
+                "{}: could not read reconstruction publish target {}: {}",
+                entry.name,
+                target.source(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let expected = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_string);
+        let lease = match expected {
+            Some(oid) => format!("--force-with-lease={destination}:{oid}"),
+            None => format!("--force-with-lease={destination}:"),
+        };
+        let source = format!("{tip}:{destination}");
+        git::out(&ctx.repo, &["push", &lease, &target.remote, &source]).with_context(|| {
+            format!(
+                "{}: publishing reconstructed {} to {}",
+                entry.name,
+                short(tip),
+                target.source()
+            )
+        })?;
+        println!(
+            "  {} published reconstruction {} -> {}",
+            entry.name,
+            short(tip),
+            target.source()
+        );
+    }
+    Ok(())
+}
+
 /// Finish a completed run: provenance commit, lock write, reporting.
 fn finalize(ctx: &Ctx, st: &State, previous: Option<&Lock>, write_lock: bool) -> Result<()> {
     let pre_provenance = git::out(&ctx.worktree, &["rev-parse", "HEAD"])?;
@@ -1294,6 +1365,7 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     match run_entries(&ctx, &mut st, start)? {
         Some(code) => Ok(code),
         None => {
+            publish_reconstructions(&ctx, &st, locked)?;
             finalize(&ctx, &st, previous.as_ref(), !locked)?;
             Ok(0)
         }
@@ -1525,6 +1597,7 @@ pub fn cont(root: &Path) -> Result<i32> {
         Some(code) => Ok(code),
         None => {
             let previous = lock::load(&ctx.root)?;
+            publish_reconstructions(&ctx, &st, false)?;
             finalize(&ctx, &st, previous.as_ref(), true)?;
             Ok(0)
         }

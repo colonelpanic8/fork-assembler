@@ -48,6 +48,7 @@ struct RawEntry {
     remote: Option<String>,
     patch: Option<String>,
     fixup: Option<String>,
+    reconstruction_publish: Option<String>,
     summary: Option<String>,
     note: Option<String>,
     /// Inline `parents = [{ pr = N }, ...]` and nested `[[entry.parents]]`
@@ -103,12 +104,29 @@ pub struct Entry {
     /// every entry boundary a coherent tree and makes the dependency visible
     /// to `remove`/`prune`.
     pub fixup: Option<String>,
+    /// Optional writable branch that receives a completed reconstruction.
+    /// PR entries need this because `refs/pull/N/head` does not identify a
+    /// writable remote branch.
+    pub reconstruction_publish: Option<ReconstructionPublish>,
     /// Live refs whose commits this entry already contains, in the order it
     /// merged them. Empty for an ordinary entry; non-empty makes the entry
     /// **derived**, and `build` reconstructs it rather than merging its pin.
     pub parents: Vec<Parent>,
     pub summary: Option<String>,
     pub note: Option<String>,
+}
+
+/// A branch to update after a derived entry has been reconstructed.
+#[derive(Clone)]
+pub struct ReconstructionPublish {
+    pub remote: String,
+    pub branch: String,
+}
+
+impl ReconstructionPublish {
+    pub fn source(&self) -> String {
+        format!("{}:{}", self.remote, self.branch)
+    }
 }
 
 /// A live ref whose commits a derived entry already contains.
@@ -478,6 +496,30 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
              to reconstruct)"
         );
     }
+    let reconstruction_publish = match raw.reconstruction_publish {
+        Some(spec) => {
+            if raw.parents.is_empty() {
+                bail!(
+                    "entry {name:?}: `reconstruction_publish` only applies to derived entries with `parents`"
+                );
+            }
+            let Some((remote, branch)) = spec.split_once(':') else {
+                bail!(
+                    "entry {name:?}: reconstruction publish target {spec:?} must be REMOTE:BRANCH"
+                );
+            };
+            if remote.is_empty() || branch.is_empty() {
+                bail!(
+                    "entry {name:?}: reconstruction publish target {spec:?} must be REMOTE:BRANCH"
+                );
+            }
+            Some(ReconstructionPublish {
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+            })
+        }
+        None => None,
+    };
     let mut parents = Vec::new();
     let mut named = BTreeSet::new();
     for raw_parent in raw.parents {
@@ -494,6 +536,7 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
         name,
         kind,
         fixup: raw.fixup,
+        reconstruction_publish,
         parents,
         summary: raw.summary,
         note: raw.note,
@@ -603,6 +646,9 @@ pub fn load(root: &Path) -> Result<Manifest> {
                 }
                 Kind::Patch { .. } => {}
             }
+        }
+        if let Some(target) = &entry.reconstruction_publish {
+            manifest.remote_url(&target.remote)?;
         }
     }
     Ok(manifest)

@@ -95,6 +95,11 @@ pub struct SnapshotEntry {
     /// since a fixup is repo-local content, not a tracked remote ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixup: Option<String>,
+    /// A requested remote branch publication is part of the snapshot so adding
+    /// or changing it reruns the entry instead of treating the build as up to
+    /// date and silently skipping the requested push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction_publish: Option<String>,
     /// A derived entry's parent pins, in manifest order. In the snapshot for
     /// the same reason the fixup blob is: a parent that moved changes what
     /// this entry's step produces, so it must invalidate the suffix from here
@@ -184,6 +189,10 @@ pub fn snapshot(
             source: entry.source(),
             pin: pins.entries.get(&entry.name).cloned().unwrap_or_default(),
             fixup: fixups.get(&entry.name).cloned(),
+            reconstruction_publish: entry
+                .reconstruction_publish
+                .as_ref()
+                .map(|target| target.source()),
             parents: entry
                 .parents
                 .iter()
@@ -237,6 +246,13 @@ fn diverged_reason(index: usize, current: &SnapshotEntry, locked: &SnapshotEntry
     };
     if sole(|probe, locked| probe.fixup.clone_from(&locked.fixup)) {
         return format!("entry {position} ({name})'s fixup changed");
+    }
+    if sole(|probe, locked| {
+        probe
+            .reconstruction_publish
+            .clone_from(&locked.reconstruction_publish)
+    }) {
+        return format!("entry {position} ({name})'s reconstruction publish target changed");
     }
     if sole(|probe, locked| probe.parents.clone_from(&locked.parents)) {
         return format!("entry {position} ({name})'s parent pins moved");

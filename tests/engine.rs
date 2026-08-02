@@ -185,6 +185,18 @@ fn add_derived(fx: &Fixture, name: &str, parents: &[&str]) {
     ff_ok(&fx.root, &args);
 }
 
+fn publish_derived_to_its_branch(fx: &Fixture, name: &str) {
+    let path = fx.root.join("manifest.toml");
+    let manifest = fs::read_to_string(&path).unwrap();
+    let branch = format!("branch = \"up:{name}\"");
+    let replacement = format!("{branch}\nreconstruction_publish = \"up:{name}\"");
+    assert!(
+        manifest.contains(&branch),
+        "missing derived branch {branch:?}"
+    );
+    fs::write(path, manifest.replacen(&branch, &replacement, 1)).unwrap();
+}
+
 fn build_worktree(fx: &Fixture) -> PathBuf {
     fx.root.join(".worktrees/build")
 }
@@ -1235,6 +1247,33 @@ fn pushing_the_reconstruction_moves_the_anchor_to_it() {
         1,
         "{log:?}"
     );
+}
+
+#[test]
+fn a_derived_entry_can_publish_its_completed_reconstruction() {
+    let fx = fixture();
+    topic(&fx, "a", "c.txt", "from a\n");
+    topic(&fx, "b", "d.txt", "from b\n");
+    combined(&fx, "c", &["a", "b"], "e.txt", "own\n");
+    add_derived(&fx, "c", &["a", "b"]);
+    publish_derived_to_its_branch(&fx, "c");
+
+    let out = ff_ok(&fx.root, &["build"]);
+    assert!(out.contains("c published reconstruction"), "{out}");
+    let tip = lock_json(&fx.root)["build"]["results"][0]["derived"]["tip"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(git(&fx.upstream, &["rev-parse", "c"]), tip);
+
+    // A locked reproduction rebuilds the same tree but must not write the
+    // configured review branch.
+    let out = ff_ok(&fx.root, &["build", "--locked"]);
+    assert!(
+        out.contains("reconstruction publication to up:c skipped (--locked)"),
+        "{out}"
+    );
+    assert_eq!(git(&fx.upstream, &["rev-parse", "c"]), tip);
 }
 
 #[test]
