@@ -1,6 +1,6 @@
-# fork-fold design
+# fork-assembler design
 
-fork-fold maintains a **build recipe for a stack of live branches**: an upstream
+fork-assembler maintains a **build recipe for a stack of live branches**: an upstream
 base plus an ordered set of topics, each still maintained as a potential
 upstream merge target, combined into a single assembled branch with recorded
 conflict resolutions. It generalizes the workflow prototyped in
@@ -217,7 +217,7 @@ Binding it there buys three things a trailing patch entry cannot:
   anonymous patch entry to fail to apply — or, worse, apply cleanly and do
   something no longer meaningful.
 - **One repair loop.** A build stops the same way for an unrecognized conflict
-  and for a fixup that no longer applies, and `fork-fold fixup ENTRY PATH
+  and for a fixup that no longer applies, and `fork-assembler fixup ENTRY PATH
   --capture` turns whatever the human did in the build worktree back into the
   tracked patch.
 
@@ -280,6 +280,40 @@ belongs in the entry's coherence fixup, which is applied in the same step as
 the resolution it completes. The end-of-build lock tree hash remains the sole
 verification invariant, so any uncaptured edit surfaces as a tree mismatch on
 reproduction, never as silent drift.
+
+### Base conflicts are refused, not resolved
+
+A resolution is only ever recorded for a conflict *between* things this
+repository composes. A topic that cannot merge with the base **on its own** is
+not composing badly — it is simply out of date with upstream, and that is a fact
+about the topic, not about the assembly.
+
+So the moment a merge conflicts, the build asks `git merge-tree --write-tree`
+whether the topic and the base alone conflict. If they do, it aborts the merge,
+clears its state, and exits non-zero with the topic, the base, the conflicted
+paths, and the rebase to run. This happens *before* rerere is consulted, so a
+pair recorded when the conflict was still cross-topic cannot start silently
+absorbing upstream's changes once the base moves onto the same lines.
+
+Refusing is the stronger choice over stopping for resolution, for three reasons:
+
+- **The fix has an owner elsewhere.** The topic's own author and reviewers
+  cannot see a conflict resolved in a downstream assembly. If the topic is a PR,
+  it is blocked for its maintainer too — rebasing it is work that needed doing.
+- **The resolution would not stay resolved.** A cross-topic pair is keyed on
+  hunks that only these topics produce. A base conflict recurs, differently,
+  with every upstream commit that touches those lines.
+- **It keeps topics upstreamable**, which is the core invariant. A topic
+  carried only by a resolution in this repository has quietly stopped being a
+  minimal diff against upstream.
+
+`status` reports the same condition as `CONFLICTS WITH BASE`, on entries and on
+derived entries' parents, so it is visible before a build has to refuse.
+
+Derived entries are checked one parent at a time, as each is merged onto the
+base during reconstruction. The entry's own merge into the stack is not checked
+against the base, because what it merges is the reconstruction, which already
+contains it.
 
 ### Manifest and lock
 
@@ -346,10 +380,10 @@ Appending never re-touches or re-resolves earlier entries, so "throw stuff on
 top" is cheap:
 
 ```
-fork-fold add mine:some-branch
-fork-fold add --pr 4102
-fork-fold add --patch fix-thing.patch
-fork-fold build          # incremental: merges only the tail
+fork-assembler add mine:some-branch
+fork-assembler add --pr 4102
+fork-assembler add --patch fix-thing.patch
+fork-assembler build          # incremental: merges only the tail
 ```
 
 Reordering or removing an entry invalidates the suffix from that point and
@@ -384,12 +418,12 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   or `--remove` to detach it. Attaching or editing a fixup changes what that
   entry's step produces, so the next `build` redoes it.
 - `init` — scaffold a maintenance repository: `manifest.toml`, `resolutions/`,
-  `patches/`, `flake.nix` (consuming `fork-fold.lib.mkMaintenanceShell`),
+  `patches/`, `flake.nix` (consuming `fork-assembler.lib.mkMaintenanceShell`),
   `.envrc`, justfile. `--upstream URL` fills in the base remote; `--submodule`
   additionally adds the upstream as a git submodule at `upstream/` and marks
   it in the manifest as the base-object source (an optional sourcing strategy,
   never a requirement). The same layout is available as a nix flake template
-  (`nix flake init -t github:colonelpanic8/fork-fold`).
+  (`nix flake init -t github:colonelpanic8/fork-assembler`).
 - `add` — append a branch/pr/patch entry to the manifest. Idempotent: adding
   an entry that is already present is a reported no-op. `--prs-from USER`
   appends every open PR authored by USER on the base repo that is not already
@@ -425,7 +459,7 @@ same repair cycle.
 
 ## Consuming repository layout
 
-A "stack repo" that uses fork-fold contains only data:
+A "stack repo" that uses fork-assembler contains only data:
 
 ```
 manifest.toml
@@ -436,38 +470,38 @@ patches/
 
 Publish/install tails (pushing the assembled branch, tagging, Nix repinning,
 system activation) are site-specific and live in the consuming repo (justfile,
-scripts) — outside fork-fold.
+scripts) — outside fork-assembler.
 
 ### Nix integration
 
-Beyond `packages` and `devShells`, the fork-fold flake exports:
+Beyond `packages` and `devShells`, the fork-assembler flake exports:
 
-- `overlays.default` — adds `pkgs.fork-fold`.
+- `overlays.default` — adds `pkgs.fork-assembler`.
 - `lib.mkMaintenanceShell { pkgs, extraPackages ? [] }` — dev shell for
-  maintenance repos: the compiled fork-fold binary plus `git`, `gh`, and
+  maintenance repos: the compiled fork-assembler binary plus `git`, `gh`, and
   `just`. Consuming repos pair it with direnv (`use flake` in `.envrc`).
 - `templates.default` — the maintenance-repo scaffold, kept in
-  `templates/maintenance/` and shared verbatim with `fork-fold init` via
+  `templates/maintenance/` and shared verbatim with `fork-assembler init` via
   `include_str!`.
 - `lib.agentGuide` — the authoritative agent operating guide as text.
-  Maintenance flakes re-export it from their pinned `fork-fold` input, letting
+  Maintenance flakes re-export it from their pinned `fork-assembler` input, letting
   a stable local discovery stub load version-matched instructions with
   `nix eval` rather than vendoring a copy.
 
 ## Agent-first operation
 
-fork-fold assumes its day-to-day operators are coding agents as much as
+fork-assembler assumes its day-to-day operators are coding agents as much as
 humans. Consequences:
 
 - The maintenance template ships `AGENTS.md` (model + invariants +
   operations), a `CLAUDE.md` pointer, and a project skill covering status,
   appends, and the conflict-resolution loop. The skill lives canonically at
-  `.agents/skills/fork-fold/` in the open Agent Skills format
+  `.agents/skills/fork-assembler/` in the open Agent Skills format
   (agentskills.io); `.claude/skills/` and `.codex/skills/` are relative
   symlinks into it, so Claude Code and Codex share one entry point and other
   agents find it via AGENTS.md. That local skill is a small, stable discovery
   stub. It evaluates `lib.forkFoldAgentGuide`, re-exported directly from the
-  repository's pinned `fork-fold` input, so the substantive instructions
+  repository's pinned `fork-assembler` input, so the substantive instructions
   cannot drift independently of the tool. The unavoidable local stub contains
   only discovery metadata and that loading protocol.
 - CLI output is written to be parsed by an agent mid-workflow: explicit
@@ -503,12 +537,12 @@ humans. Consequences:
 - **Groups** — nested manifests whose assembled branch is one entry in a
   parent manifest. Derived entries are the one case of this that shipped: a
   combined PR *is* a nested assembly, but one somebody else already maintains
-  and publishes, so fork-fold only has to know its inputs and rebuild it, not
+  and publishes, so fork-assembler only has to know its inputs and rebuild it, not
   own its order, resolutions, or lock. General groups are still deferred; add
   them when a consumer has a repeatedly-conflicting subsystem cluster that no
   upstream branch already combines.
 - **Freeze/vendor** — hermetic mode: vendored bundles (base + topics) so a
   clone reproduces with no network. The t3code workflow may want this back;
   the default is live refs + lock pins.
-- Anything resembling patch algebra. fork-fold pins order and records outcomes;
+- Anything resembling patch algebra. fork-assembler pins order and records outcomes;
   it does not try to make patches commute.

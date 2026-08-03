@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::git;
 use crate::lock::{DerivedResult, EntryResult};
 
-const FILE: &str = "fork-fold-state.json";
+const FILE: &str = "fork-assembler-state.json";
 
 #[derive(Serialize, Deserialize)]
 pub struct State {

@@ -58,7 +58,10 @@ impl Ctx {
 
 /// A private ref namespace so fetched heads never collide with user refs.
 fn holding_ref(entry: &Entry) -> String {
-    format!("refs/fork-fold/{}", manifest::sanitize_name(&entry.name))
+    format!(
+        "refs/fork-assembler/{}",
+        manifest::sanitize_name(&entry.name)
+    )
 }
 
 /// Parents get their own namespace under the entry that declares them: two
@@ -66,7 +69,7 @@ fn holding_ref(entry: &Entry) -> String {
 /// is standalone, so the holding refs must not be shared between them.
 fn parent_holding_ref(entry: &Entry, parent: &Parent) -> String {
     format!(
-        "refs/fork-fold/parents/{}/{}",
+        "refs/fork-assembler/parents/{}/{}",
         manifest::sanitize_name(&entry.name),
         manifest::sanitize_name(&parent.name)
     )
@@ -78,7 +81,7 @@ fn parent_holding_ref(entry: &Entry, parent: &Parent) -> String {
 /// gone.
 fn derived_ref(entry: &Entry) -> String {
     format!(
-        "refs/fork-fold/derived/{}",
+        "refs/fork-assembler/derived/{}",
         manifest::sanitize_name(&entry.name)
     )
 }
@@ -130,9 +133,9 @@ pub fn fetch_parent(ctx: &Ctx, entry: &Entry, parent: &Parent) -> Result<String>
 pub fn fetch_base(ctx: &Ctx) -> Result<String> {
     let remote = ctx.manifest.base.remote.clone();
     let ref_ = ctx.manifest.base.ref_.clone();
-    let spec = format!("+refs/heads/{ref_}:refs/fork-fold/base");
+    let spec = format!("+refs/heads/{ref_}:refs/fork-assembler/base");
     git::out(&ctx.repo, &["fetch", &remote, &spec])?;
-    git::out(&ctx.repo, &["rev-parse", "refs/fork-fold/base"])
+    git::out(&ctx.repo, &["rev-parse", "refs/fork-assembler/base"])
 }
 
 pub fn patch_blob(root: &Path, rel: &str) -> Result<String> {
@@ -181,7 +184,7 @@ fn ensure_pin(
                 let current = patch_blob(&ctx.root, path)?;
                 if current != pin {
                     bail!(
-                        "{}: patch file content changed since it was pinned; run `fork-fold update {}`",
+                        "{}: patch file content changed since it was pinned; run `fork-assembler update {}`",
                         entry.name,
                         entry.name
                     );
@@ -199,7 +202,7 @@ fn ensure_pin(
                     if !git::has_commit(&ctx.repo, &pin) {
                         bail!(
                             "{}: pinned OID {pin} is not reachable from its live ref; \
-                             the branch moved on or was rewritten (fetch it manually or `fork-fold update {}`)",
+                             the branch moved on or was rewritten (fetch it manually or `fork-assembler update {}`)",
                             entry.name,
                             entry.name
                         );
@@ -211,7 +214,7 @@ fn ensure_pin(
     }
     if locked {
         bail!(
-            "{}: no pin recorded and --locked forbids pinning; run `fork-fold build` or `update` first",
+            "{}: no pin recorded and --locked forbids pinning; run `fork-assembler build` or `update` first",
             entry.name
         );
     }
@@ -248,7 +251,7 @@ fn ensure_parent_pins(
                         bail!(
                             "{}: parent {} is pinned at {pin}, which is not reachable from its \
                              live ref; the parent was rewritten (fetch it manually or \
-                             `fork-fold update {}`)",
+                             `fork-assembler update {}`)",
                             entry.name,
                             parent.name,
                             entry.name
@@ -260,7 +263,7 @@ fn ensure_parent_pins(
                 if locked {
                     bail!(
                         "{}: parent {} has no pin recorded and --locked forbids pinning; \
-                         run `fork-fold build` or `update {}` first",
+                         run `fork-assembler build` or `update {}` first",
                         entry.name,
                         parent.name,
                         entry.name
@@ -313,8 +316,163 @@ fn conflicted_files(worktree: &Path) -> Result<Vec<String>> {
     Ok(out.lines().map(str::to_string).collect())
 }
 
+/// The files that conflict when `oid` is merged with the base ALONE — nothing
+/// else in the stack involved. A non-empty answer means the topic is simply out
+/// of date with upstream, which is a fact about the topic and not about this
+/// assembly.
+///
+/// `merge-tree --write-tree` answers this without a worktree, using the same
+/// merge machinery the real merge will use.
+fn base_conflict_files(repo: &Path, base: &str, oid: &str) -> Result<Vec<String>> {
+    let out = git::raw(
+        repo,
+        &["merge-tree", "--write-tree", "--name-only", base, oid],
+    )?;
+    // 0 = merged clean, 1 = conflicts. Anything else means merge-tree could not
+    // answer the question at all (unrelated histories, a missing object), and
+    // an unanswered question is not a base conflict.
+    if out.status.code() != Some(1) {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout
+        .lines()
+        .skip(1) // the merged tree's OID
+        .take_while(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// True when `oid` cannot merge with the base on its own. For reporting, where
+/// only the answer matters and a merge-tree that cannot answer means "no".
+pub fn conflicts_with_base(repo: &Path, base: &str, oid: &str) -> bool {
+    base_conflict_files(repo, base, oid).is_ok_and(|files| !files.is_empty())
+}
+
+/// Roll the build back to nothing in progress.
+///
+/// A base conflict is not a stop the operator resumes from — the repair happens
+/// in a different repository, on the topic branch — so leaving a half-merged
+/// worktree and a state file behind would only make the next `build` refuse to
+/// start for an unrelated-looking reason.
+fn abandon(ctx: &Ctx) {
+    for worktree in [ctx.worktree.clone(), ctx.derive_worktree()] {
+        if worktree.exists() {
+            let _ = git::raw(&worktree, &["merge", "--abort"]);
+            let _ = git::raw(&worktree, &["cherry-pick", "--abort"]);
+        }
+    }
+    let _ = state::clear(&ctx.worktree);
+}
+
+/// What is being checked against the base: an entry's own pin, or one parent of
+/// a derived entry. Both are topics somebody maintains elsewhere, which is the
+/// only thing the refusal needs to know about them.
+pub struct Topic<'a> {
+    /// How to name it to the operator.
+    pub label: String,
+    /// What it tracks, as `status` and the lock spell it.
+    pub source: String,
+    /// Whether it is a pull request, which changes where the fix gets pushed.
+    pub is_pr: bool,
+    pub oid: &'a str,
+}
+
+impl<'a> Topic<'a> {
+    fn entry(entry: &Entry, oid: &'a str) -> Topic<'a> {
+        Topic {
+            label: entry.name.clone(),
+            source: entry.source(),
+            is_pr: matches!(entry.kind, Kind::Pr { .. }),
+            oid,
+        }
+    }
+
+    fn parent(entry: &Entry, parent: &Parent, oid: &'a str) -> Topic<'a> {
+        Topic {
+            label: format!("{}: parent {}", entry.name, parent.name),
+            source: parent.source(),
+            is_pr: matches!(parent.kind, Kind::Pr { .. }),
+            oid,
+        }
+    }
+}
+
+/// The refusal.
+///
+/// A topic that conflicts with the base conflicts with nothing this repository
+/// owns, so nothing this repository can record is a fix. Recording a resolution
+/// here would hide a broken topic from its own author and reviewers, and would
+/// have to be re-resolved on every base bump — the conflict comes back with the
+/// next upstream commit that touches those files, forever.
+fn base_conflict_error(
+    ctx: &Ctx,
+    entry: &Entry,
+    topic: &Topic,
+    base: &str,
+    files: &[String],
+) -> anyhow::Error {
+    let Topic {
+        label,
+        source,
+        is_pr,
+        oid,
+    } = topic;
+    let repo = ctx.repo.display();
+    let push_hint = if *is_pr {
+        "  # then push the result to the PR's head branch. If the PR is someone\n  \
+         # else's, ask its author to rebase, or `fork-assembler exclude` it with\n  \
+         # that as the reason -- do not carry a topic that no longer applies."
+    } else {
+        "  # then push the result to the branch this entry tracks (force-with-lease)."
+    };
+    anyhow::anyhow!(
+        "{label} conflicts with the BASE ITSELF, not with anything else in the stack.\n\
+         \n  \
+         base    {} ({}:{})\n  \
+         topic   {} ({source})\n  \
+         file(s) {}\n\
+         \n\
+         This is not an assembly conflict, and it will not be resolved here. A tracked \
+         resolution would paper over a topic that no longer applies to upstream: it would \
+         hide the breakage from the topic's own author and reviewers, and it would have to \
+         be re-resolved every time the base moves.\n\
+         \n\
+         Fix it where it lives. Bring the topic up to date against the base, resolve the \
+         conflict there, and publish that:\n\
+         \n  \
+         git -C {repo} checkout -B onto-base {}\n  \
+         git -C {repo} rebase {}\n\
+         {push_hint}\n\
+         \n\
+         Then `fork-assembler update {}` and build again.\n\
+         \n\
+         This build has been rolled back; nothing is left in progress.",
+        short(base),
+        ctx.manifest.base.remote,
+        ctx.manifest.base.ref_,
+        short(oid),
+        files.join(", "),
+        short(oid),
+        short(base),
+        entry.name,
+    )
+}
+
+/// Refuse the build outright when `topic` cannot merge with the base on its
+/// own. Called the moment a merge conflicts, before any resolution — recorded
+/// or manual — gets a chance to obscure why.
+fn refuse_if_base_conflict(ctx: &Ctx, entry: &Entry, topic: Topic, base: &str) -> Result<()> {
+    let files = base_conflict_files(&ctx.repo, base, topic.oid)?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    abandon(ctx);
+    Err(base_conflict_error(ctx, entry, &topic, base, &files))
+}
+
 fn merge_entry(ctx: &Ctx, entry: &Entry, oid: &str) -> Result<bool> {
-    let message = format!("fork-fold: merge {}", entry.name);
+    let message = format!("fork-assembler: merge {}", entry.name);
     let out = git::raw(
         &ctx.worktree,
         &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, oid]),
@@ -512,7 +670,7 @@ fn stop_in_derive(ctx: &Ctx, entry: &Entry, label: &str, doing: &str, unresolved
         "  That worktree holds {}'s reconstruction, not the assembled stack.",
         entry.name
     );
-    println!("  Stage with `git add`, then: fork-fold continue");
+    println!("  Stage with `git add`, then: fork-assembler continue");
 }
 
 /// Reconstruct a derived entry: re-merge its parents onto the pinned base,
@@ -576,7 +734,7 @@ fn reconstruct(
             );
         } else {
             let message = format!(
-                "fork-fold: merge parent {} (for {})",
+                "fork-assembler: merge parent {} (for {})",
                 parent.name, entry.name
             );
             let out = git::raw(
@@ -584,6 +742,15 @@ fn reconstruct(
                 &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, &parent_pin]),
             )?;
             if !out.status.success() {
+                // Before anything else: a parent that cannot merge with the
+                // base on its own is out of date with upstream, and no amount
+                // of reconstruction here makes it apply again.
+                refuse_if_base_conflict(
+                    ctx,
+                    entry,
+                    Topic::parent(entry, parent, &parent_pin),
+                    &st.base,
+                )?;
                 st.conflicts += 1;
                 let unresolved = conflicted_files(&derive)?;
                 if unresolved.is_empty() {
@@ -775,7 +942,7 @@ fn finish_entry(
 ) -> Result<bool> {
     if let Some(rel) = &entry.fixup {
         let blob = patch_blob(&ctx.root, rel)?;
-        let message = format!("fork-fold: fixup {}", entry.name);
+        let message = format!("fork-assembler: fixup {}", entry.name);
         match apply_patch_file(ctx, rel, &message)? {
             Some(outcome) => {
                 println!("  {label} fixup {rel}: {outcome}");
@@ -789,10 +956,10 @@ fn finish_entry(
                 println!("  The merge is committed; only the fixup is outstanding.");
                 println!("  Resolve the markers in: {}", ctx.worktree.display());
                 println!("  Then re-capture the corrected fixup and rebuild:");
-                println!("      fork-fold fixup {} {rel} --capture", entry.name);
-                println!("      fork-fold build");
+                println!("      fork-assembler fixup {} {rel} --capture", entry.name);
+                println!("      fork-assembler build");
                 println!("  Or commit this resolution once, leaving {rel} stale:");
-                println!("      git add -A && fork-fold continue");
+                println!("      git add -A && fork-assembler continue");
                 return Ok(false);
             }
         }
@@ -819,7 +986,7 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
 
         if let Kind::Patch { path } = &entry.kind {
             let rel = path.clone();
-            let message = format!("fork-fold: {}", entry.name);
+            let message = format!("fork-assembler: {}", entry.name);
             match apply_patch_file(ctx, &rel, &message)? {
                 Some(outcome) => {
                     println!("  {label} {outcome}");
@@ -841,7 +1008,7 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
                     state::write(&ctx.worktree, st)?;
                     println!("\n  {label} patch FAILED to apply");
                     println!("  Resolve in: {}", ctx.worktree.display());
-                    println!("  Then: fork-fold continue");
+                    println!("  Then: fork-assembler continue");
                     return Ok(Some(STOPPED));
                 }
             }
@@ -889,6 +1056,12 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
         let clean = merge_entry(ctx, entry, merging)?;
 
         if !clean {
+            // A derived entry merges its reconstruction, which already contains
+            // the base; its topics were checked against the base one at a time
+            // as they were merged in above.
+            if entry.parents.is_empty() {
+                refuse_if_base_conflict(ctx, entry, Topic::entry(entry, &oid), &st.base)?;
+            }
             st.conflicts += 1;
             let unresolved = conflicted_files(&ctx.worktree)?;
             if unresolved.is_empty() {
@@ -923,7 +1096,7 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
                 println!("      {file}");
             }
             println!("\n  Resolve in: {}", ctx.worktree.display());
-            println!("  Stage with `git add`, then: fork-fold continue");
+            println!("  Stage with `git add`, then: fork-assembler continue");
             return Ok(Some(STOPPED));
         }
 
@@ -1153,7 +1326,12 @@ fn finalize(ctx: &Ctx, st: &State, previous: Option<&Lock>, write_lock: bool) ->
         if !git::out(&ctx.worktree, &["status", "--porcelain", "--", file])?.is_empty() {
             git::out(
                 &ctx.worktree,
-                &["commit", "-q", "-m", "fork-fold: record build provenance"],
+                &[
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fork-assembler: record build provenance",
+                ],
             )?;
         }
         git::out(&ctx.worktree, &["rev-parse", "HEAD"])?
@@ -1226,7 +1404,7 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     if let Some(st) = state::read(&ctx.worktree).unwrap_or(None) {
         let _ = st;
         bail!(
-            "a build is already in progress in {}; finish it with `fork-fold continue` \
+            "a build is already in progress in {}; finish it with `fork-assembler continue` \
              (or remove the worktree to abandon it)",
             ctx.worktree.display()
         );
@@ -1405,7 +1583,7 @@ fn report_harvest(label: &str, what: &str, harvested: &[String]) {
 pub fn cont(root: &Path) -> Result<i32> {
     let ctx = Ctx::open(root, false).or_else(|_| Ctx::open(root, true))?;
     let Some(mut st) = state::read(&ctx.worktree)? else {
-        bail!("no in-progress build found; run `fork-fold build`");
+        bail!("no in-progress build found; run `fork-assembler build`");
     };
 
     // A reconstruction in flight owns the conflict: the build worktree is
@@ -1420,7 +1598,7 @@ pub fn cont(root: &Path) -> Result<i32> {
         bail!(
             "the build stalled reconstructing a derived entry, but its worktree at {} is \
              gone -- the reconstruction it held cannot be resumed. Remove {} to abandon \
-             this build and start it again with `fork-fold build`.",
+             this build and start it again with `fork-assembler build`.",
             stalled_worktree.display(),
             ctx.worktree.display()
         );
@@ -1507,12 +1685,12 @@ pub fn cont(root: &Path) -> Result<i32> {
         if git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty() {
             bail!(
                 "{}: nothing staged for the fixup {rel}; resolve it and `git add`, \
-                 or detach it with `fork-fold fixup {} --remove`",
+                 or detach it with `fork-assembler fixup {} --remove`",
                 entry.name,
                 entry.name
             );
         }
-        let message = format!("fork-fold: fixup {}", entry.name);
+        let message = format!("fork-assembler: fixup {}", entry.name);
         git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
         pending.fixup = Some(patch_blob(&ctx.root, &rel)?);
         st.results.push(pending);
@@ -1526,7 +1704,7 @@ pub fn cont(root: &Path) -> Result<i32> {
         // was just committed, so a rebuild stalls here again. Say so plainly.
         println!(
             "  WARNING: {rel} still holds the version that failed; re-capture it with \
-             `fork-fold fixup {} {rel} --capture` after this build, or the next \
+             `fork-assembler fixup {} {rel} --capture` after this build, or the next \
              rebuild stops here again",
             entry.name
         );
@@ -1570,7 +1748,7 @@ pub fn cont(root: &Path) -> Result<i32> {
         // A stalled patch entry: commit the staged patch-entry result.
         let entry = &ctx.manifest.entries[stalled];
         if let Kind::Patch { .. } = &entry.kind {
-            let message = format!("fork-fold: {}", entry.name);
+            let message = format!("fork-assembler: {}", entry.name);
             git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
             let oid = st.pins.get(&entry.name).cloned().unwrap_or_default();
             st.results.push(EntryResult {

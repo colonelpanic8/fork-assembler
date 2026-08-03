@@ -1,4 +1,4 @@
-# Operating a fork-fold stack
+# Operating a fork-assembler stack
 
 Read `AGENTS.md` in the repository root first. It states the model and
 repository-specific invariants. The short version: `manifest.toml` is intent,
@@ -8,7 +8,7 @@ output, and conflict resolutions live only in tracked files under
 
 ## Reporting status
 
-Run `fork-fold status` for an offline comparison of the manifest, lock, and
+Run `fork-assembler status` for an offline comparison of the manifest, lock, and
 last build. It also lists the manifest's exclusions with their reasons, after
 the stack. Add `--live` when current remote heads or merged PR state matter.
 Report whether live refs moved past their lock pins, whether the manifest is a
@@ -18,12 +18,12 @@ build completed.
 
 ## Appending to the stack
 
-1. Run `fork-fold add REMOTE:BRANCH` (or `--pr N`, or `--patch FILE`). For a
+1. Run `fork-assembler add REMOTE:BRANCH` (or `--pr N`, or `--patch FILE`). For a
    new fork, first add it under `[remotes]` in `manifest.toml`. To carry all
-   of a user's open PRs, run `fork-fold add --prs-from USER`; it is
+   of a user's open PRs, run `fork-assembler add --prs-from USER`; it is
    idempotent and appends only PRs that are neither already carried nor
    excluded.
-2. Run `fork-fold build`. Appends build incrementally from the last assembled
+2. Run `fork-assembler build`. Appends build incrementally from the last assembled
    commit.
 3. If it completes, commit `manifest.toml`, `manifest.lock.json`, and any
    tracked resolution changes together using explicit paths. Unrelated local
@@ -36,7 +36,7 @@ so deleting an entry — or commenting it out — is not a decision the manifest
 remembers. To keep a target out, say so:
 
 ```sh
-fork-fold exclude --pr 3970 --reason "superseded by 3984, which contains it"
+fork-assembler exclude --pr 3970 --reason "superseded by 3984, which contains it"
 ```
 
 The case that forces this used to be a combined PR that merges two others and
@@ -50,7 +50,7 @@ indistinguishable from an oversight, and the reason is quoted wherever the
 refusal is reported.
 
 `exclude` never touches the lock — nothing needs rebuilding after one. It
-refuses a target that is currently carried: run `fork-fold remove NAME` first
+refuses a target that is currently carried: run `fork-assembler remove NAME` first
 and accept that it invalidates the build from that position. Report both the
 exclusion and any removal it required.
 
@@ -64,7 +64,7 @@ When an entry merges other PRs and adds work on top, say so instead of
 excluding them:
 
 ```sh
-fork-fold add --pr 4102 --parent 2525 --parent mine:auth-refactor
+fork-assembler add --pr 4102 --parent 2525 --parent mine:auth-refactor
 ```
 
 That writes `parents = [{ pr = 2525 }, { branch = "mine:auth-refactor" }]` on
@@ -107,8 +107,9 @@ without duplicating anything.
 2. Resolve the conflicted files. Judge each resolution against what the topic
    and the earlier stack each intend; do not mechanically prefer one side. If
    the correct fix belongs within one topic, fix that topic branch instead
-   and rebuild.
-3. Stage the resolved files with `git add`, then run `fork-fold continue`
+   and rebuild. (A conflict with the *base* never reaches this point — the
+   build refuses it; see below.)
+3. Stage the resolved files with `git add`, then run `fork-assembler continue`
    from the maintenance repository root.
 4. Commit the new tracked pairs under `resolutions/rerere/`, their
    informational `INDEX.toml`, the manifest, and the lock together.
@@ -116,12 +117,62 @@ without duplicating anything.
 A stop inside a reconstruction says **DERIVE worktree** and names
 `.worktrees/derive`. Resolve there, not in the build worktree: the build
 worktree is paused behind the reconstruction and holds nothing to fix. The loop
-is otherwise identical — `git add`, then `fork-fold continue`, which finishes
+is otherwise identical — `git add`, then `fork-assembler continue`, which finishes
 the parent merge or the cherry-pick, harvests the pair under the *entry's*
 name, and carries on through the rest of the reconstruction and into the stack
 merge. Judge these resolutions against what each parent intends; the combined
 PR's author already made this decision once, so prefer reproducing their
 resolution over inventing a new one.
+
+## When a topic conflicts with the base
+
+`build` does not stop for this one — it refuses, exits non-zero, and rolls
+itself back:
+
+```
+stale-topic conflicts with the BASE ITSELF, not with anything else in the stack.
+```
+
+The check runs the moment a merge conflicts, before any tracked pair can replay
+over it, and it asks one question: does this topic merge cleanly with the base
+*on its own*? If it does not, the topic is out of date with upstream. That is a
+fact about the topic, not about this assembly, and nothing recordable here fixes
+it — a tracked pair would hide the breakage from the topic's own author and
+reviewers, and would have to be re-resolved every time the base moves.
+
+`status` flags the same thing as `CONFLICTS WITH BASE` once the pin and base
+pin are known, so you can usually see it coming.
+
+Fix it upstream, then come back:
+
+1. Check the topic out in the source repository the error names, and bring it up
+   to date against the base — `git rebase <base>` for a topic you own, or
+   `git merge <base>` where the branch's history is published and rebasing it
+   would break other people.
+2. Resolve the conflict there, judging it as the topic's author would: what does
+   this topic intend, and what does the upstream change that broke it intend?
+   Both are visible in that repository, which is exactly why the resolution
+   belongs there.
+3. Run the topic's own checks if it has them. The rebased topic has to be
+   correct on its own, independent of anything this stack does.
+4. **Push it.** For a branch you own, force-with-lease to the branch the entry
+   tracks. For your own PR, push to its head branch so the PR itself is
+   mergeable again — a PR that conflicts with its target is blocked for the
+   maintainer too, so this is work that needed doing regardless. Say in your
+   report which branches you pushed.
+5. Run `fork-assembler update ENTRY` to repin, then `fork-assembler build`.
+
+For someone *else's* PR you cannot push to, you have two honest options and no
+third: ask its author to rebase, or `fork-assembler exclude --pr N --reason
+"conflicts with base since <upstream change>; awaiting a rebase from its
+author"`. Do not vendor a fixed copy under your own remote without saying so in
+the entry's `summary` — a silently forked copy of someone's PR is the thing this
+refusal exists to prevent.
+
+Never work around the refusal by resolving in the build worktree, by attaching a
+coherence fixup that reconstructs what the rebase would have done, or by pinning
+the entry to an older base. Fixups are for interactions *between* entries; this
+conflict has only one side.
 
 ## Coherence fixups
 
@@ -132,8 +183,8 @@ migration number) — record it as the entry's **coherence fixup**, not as a
 patch entry sitting later in the order:
 
 ```sh
-fork-fold fixup ENTRY patches/thing.patch --capture   # from the build worktree
-fork-fold build
+fork-assembler fixup ENTRY patches/thing.patch --capture   # from the build worktree
+fork-assembler build
 ```
 
 Attach it to the entry whose admission caused the problem — normally the
@@ -144,12 +195,12 @@ all, such as site-local customization.
 
 `--capture` writes the patch from the build worktree: its uncommitted changes
 when there are any (at a fixup stall, precisely the corrected patch), else the
-entry's existing `fork-fold: fixup ENTRY` commit. Fixups are not pinned, so
+entry's existing `fork-assembler: fixup ENTRY` commit. Fixups are not pinned, so
 editing one needs no `update` — the next `build` picks it up.
 
 When a build stops on a fixup that no longer applies, the entry's merge is
 already committed and only the fixup is outstanding. Repair the worktree,
-re-capture, and rebuild. You may instead `git add` and `fork-fold continue` to
+re-capture, and rebuild. You may instead `git add` and `fork-assembler continue` to
 commit that resolution once, but the patch file then no longer describes what
 shipped and the next rebuild stops in the same place — re-capture afterwards.
 
@@ -162,19 +213,19 @@ or delete it; do not leave the question open.
 
 `build` never moves an existing pin. To refresh:
 
-1. Run `fork-fold update` for all pins or `fork-fold update ENTRY...` for a
+1. Run `fork-assembler update` for all pins or `fork-assembler update ENTRY...` for a
    selective bump.
-2. Run `fork-fold build`. Known conflict hunks replay from the tracked pairs;
+2. Run `fork-assembler build`. Known conflict hunks replay from the tracked pairs;
    changed conflicts stop for resolution.
-3. After the repair completes, run `fork-fold build --locked` to prove the
+3. After the repair completes, run `fork-assembler build --locked` to prove the
    tracked inputs reproduce the lock's tree.
 4. Commit the manifest, lock, and tracked resolution changes together.
 
 ## When a PR merges upstream
 
-Run `fork-fold status --live` to identify entries contained in the updated
+Run `fork-assembler status --live` to identify entries contained in the updated
 base. In the same repair cycle, update the base past the merge, run
-`fork-fold prune --dry-run`, prune the dead entries, and rebuild. Report which
+`fork-assembler prune --dry-run`, prune the dead entries, and rebuild. Report which
 entries were pruned and why, and resolve any orphaned fixups the prune
 reported.
 
@@ -192,6 +243,6 @@ say in the reason which upstream change obsoleted it.
 
 ## Verification
 
-After a completed repair, `fork-fold build --locked` must reproduce the
+After a completed repair, `fork-assembler build --locked` must reproduce the
 lock's tree hash. Never enable persistent Git rerere, develop on the assembled
 branch, or merge from the assembled branch.

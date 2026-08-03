@@ -162,7 +162,7 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
             let head = engine::fetch_base(ctx)?;
             if Some(&head) != lock.pins.base.as_ref() {
                 println!(
-                    "      live head {} -- run `fork-fold update base`",
+                    "      live head {} -- run `fork-assembler update base`",
                     short(&head)
                 );
             }
@@ -202,6 +202,11 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         ) {
             if git::has_commit(repo, pin) && contained(repo, pin, base) {
                 flags.push("contained in base -- prune candidate".to_string());
+            } else if git::has_commit(repo, pin) && engine::conflicts_with_base(repo, base, pin) {
+                // Reported here because `build` refuses this outright, and the
+                // repair is in another repository. Better to learn it from a
+                // status read than from a build that stops and rolls back.
+                flags.push("CONFLICTS WITH BASE -- rebase the topic; build refuses it".to_string());
             }
         }
         if live {
@@ -244,6 +249,11 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
                 if git::has_commit(repo, pin) && contained(repo, pin, base) {
                     flags
                         .push("absorbed upstream -- consider removing it from parents".to_string());
+                } else if git::has_commit(repo, pin) && engine::conflicts_with_base(repo, base, pin)
+                {
+                    flags.push(
+                        "CONFLICTS WITH BASE -- rebase the topic; build refuses it".to_string(),
+                    );
                 }
             }
             if let Some(ctx) = ctx.as_ref().filter(|_| live) {
@@ -306,7 +316,7 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
                 Prefix::NoBuild => {}
             }
         }
-        None => println!("\nno completed build recorded; run `fork-fold build`"),
+        None => println!("\nno completed build recorded; run `fork-assembler build`"),
     }
     Ok(())
 }
@@ -315,10 +325,10 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
     let m = manifest::load(root)?;
     let lock = lock::load(root)?.unwrap_or_default();
     let Some(base) = lock.pins.base.clone() else {
-        bail!("no base pin; run `fork-fold build` or `update` first");
+        bail!("no base pin; run `fork-assembler build` or `update` first");
     };
     let Some(repo) = source::source_repo_if_present(root, &m) else {
-        bail!("no source repository available; run `fork-fold build` first");
+        bail!("no source repository available; run `fork-assembler build` first");
     };
 
     let mut dead = Vec::new();
@@ -348,7 +358,7 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
     }
     let removal = manifest::remove_entries(root, &dead)?;
     println!(
-        "removed {} entr{}; the build suffix from position {} is invalidated -- run `fork-fold build`",
+        "removed {} entr{}; the build suffix from position {} is invalidated -- run `fork-assembler build`",
         dead.len(),
         if dead.len() == 1 { "y" } else { "ies" },
         removal.earliest + 1
@@ -367,7 +377,7 @@ pub fn report_orphaned_fixups(removal: &manifest::Removal) {
         println!(
             "  NOTE: {name} carried the coherence fixup {path}, now unreferenced.\n  \
              {path} is left on disk: if the incoherence it repaired survives the removal, \
-             re-home it with `fork-fold fixup OTHER_ENTRY {path}`; otherwise delete it."
+             re-home it with `fork-assembler fixup OTHER_ENTRY {path}`; otherwise delete it."
         );
     }
 }
@@ -382,7 +392,7 @@ pub fn report_orphaned_parents(removal: &manifest::Removal) {
             "  NOTE: {name} declared {} as parent(s); nothing references them now.\n  \
              Their commits left the stack with {name}. If they are still open PRs, the next \
              `add --prs-from` sweep will offer them again -- carry them as entries if they \
-             should be in the stack on their own, or `fork-fold exclude` them with a reason \
+             should be in the stack on their own, or `fork-assembler exclude` them with a reason \
              if they should not.",
             parents.join(", ")
         );
@@ -400,7 +410,7 @@ pub fn fixup(
     if remove {
         let index = manifest::set_fixup(root, name, None)?;
         println!("detached {name}'s coherence fixup (the patch file is left in place)");
-        println!("entry {} changed -- run `fork-fold build`", index + 1);
+        println!("entry {} changed -- run `fork-assembler build`", index + 1);
         return Ok(());
     }
     let Some(rel) = path else {
@@ -411,7 +421,7 @@ pub fn fixup(
         let worktree = root.join(engine::WORKTREE);
         if !worktree.exists() {
             bail!(
-                "no build worktree at {} to capture from; run `fork-fold build` first",
+                "no build worktree at {} to capture from; run `fork-assembler build` first",
                 worktree.display()
             );
         }
@@ -423,7 +433,7 @@ pub fn fixup(
         if diff.is_empty() {
             bail!(
                 "nothing to capture: the build worktree has no uncommitted changes and no \
-                 `fork-fold: fixup {name}` commit"
+                 `fork-assembler: fixup {name}` commit"
             );
         }
         std::fs::write(&dest, diff)?;
@@ -440,7 +450,7 @@ pub fn fixup(
     let index = manifest::set_fixup(root, name, Some(rel))?;
     println!("{name}: coherence fixup set to {rel}");
     println!(
-        "entry {} now produces a different tree -- run `fork-fold build`",
+        "entry {} now produces a different tree -- run `fork-assembler build`",
         index + 1
     );
     Ok(())
@@ -457,7 +467,7 @@ fn capture_diff(worktree: &Path, name: &str) -> Result<(Vec<u8>, String)> {
     if !pending.is_empty() {
         return Ok((pending, "the build worktree's uncommitted changes".into()));
     }
-    let subject = format!("fork-fold: fixup {name}");
+    let subject = format!("fork-assembler: fixup {name}");
     let log = git::out(worktree, &["log", "--format=%H%x1f%s"])?;
     let commit = log
         .lines()

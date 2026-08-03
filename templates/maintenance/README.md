@@ -1,6 +1,6 @@
-# fork-fold maintenance repository
+# fork-assembler maintenance repository
 
-This repository is a [fork-fold](https://github.com/colonelpanic8/fork-fold)
+This repository is a [fork-assembler](https://github.com/colonelpanic8/fork-assembler)
 stack: an upstream base plus an ordered set of live topic branches, assembled
 into a single branch with tracked conflict resolutions.
 
@@ -12,9 +12,9 @@ into a single branch with tracked conflict resolutions.
 Common operations:
 
 ```sh
-fork-fold add mine:some-branch   # append a topic
-fork-fold build                  # assemble (incremental for appends)
-fork-fold status                 # lock vs. manifest vs. live refs
+fork-assembler add mine:some-branch   # append a topic
+fork-assembler build                  # assemble (incremental for appends)
+fork-assembler status                 # lock vs. manifest vs. live refs
 ```
 
 The assembled branch is compiled output. Never develop on it, never merge it
@@ -22,5 +22,5 @@ back into a topic.
 
 The checked-in agent skill is only a stable discovery stub. It loads the full
 operating guide from `lib.forkFoldAgentGuide`, which is re-exported directly
-from the `fork-fold` revision in `flake.lock`. Updating that input therefore
+from the `fork-assembler` revision in `flake.lock`. Updating that input therefore
 updates the guide without copying or synchronizing it into this repository.

@@ -763,7 +763,7 @@ pub fn record_exclusion(root: &Path, target: &Target, reason: Option<&str>) -> R
     };
     if let Some(entry) = manifest.entries.iter().find(|e| exclusion.matches(e)) {
         bail!(
-            "{} is carried by entry {:?}; run `fork-fold remove {}` first \
+            "{} is carried by entry {:?}; run `fork-assembler remove {}` first \
              (that invalidates the build from its position, which is why \
              excluding will not do it for you)",
             target.label(),

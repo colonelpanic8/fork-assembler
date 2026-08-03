@@ -1,5 +1,5 @@
 {
-  description = "fork-fold - assemble stacks of live fork branches with tracked resolutions";
+  description = "fork-assembler - assemble stacks of live fork branches with tracked resolutions";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -8,16 +8,16 @@
 
   outputs = { self, nixpkgs, flake-utils }:
     let
-      mkForkFold = pkgs:
+      mkForkAssembler = pkgs:
         pkgs.rustPlatform.buildRustPackage {
-          pname = "fork-fold";
+          pname = "fork-assembler";
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper ];
           nativeCheckInputs = [ pkgs.git ];
           postInstall = ''
-            wrapProgram $out/bin/fork-fold --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+            wrapProgram $out/bin/fork-assembler --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
           '';
         };
     in
@@ -26,7 +26,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
-        packages.default = mkForkFold pkgs;
+        packages.default = mkForkAssembler pkgs;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
@@ -41,19 +41,19 @@
         };
       })
     // {
-      overlays.default = final: prev: { fork-fold = mkForkFold final; };
+      overlays.default = final: prev: { fork-assembler = mkForkAssembler final; };
 
       # Authoritative agent instructions. Consuming maintenance flakes
       # re-export this text so their tiny discovery skill always loads the
-      # guide from the exact fork-fold revision they pin.
+      # guide from the exact fork-assembler revision they pin.
       lib.agentGuide = builtins.readFile ./AGENT_GUIDE.md;
 
-      # Dev shell for a maintenance repo that consumes fork-fold: the compiled
+      # Dev shell for a maintenance repo that consumes fork-assembler: the compiled
       # tool plus the commands its workflows shell out to.
       lib.mkMaintenanceShell = { pkgs, extraPackages ? [ ] }:
         pkgs.mkShell {
           packages = [
-            (mkForkFold pkgs)
+            (mkForkAssembler pkgs)
             pkgs.git
             pkgs.gh
             pkgs.just
@@ -62,7 +62,7 @@
 
       templates.default = {
         path = ./templates/maintenance;
-        description = "fork-fold maintenance repository: manifest, resolutions, dev shell, direnv";
+        description = "fork-assembler maintenance repository: manifest, resolutions, dev shell, direnv";
       };
     };
 }

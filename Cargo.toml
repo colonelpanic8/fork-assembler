@@ -1,5 +1,5 @@
 [package]
-name = "fork-fold"
+name = "fork-assembler"
 version = "0.1.0"
 edition = "2021"
 description = "Assemble a stack of live fork branches onto an upstream base with tracked conflict resolutions"

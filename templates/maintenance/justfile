@@ -1,8 +1,8 @@
 build:
-    fork-fold build
+    fork-assembler build
 
 status:
-    fork-fold status
+    fork-assembler status
 
 continue:
-    fork-fold continue
+    fork-assembler continue
