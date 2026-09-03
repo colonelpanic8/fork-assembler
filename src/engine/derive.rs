@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 
 use super::pins::derived_ref;
 use super::refuse::{refuse_if_base_conflict, Topic};
@@ -17,14 +18,16 @@ use super::{conflicted_files, prepare_worktree, remove_worktree, Ctx, Run, Step}
 use crate::git;
 use crate::lock::{self, DerivedResult};
 use crate::manifest::Entry;
-use crate::report::{Event, Replay};
+use crate::report::{Doing, Event, Replay, Resolved};
 use crate::rerere;
 use crate::state::DeriveState;
 
-/// Which rule established a derived entry's anchor. Printed on every
+/// Which rule established a derived entry's anchor. Reported on every
 /// resolution: the anchor decides which commits are replayed as the entry's
 /// own, so an operator who cannot see how it was chosen cannot audit the
 /// boundary — and a wrong boundary silently duplicates or drops work.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
 pub enum AnchorRule {
     /// The last reconstruction's parent merge is an ancestor of the new pin:
     /// the operator pushed the reconstructed tip, and everything the PR has
@@ -38,27 +41,10 @@ pub enum AnchorRule {
     Detected,
 }
 
+#[derive(Serialize)]
 pub struct Anchor {
     pub oid: String,
     pub rule: AnchorRule,
-}
-
-impl Anchor {
-    /// The audit sentence: which rule fired and what it means.
-    pub fn describe(&self) -> &'static str {
-        match self.rule {
-            AnchorRule::PushedReconstruction => {
-                "the last reconstruction's parent merge is an ancestor of the pin \
-                 -- the reconstructed tip was pushed, so everything above it is the \
-                 entry's own work"
-            }
-            AnchorRule::Kept => "unchanged: the recorded anchor is still an ancestor of the pin",
-            AnchorRule::Detected => {
-                "detected: the first-parent walk stopped at the first merge or \
-                 already-contained commit"
-            }
-        }
-    }
 }
 
 /// The commit in a derived entry's history after which its own commits start.
@@ -206,9 +192,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
             _ => {
                 prepare_worktree(run.ctx, &worktree, &run.st.base)?;
                 run.ctx.emit(Event::Reconstructing {
-                    step,
-                    base: &run.st.base,
-                    worktree: &worktree,
+                    step: step.info(),
+                    base: run.st.base.clone(),
+                    worktree: worktree.clone(),
                 });
                 DeriveState {
                     entry_index: step.index,
@@ -229,7 +215,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
         Ok(this)
     }
 
-    fn ctx(&self) -> &'a Ctx {
+    fn ctx(&self) -> &'a Ctx<'a> {
         self.run.ctx
     }
 
@@ -246,13 +232,13 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
     }
 
     /// Stop for the human, with the progress so far persisted.
-    fn stop(&mut self, doing: &str, files: &[String]) -> Result<()> {
+    fn stop(&mut self, doing: Doing, files: Vec<String>) -> Result<()> {
         self.persist()?;
         self.ctx().emit(Event::DeriveConflict {
-            step: self.step,
+            step: self.step.info(),
             doing,
             files,
-            worktree: &self.worktree,
+            worktree: self.worktree.clone(),
         });
         Ok(())
     }
@@ -286,8 +272,8 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // a parent that is permanently absorbed no longer belongs in
                 // the list.
                 ctx.emit(Event::ParentAbsorbed {
-                    step,
-                    parent: &parent.name,
+                    step: step.info(),
+                    parent: parent.name.clone(),
                 });
             } else {
                 let message = format!(
@@ -307,9 +293,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 )?;
                 if out.status.success() {
                     ctx.emit(Event::ParentMerged {
-                        step,
-                        parent: &parent.name,
-                        oid: &parent_pin,
+                        step: step.info(),
+                        parent: parent.name.clone(),
+                        oid: parent_pin.clone(),
                     });
                 } else {
                     // Before anything else: a parent that cannot merge with
@@ -324,14 +310,16 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                     self.run.st.conflicts += 1;
                     let unresolved = conflicted_files(&self.worktree)?;
                     if !unresolved.is_empty() {
-                        let doing = format!("merging parent {}", parent.name);
-                        self.stop(&doing, &unresolved)?;
+                        let doing = Doing::MergingParent {
+                            parent: parent.name.clone(),
+                        };
+                        self.stop(doing, unresolved)?;
                         return Ok(false);
                     }
                     git::out(&self.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
                     ctx.emit(Event::ParentAutoResolved {
-                        step,
-                        parent: &parent.name,
+                        step: step.info(),
+                        parent: parent.name.clone(),
                     });
                 }
             }
@@ -351,7 +339,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
         let anchor = self.ensure_anchor(pin)?;
         let delta = delta_commits(&self.ctx().repo, pin, &anchor)?;
         self.ctx().emit(Event::Delta {
-            step: self.step,
+            step: self.step.info(),
             commits: delta.len(),
         });
         self.ds.base_tip = Some(base_tip);
@@ -390,9 +378,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
             previous_base_tip.as_deref(),
         )?;
         ctx.emit(Event::Anchor {
-            step: self.step,
-            oid: &anchor.oid,
-            rule: anchor.describe(),
+            step: self.step.info(),
+            oid: anchor.oid.clone(),
+            rule: anchor.rule,
         });
         self.run
             .st
@@ -417,8 +405,11 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 let unresolved = conflicted_files(&self.worktree)?;
                 if !unresolved.is_empty() {
                     self.run.st.conflicts += 1;
-                    let doing = format!("replaying {} ({subject})", git::short(&commit));
-                    self.stop(&doing, &unresolved)?;
+                    let doing = Doing::Replaying {
+                        commit: commit.clone(),
+                        subject,
+                    };
+                    self.stop(doing, unresolved)?;
                     return Ok(false);
                 }
                 // Nothing conflicted, so either rerere replayed every hunk and
@@ -434,9 +425,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 }
             };
             ctx.emit(Event::Replayed {
-                step,
-                commit: &commit,
-                subject: &subject,
+                step: step.info(),
+                commit: commit.clone(),
+                subject,
                 outcome,
             });
             self.ds.next_pick += 1;
@@ -484,14 +475,15 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
             // Attributed to the entry, not the parent: the entry is what the
             // manifest carries and what a later build will replay this for.
             rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-            let what = match entry.parents.get(self.ds.next_parent) {
-                Some(parent) => format!("parent {} merged", parent.name),
-                None => "parent merged".to_string(),
-            };
+            let parent = entry
+                .parents
+                .get(self.ds.next_parent)
+                .map(|parent| parent.name.clone())
+                .unwrap_or_default();
             ctx.emit(Event::Harvested {
-                step,
-                what: &what,
-                pairs: &harvested,
+                step: step.info(),
+                resolved: Resolved::ParentMerge { parent },
+                pairs: harvested,
             });
             self.ds.next_parent += 1;
         } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
@@ -508,18 +500,19 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // replay simply skips it.
                 git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
                 ctx.emit(Event::ReplaySkipped {
-                    step,
-                    commit: &picked,
+                    step: step.info(),
+                    commit: picked.clone(),
                 });
             } else {
                 git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
                 let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
                 rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-                let what = format!("replayed {}", git::short(&picked));
                 ctx.emit(Event::Harvested {
-                    step,
-                    what: &what,
-                    pairs: &harvested,
+                    step: step.info(),
+                    resolved: Resolved::Replay {
+                        commit: picked.clone(),
+                    },
+                    pairs: harvested,
                 });
             }
             self.ds.next_pick += 1;
@@ -602,8 +595,8 @@ pub fn publish(run: &Run, locked: bool) -> Result<()> {
         };
         if locked {
             ctx.emit(Event::PublishSkipped {
-                entry: &entry.name,
-                target: &target.source(),
+                entry: entry.name.clone(),
+                target: target.source(),
             });
             continue;
         }
@@ -637,9 +630,9 @@ pub fn publish(run: &Run, locked: bool) -> Result<()> {
             )
         })?;
         ctx.emit(Event::Published {
-            entry: &entry.name,
-            oid: tip,
-            target: &target.source(),
+            entry: entry.name.clone(),
+            oid: tip.to_string(),
+            target: target.source(),
         });
     }
     Ok(())

@@ -1,3 +1,10 @@
+//! The CLI: parse, run one verb, render what it returned.
+//!
+//! Nothing outside `output` may print. A verb computes and returns; a build
+//! emits events; `output` turns both, and the error that ends a command,
+//! into text or JSON.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 mod add;
 mod engine;
 mod git;
@@ -5,6 +12,7 @@ mod init;
 mod lock;
 mod manifest;
 mod ops;
+mod output;
 mod report;
 mod rerere;
 mod source;
@@ -15,9 +23,14 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use output::{Format, Out};
+
 #[derive(Parser)]
 #[command(name = "fork-assembler", version, about)]
 struct Cli {
+    /// How to report: lines for a terminal, or one JSON object per line
+    #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
+    format: Format,
     #[command(subcommand)]
     command: Command,
 }
@@ -119,40 +132,62 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// Run one verb; the process exit code on success.
+fn run(command: Command, out: &Out) -> Result<i32> {
     let root = std::env::current_dir()?;
-    match cli.command {
+    match command {
         Command::Init {
             dir,
             upstream,
             base_ref,
             submodule,
-        } => init::init(dir.unwrap_or(root), upstream, base_ref, submodule),
+        } => out.result(&init::init(
+            dir.unwrap_or(root),
+            upstream,
+            base_ref,
+            submodule,
+        )?),
         Command::Add {
             target,
             pr,
             patch,
             parents,
             prs_from,
-        } => add::add(&root, target, pr, patch, parents, prs_from),
+        } => out.result(&add::add(&root, target, pr, patch, parents, prs_from)?),
         Command::Exclude {
             target,
             pr,
             patch,
             reason,
-        } => add::exclude(&root, target, pr, patch, reason),
-        Command::Build { locked } => std::process::exit(engine::build(&root, locked)?),
-        Command::Continue => std::process::exit(engine::cont(&root)?),
-        Command::Update { entries } => ops::update(&root, &entries),
+        } => out.result(&add::exclude(&root, target, pr, patch, reason)?),
+        Command::Build { locked } => return engine::build(&root, locked, out),
+        Command::Continue => return engine::cont(&root, out),
+        Command::Update { entries } => out.result(&ops::update(&root, &entries, out)?),
         Command::Fixup {
             entry,
             path,
             capture,
             remove,
-        } => ops::fixup(&root, &entry, path.as_deref(), capture, remove),
-        Command::Remove { name } => ops::remove(&root, name),
-        Command::Prune { dry_run } => ops::prune(&root, dry_run),
-        Command::Status { live } => ops::status(&root, live),
+        } => out.result(&ops::fixup(
+            &root,
+            &entry,
+            path.as_deref(),
+            capture,
+            remove,
+        )?),
+        Command::Remove { name } => out.result(&ops::remove(&root, name)?),
+        Command::Prune { dry_run } => out.result(&ops::prune(&root, dry_run)?),
+        Command::Status { live } => out.result(&ops::status(&root, live, out)?),
     }
+    Ok(0)
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let out = Out::new(cli.format);
+    let code = match run(cli.command, &out) {
+        Ok(code) => code,
+        Err(err) => out.error(&err),
+    };
+    std::process::exit(code);
 }

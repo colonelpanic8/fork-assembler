@@ -7,10 +7,11 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use toml_edit::{value, Array, InlineTable, Item};
 
 use crate::manifest::edit::{self, Carried, Document, Excluded};
-use crate::manifest::{entries_noun, Exclusion, Target, FILE};
+use crate::manifest::{Exclusion, Target};
 
 /// The refusal an explicitly named target gets when the manifest already
 /// says something about it.
@@ -75,15 +76,20 @@ fn open_prs_by(slug: &str, author: &str) -> Result<Vec<(i64, String)>> {
 }
 
 /// What a discovery sweep decides about one PR it found.
-#[derive(Debug, PartialEq, Eq)]
-enum Discovered {
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Discovered {
     Append,
     AlreadyCarried,
     /// Carried inside the named entry, which merged it and builds on it. Not
     /// an exclusion: the entry says why this PR stays out of the list, and
     /// says it more precisely than any reason string could.
-    CarriedAsParent(String),
-    Excluded(String),
+    CarriedAsParent {
+        entry: String,
+    },
+    Excluded {
+        reason: String,
+    },
 }
 
 /// Sort discovered PRs into append / already-carried / parent / excluded.
@@ -103,9 +109,13 @@ fn triage_discovered(
             let verdict = if carried.contains(&target) {
                 Discovered::AlreadyCarried
             } else if let Some(entry) = parents.get(&target) {
-                Discovered::CarriedAsParent(entry.clone())
+                Discovered::CarriedAsParent {
+                    entry: entry.clone(),
+                }
             } else if let Some(exclusion) = exclusions.iter().find(|x| x.target == target) {
-                Discovered::Excluded(exclusion.reason_text().to_string())
+                Discovered::Excluded {
+                    reason: exclusion.reason_text().to_string(),
+                }
             } else {
                 Discovered::Append
             };
@@ -114,39 +124,32 @@ fn triage_discovered(
         .collect()
 }
 
+#[derive(Serialize)]
+pub struct ExcludeReport {
+    pub target: Target,
+    /// Whether the operator gave a reason; an exclusion without one is
+    /// worth a nudge.
+    pub reason_given: bool,
+    #[serde(flatten)]
+    pub outcome: Excluded,
+}
+
 pub fn exclude(
     root: &Path,
     target: Option<String>,
     pr: Option<u64>,
     patch: Option<String>,
     reason: Option<String>,
-) -> Result<()> {
+) -> Result<ExcludeReport> {
     let target = Exclusion::from_fields(target, pr.map(|n| n as i64), patch, None)
         .context("nothing to exclude: pass REMOTE:BRANCH, --pr, or --patch")?
         .target;
-    match edit::record_exclusion(root, &target, reason.as_deref())? {
-        Excluded::Added => {
-            println!("excluded {}", target.label());
-            if reason.is_none() {
-                println!(
-                    "  no reason recorded -- add one with `--reason` so the refusal \
-                     is still legible later"
-                );
-            }
-            println!("  the lock is untouched; nothing needs rebuilding");
-        }
-        Excluded::AlreadyRecorded => {
-            println!("already excluded: {}", target.label())
-        }
-        Excluded::ReasonUpdated { previous } => {
-            println!("already excluded: {}", target.label());
-            match previous {
-                Some(previous) => println!("  reason updated (was: {previous})"),
-                None => println!("  reason recorded"),
-            }
-        }
-    }
-    Ok(())
+    let outcome = edit::record_exclusion(root, &target, reason.as_deref())?;
+    Ok(ExcludeReport {
+        target,
+        reason_given: reason.is_some(),
+        outcome,
+    })
 }
 
 /// One `--parent` argument: a PR number, or a REMOTE:BRANCH.
@@ -189,22 +192,52 @@ fn parents_array(parents: &[Target]) -> Array {
     array
 }
 
+/// One thing `add` did, in the order it did them.
+#[derive(Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Admitted {
+    Added {
+        target: Target,
+        parents: Vec<Target>,
+    },
+    AlreadyCarried {
+        target: Target,
+    },
+    NoOpenPrs {
+        author: String,
+        slug: String,
+    },
+    /// One PR a `--prs-from` sweep found, and what was decided about it.
+    Discovered {
+        number: i64,
+        title: String,
+        #[serde(flatten)]
+        verdict: Discovered,
+    },
+}
+
+#[derive(Serialize)]
+pub struct AddReport {
+    pub log: Vec<Admitted>,
+    /// Entries appended to the manifest; zero means it was left untouched.
+    pub appended: usize,
+}
+
 /// One explicitly named target: refused, already carried, or appended with
-/// its parents. Returns whether an entry was appended.
+/// its parents.
 fn admit(
     doc: &mut Document,
     carried: &Carried,
     exclusions: &[Exclusion],
-    target: &Target,
+    target: Target,
     parents: &[Target],
-) -> Result<bool> {
-    reject_if_refused(exclusions, carried, target)?;
-    if carried.entries.contains(target) {
-        println!("already carried: {}", target.label());
-        return Ok(false);
+) -> Result<Admitted> {
+    reject_if_refused(exclusions, carried, &target)?;
+    if carried.entries.contains(&target) {
+        return Ok(Admitted::AlreadyCarried { target });
     }
     doc.push_entry(|t| {
-        match target {
+        match &target {
             Target::Branch { spec } => t["branch"] = value(spec),
             Target::Pr { number } => t["pr"] = value(*number),
             Target::Patch { path } => t["patch"] = value(path),
@@ -213,11 +246,10 @@ fn admit(
             t["parents"] = Item::Value(parents_array(parents).into());
         }
     });
-    println!("added {}", target.label());
-    for parent in parents {
-        println!("  parent: {}", parent.label());
-    }
-    Ok(true)
+    Ok(Admitted::Added {
+        target,
+        parents: parents.to_vec(),
+    })
 }
 
 pub fn add(
@@ -227,7 +259,7 @@ pub fn add(
     patch: Option<String>,
     parents: Vec<String>,
     prs_from: Option<String>,
-) -> Result<()> {
+) -> Result<AddReport> {
     if target.is_none() && pr.is_none() && patch.is_none() && prs_from.is_none() {
         bail!("nothing to add: pass REMOTE:BRANCH, --pr, --patch, or --prs-from");
     }
@@ -255,6 +287,7 @@ pub fn add(
     let mut doc = Document::read(root)?;
     let carried = doc.carried();
     let exclusions = doc.exclusions()?;
+    let mut log = Vec::new();
     let mut appended = 0usize;
 
     let named = [
@@ -262,49 +295,43 @@ pub fn add(
         pr.map(|n| Target::Pr { number: n as i64 }),
         patch.map(|path| Target::Patch { path }),
     ];
-    for target in named.iter().flatten() {
+    for target in named.into_iter().flatten() {
         // Only a live entry can have parents; `one_entry` guaranteed that
         // when any were declared, the only named target is that entry.
-        if admit(&mut doc, &carried, &exclusions, target, &declared)? {
+        let admitted = admit(&mut doc, &carried, &exclusions, target, &declared)?;
+        if matches!(admitted, Admitted::Added { .. }) {
             appended += 1;
         }
+        log.push(admitted);
     }
     if let Some(author) = prs_from {
         let slug = doc.base_repo_slug()?;
         let prs = open_prs_by(&slug, &author)?;
         if prs.is_empty() {
-            println!("no open PRs by {author} on {slug}");
+            log.push(Admitted::NoOpenPrs { author, slug });
         }
-        for (n, title, verdict) in
+        for (number, title, verdict) in
             triage_discovered(&prs, &carried.entries, &carried.parents, &exclusions)
         {
-            match verdict {
-                Discovered::AlreadyCarried => println!("already carried: pr {n} ({title})"),
-                Discovered::CarriedAsParent(entry) => {
-                    println!("carried as a parent of {entry}: pr {n} ({title}) -- not added")
-                }
-                Discovered::Excluded(reason) => {
-                    println!("excluded: pr {n} ({title}) -- not added: {reason}")
-                }
-                Discovered::Append => {
-                    doc.push_entry(|t| {
-                        t["pr"] = value(n);
-                        t["summary"] = value(&title);
-                    });
-                    println!("added pr {n} ({title})");
-                    appended += 1;
-                }
+            if verdict == Discovered::Append {
+                doc.push_entry(|t| {
+                    t["pr"] = value(number);
+                    t["summary"] = value(&title);
+                });
+                appended += 1;
             }
+            log.push(Admitted::Discovered {
+                number,
+                title,
+                verdict,
+            });
         }
     }
 
     if appended > 0 {
         doc.save()?;
-        println!("{appended} {} appended to {FILE}", entries_noun(appended));
-    } else {
-        println!("manifest unchanged");
     }
-    Ok(())
+    Ok(AddReport { log, appended })
 }
 
 #[cfg(test)]
@@ -330,6 +357,18 @@ mod tests {
         }
     }
 
+    fn excluded(reason: &str) -> Discovered {
+        Discovered::Excluded {
+            reason: reason.into(),
+        }
+    }
+
+    fn carried_as_parent(entry: &str) -> Discovered {
+        Discovered::CarriedAsParent {
+            entry: entry.into(),
+        }
+    }
+
     /// The sweep's whole job: an excluded PR is skipped with its reason while
     /// everything else it found is still appended.
     #[test]
@@ -340,7 +379,7 @@ mod tests {
         assert_eq!(
             verdicts.iter().map(|(n, _, v)| (*n, v)).collect::<Vec<_>>(),
             vec![
-                (7, &Discovered::Excluded("superseded by 10".into())),
+                (7, &excluded("superseded by 10")),
                 (8, &Discovered::AlreadyCarried),
                 (9, &Discovered::Append),
             ]
@@ -356,10 +395,7 @@ mod tests {
             &HashMap::new(),
             &[excluding(7, None)],
         );
-        assert_eq!(
-            verdicts[0].2,
-            Discovered::Excluded("no reason recorded".into())
-        );
+        assert_eq!(verdicts[0].2, excluded("no reason recorded"));
     }
 
     /// Carried wins the report when a target is somehow both: the manifest
@@ -386,7 +422,7 @@ mod tests {
         assert_eq!(
             verdicts.iter().map(|(n, _, v)| (*n, v)).collect::<Vec<_>>(),
             vec![
-                (7, &Discovered::CarriedAsParent("combined".into())),
+                (7, &carried_as_parent("combined")),
                 (8, &Discovered::Append),
                 (9, &Discovered::Append),
             ]
@@ -404,9 +440,6 @@ mod tests {
             &parents,
             &[excluding(7, Some("stale"))],
         );
-        assert_eq!(
-            verdicts[0].2,
-            Discovered::CarriedAsParent("combined".into())
-        );
+        assert_eq!(verdicts[0].2, carried_as_parent("combined"));
     }
 }

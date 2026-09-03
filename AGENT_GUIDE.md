@@ -16,6 +16,15 @@ prefix-extension of the lock (append = cheap incremental build; reorder or
 removal = suffix rebuild with likely re-resolution), and whether the last
 build completed.
 
+## Machine-readable output
+
+Every verb accepts `--format json`. Instead of prose it writes one JSON object
+per line to stdout, each tagged by `type`: an `event` as a build or `continue`
+progresses (`event` names it: `merged`, `conflict`, `fixup_failed`, ...), a
+`result` carrying a verb's data under `data` (`verb` names it), or the `error`
+that ended the command. Exit codes are unchanged. Prefer it whenever a script
+or an agent consumes the output rather than a person reading a terminal.
+
 ## Appending to the stack
 
 1. Run `fork-assembler add REMOTE:BRANCH` (or `--pr N`, or `--patch FILE`). For a

@@ -14,6 +14,7 @@ use anyhow::{bail, Result};
 
 use crate::git;
 use crate::manifest::Manifest;
+use crate::report::{Event, Report};
 
 pub fn source_path(root: &Path, manifest: &Manifest) -> PathBuf {
     match &manifest.base.submodule {
@@ -44,7 +45,12 @@ fn ensure_remote(repo: &Path, name: &str, url: &str) -> Result<()> {
 }
 
 /// Locate (and, when permitted, create) the source repo, then configure it.
-pub fn source_repo(root: &Path, manifest: &Manifest, allow_clone: bool) -> Result<PathBuf> {
+pub fn source_repo(
+    root: &Path,
+    manifest: &Manifest,
+    allow_clone: bool,
+    report: &dyn Report,
+) -> Result<PathBuf> {
     let path = source_path(root, manifest);
     if manifest.base.submodule.is_some() {
         if !git::ok(&path, &["rev-parse", "--git-dir"]) {
@@ -64,7 +70,10 @@ pub fn source_repo(root: &Path, manifest: &Manifest, allow_clone: bool) -> Resul
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        println!("cloning {} into {}...", url, path.display());
+        report.event(&Event::Cloning {
+            url: url.to_string(),
+            path: path.clone(),
+        });
         git::out(root, &["clone", url, &path.to_string_lossy()])?;
     } else if !git::ok(&path, &["rev-parse", "--git-dir"]) {
         bail!(

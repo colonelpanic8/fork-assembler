@@ -308,3 +308,40 @@ fn removing_an_entry_drops_its_pin_from_the_lock() {
     assert!(lock["pins"]["entries"]["a"].is_null(), "{lock}");
     assert!(lock["pins"]["entries"]["b"].is_string(), "{lock}");
 }
+
+/// `--format json` says the same things as one JSON object per line, so a
+/// machine can follow a build and read a status without parsing prose.
+#[test]
+fn json_format_reports_events_results_and_errors() {
+    let fx = fixture();
+    topic(&fx, "t1", "a.txt", "t1\n");
+    add_branch(&fx, "t1");
+
+    let out = ff_ok(&fx.root, &["--format", "json", "build"]);
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON: {line}: {e}")))
+        .collect();
+    assert!(lines.iter().all(|line| line["type"] == "event"), "{out}");
+    let merged = lines
+        .iter()
+        .find(|line| line["event"] == "merged")
+        .expect("a merged event");
+    assert_eq!(merged["entry"], "t1");
+    assert_eq!(merged["index"], 0);
+    assert!(lines.iter().any(|line| line["event"] == "lock_written"));
+
+    let out = ff_ok(&fx.root, &["--format", "json", "status"]);
+    let status: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(status["type"], "result");
+    assert_eq!(status["verb"], "status");
+    assert_eq!(status["data"]["entries"][0]["name"], "t1");
+    assert_eq!(status["data"]["last_build"]["relation"], "exact");
+
+    let out = ff(&fx.root, &["--format", "json", "add"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(err["type"], "error");
+    assert!(err["message"].as_str().unwrap().contains("nothing to add"));
+}

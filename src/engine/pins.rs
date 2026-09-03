@@ -164,8 +164,8 @@ pub fn ensure_pin(
     }
     let oid = fetch_entry(ctx, entry)?;
     ctx.emit(Event::Pinned {
-        name: &entry.name,
-        oid: &oid,
+        entry: entry.name.clone(),
+        oid: oid.clone(),
     });
     pins.insert(entry.name.clone(), oid.clone());
     Ok(oid)
@@ -197,9 +197,9 @@ pub fn ensure_parent_pins(
                 }
                 let oid = fetch_parent(ctx, entry, parent)?;
                 ctx.emit(Event::PinnedParent {
-                    entry: &entry.name,
-                    parent: &parent.name,
-                    oid: &oid,
+                    entry: entry.name.clone(),
+                    parent: parent.name.clone(),
+                    oid: oid.clone(),
                 });
                 pins.insert(parent.name.clone(), oid);
             }

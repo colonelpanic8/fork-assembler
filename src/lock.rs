@@ -256,15 +256,17 @@ pub fn snapshot(
         .collect()
 }
 
+#[derive(Serialize)]
+#[serde(tag = "relation", rename_all = "snake_case")]
 pub enum Prefix {
     /// No completed build recorded.
     NoBuild,
     /// Manifest and pins exactly match the last build.
     Exact,
     /// Last build is an exact prefix; the new suffix starts at this index.
-    Extension(usize),
+    Extension { at: usize },
     /// The prefix no longer matches (reason).
-    Diverged(String),
+    Diverged { reason: String },
 }
 
 /// Why one snapshot entry no longer matches the locked one.
@@ -310,26 +312,36 @@ pub fn prefix_relation(lock: &Lock, current: &[SnapshotEntry], base_pin: &str) -
         return Prefix::NoBuild;
     };
     if build.base != base_pin {
-        return Prefix::Diverged(format!(
-            "base pin moved ({} -> {})",
-            git::short(&build.base),
-            git::short(base_pin)
-        ));
+        return Prefix::Diverged {
+            reason: format!(
+                "base pin moved ({} -> {})",
+                git::short(&build.base),
+                git::short(base_pin)
+            ),
+        };
     }
     if build.results.len() != build.manifest_entries.len() {
-        return Prefix::Diverged("the lock's results do not match its manifest snapshot".into());
+        return Prefix::Diverged {
+            reason: "the lock's results do not match its manifest snapshot".into(),
+        };
     }
     if current.len() < build.manifest_entries.len() {
-        return Prefix::Diverged("entries were removed since the last build".into());
+        return Prefix::Diverged {
+            reason: "entries were removed since the last build".into(),
+        };
     }
     for (idx, locked) in build.manifest_entries.iter().enumerate() {
         if &current[idx] != locked {
-            return Prefix::Diverged(diverged_reason(idx, &current[idx], locked));
+            return Prefix::Diverged {
+                reason: diverged_reason(idx, &current[idx], locked),
+            };
         }
     }
     if current.len() == build.manifest_entries.len() {
         Prefix::Exact
     } else {
-        Prefix::Extension(build.manifest_entries.len())
+        Prefix::Extension {
+            at: build.manifest_entries.len(),
+        }
     }
 }

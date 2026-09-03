@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 use super::{entry_name, load, slug_from_url, Exclusion, Kind, Target, FILE};
@@ -203,22 +204,35 @@ fn exclude_target(table: &Table) -> Option<Target> {
 }
 
 /// What removing entries detached along with them.
+#[derive(Serialize)]
 pub struct Removal {
     /// Position of the earliest removed entry: the suffix invalidated.
     pub earliest: usize,
-    /// (entry name, fixup path) for each removed entry that carried a
-    /// coherence fixup. The files are left on disk: a fixup is owned by the
-    /// *interaction* between entries, so when one side of that interaction
-    /// leaves (typically because it landed upstream), the incoherence it
-    /// repaired often persists and the patch needs re-homing rather than
-    /// deleting. Callers must surface these.
-    pub orphaned_fixups: Vec<(String, String)>,
-    /// (entry name, parent labels) for each removed derived entry. A parent
-    /// was kept out of the entry list by the declaration that just vanished,
-    /// so unlike a fixup it leaves no file behind — it leaves a hole in the
+    /// Removed entries that carried a coherence fixup. The files are left
+    /// on disk: a fixup is owned by the *interaction* between entries, so
+    /// when one side of that interaction leaves (typically because it landed
+    /// upstream), the incoherence it repaired often persists and the patch
+    /// needs re-homing rather than deleting. Callers must surface these.
+    pub orphaned_fixups: Vec<OrphanedFixup>,
+    /// Removed derived entries and the parents they declared. A parent was
+    /// kept out of the entry list by the declaration that just vanished, so
+    /// unlike a fixup it leaves no file behind — it leaves a hole in the
     /// manifest's intent, and an open PR discovery will offer again. Callers
     /// must surface these.
-    pub orphaned_parents: Vec<(String, Vec<String>)>,
+    pub orphaned_parents: Vec<OrphanedParents>,
+}
+
+#[derive(Serialize)]
+pub struct OrphanedFixup {
+    pub entry: String,
+    pub path: String,
+}
+
+#[derive(Serialize)]
+pub struct OrphanedParents {
+    pub entry: String,
+    /// The parents' target labels.
+    pub parents: Vec<String>,
 }
 
 /// Remove the named entries from manifest.toml (comment-preserving).
@@ -234,13 +248,18 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
     let removed = indices.iter().map(|idx| &manifest.entries[*idx]);
     let orphaned_fixups = removed
         .clone()
-        .filter_map(|entry| entry.fixup.clone().map(|path| (entry.name.clone(), path)))
+        .filter_map(|entry| {
+            entry.fixup.clone().map(|path| OrphanedFixup {
+                entry: entry.name.clone(),
+                path,
+            })
+        })
         .collect();
     let orphaned_parents = removed
         .filter(|entry| entry.is_derived())
-        .map(|entry| {
-            let labels = entry.parents.iter().map(|p| p.target().label()).collect();
-            (entry.name.clone(), labels)
+        .map(|entry| OrphanedParents {
+            entry: entry.name.clone(),
+            parents: entry.parents.iter().map(|p| p.target().label()).collect(),
         })
         .collect();
 
@@ -258,6 +277,8 @@ pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
 }
 
 /// What `record_exclusion` did to the manifest.
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Excluded {
     /// A new `[[exclude]]` table was appended.
     Added,

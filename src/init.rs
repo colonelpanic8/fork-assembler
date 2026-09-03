@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 
 const TPL_FLAKE: &str = include_str!("../templates/maintenance/flake.nix");
 const TPL_ENVRC: &str = include_str!("../templates/maintenance/.envrc");
@@ -43,12 +44,17 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize)]
+pub struct InitReport {
+    pub dir: PathBuf,
+}
+
 pub fn init(
     dir: PathBuf,
     upstream: Option<String>,
     base_ref: String,
     submodule: bool,
-) -> Result<()> {
+) -> Result<InitReport> {
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let manifest_path = dir.join("manifest.toml");
     if manifest_path.exists() {
@@ -103,10 +109,5 @@ pub fn init(
         run_git(&dir, &["submodule", "add", &url, "upstream"])?;
     }
 
-    println!(
-        "initialized fork-assembler maintenance repo in {}",
-        dir.display()
-    );
-    println!("next: edit manifest.toml, `direnv allow`, then `fork-assembler add` / `fork-assembler build`");
-    Ok(())
+    Ok(InitReport { dir })
 }

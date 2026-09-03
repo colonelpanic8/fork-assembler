@@ -25,7 +25,7 @@ use chrono::Utc;
 use crate::git;
 use crate::lock::{self, EntryResult, Lock, Prefix, Status};
 use crate::manifest::{self, Entry, Kind, Manifest};
-use crate::report::{self, Event, Outcome, Report};
+use crate::report::{Event, Outcome, Report, Resolved};
 use crate::rerere;
 use crate::source;
 use crate::state::{self, State};
@@ -42,37 +42,37 @@ pub const DERIVE_WORKTREE: &str = ".worktrees/derive";
 /// Exit code signalling "stopped for human resolution".
 pub const STOPPED: i32 = 2;
 
-pub struct Ctx {
+pub struct Ctx<'r> {
     pub root: PathBuf,
     pub manifest: Manifest,
     pub repo: PathBuf,
     pub worktree: PathBuf,
-    pub report: Box<dyn Report>,
+    pub report: &'r dyn Report,
 }
 
-impl Ctx {
-    pub fn new(root: &Path, manifest: Manifest, repo: PathBuf) -> Ctx {
+impl<'r> Ctx<'r> {
+    pub fn new(root: &Path, manifest: Manifest, repo: PathBuf, report: &'r dyn Report) -> Ctx<'r> {
         Ctx {
             root: root.to_path_buf(),
             worktree: root.join(WORKTREE),
             manifest,
             repo,
-            report: Box::new(report::Text),
+            report,
         }
     }
 
-    pub fn open(root: &Path, allow_clone: bool) -> Result<Ctx> {
+    pub fn open(root: &Path, allow_clone: bool, report: &'r dyn Report) -> Result<Ctx<'r>> {
         let manifest = manifest::load(root)?;
-        let repo = source::source_repo(root, &manifest, allow_clone)?;
-        Ok(Ctx::new(root, manifest, repo))
+        let repo = source::source_repo(root, &manifest, allow_clone, report)?;
+        Ok(Ctx::new(root, manifest, repo, report))
     }
 
     pub fn derive_worktree(&self) -> PathBuf {
         self.root.join(DERIVE_WORKTREE)
     }
 
-    pub fn emit(&self, event: Event<'_>) {
-        self.report.event(event)
+    pub fn emit(&self, event: Event) {
+        self.report.event(&event)
     }
 
     /// The entry at `index`, as one step of the run.
@@ -95,7 +95,7 @@ pub struct Step<'a> {
 /// One in-progress build: the context it runs in and the state it persists
 /// after every step. `build` starts one; `cont` picks one back up.
 pub struct Run<'a> {
-    pub ctx: &'a Ctx,
+    pub ctx: &'a Ctx<'a>,
     pub st: State,
 }
 
@@ -179,7 +179,7 @@ impl<'a> Run<'a> {
         state::write(&self.ctx.worktree, &self.st)
     }
 
-    fn emit(&self, event: Event<'_>) {
+    fn emit(&self, event: Event) {
         self.ctx.emit(event)
     }
 
@@ -208,8 +208,8 @@ impl<'a> Run<'a> {
             match apply_patch_file(ctx, path, &message)? {
                 Apply::Done(outcome) => {
                     self.emit(Event::Fixup {
-                        step,
-                        path,
+                        step: step.info(),
+                        path: path.clone(),
                         outcome,
                     });
                     result.fixup = Some(blob);
@@ -218,10 +218,10 @@ impl<'a> Run<'a> {
                     self.st.pending = Some(result);
                     self.stall(step.index)?;
                     self.emit(Event::FixupFailed {
-                        step,
-                        path,
-                        stderr: &stderr,
-                        worktree: &ctx.worktree,
+                        step: step.info(),
+                        path: path.clone(),
+                        stderr,
+                        worktree: ctx.worktree.clone(),
                     });
                     return Ok(false);
                 }
@@ -243,14 +243,17 @@ impl<'a> Run<'a> {
             Apply::Failed(stderr) => {
                 self.stall(step.index)?;
                 self.emit(Event::PatchFailed {
-                    step,
-                    stderr: &stderr,
-                    worktree: &ctx.worktree,
+                    step: step.info(),
+                    stderr,
+                    worktree: ctx.worktree.clone(),
                 });
                 return Ok(Some(STOPPED));
             }
         };
-        self.emit(Event::Applied { step, outcome });
+        self.emit(Event::Applied {
+            step: step.info(),
+            outcome,
+        });
         // Patch entries cannot carry a fixup (the manifest rejects it), so
         // this only records and advances.
         let result = EntryResult::new(&step.entry.name, oid, Status::Applied);
@@ -274,7 +277,7 @@ impl<'a> Run<'a> {
         let ctx = self.ctx;
         let entry = step.entry;
         if git::is_ancestor(&ctx.repo, &oid, &self.st.base) {
-            self.emit(Event::Absorbed { step });
+            self.emit(Event::Absorbed { step: step.info() });
             // A derived entry stops here too, before any reconstruction: the
             // base already contains the whole thing, parents and own commits
             // alike, so there is nothing left to rebuild it out of.
@@ -306,12 +309,12 @@ impl<'a> Run<'a> {
         if clean {
             let after = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
             if before == after {
-                self.emit(Event::Empty { step });
+                self.emit(Event::Empty { step: step.info() });
                 result.status = Status::Empty;
             } else {
                 self.emit(Event::Merged {
-                    step,
-                    oid: merging,
+                    step: step.info(),
+                    oid: merging.to_string(),
                     reconstruction: derived.is_some(),
                 });
             }
@@ -332,9 +335,9 @@ impl<'a> Run<'a> {
             if !unresolved.is_empty() {
                 self.stall(step.index)?;
                 self.emit(Event::Conflict {
-                    step,
-                    files: &unresolved,
-                    worktree: &ctx.worktree,
+                    step: step.info(),
+                    files: unresolved,
+                    worktree: ctx.worktree.clone(),
                 });
                 return Ok(Some(STOPPED));
             }
@@ -345,7 +348,7 @@ impl<'a> Run<'a> {
                 .map(|(hash, _)| hash)
                 .collect();
             git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-            self.emit(Event::AutoResolved { step });
+            self.emit(Event::AutoResolved { step: step.info() });
             result.conflicted = true;
             result.resolution = Some(rerere::label(&hashes));
         }
@@ -424,12 +427,12 @@ impl<'a> Run<'a> {
         let built_tree = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
 
         let previous_build = previous.and_then(|l| l.build.as_ref());
-        let previous_tree = previous_build.map(|b| b.tree.as_str());
+        let previous_tree = previous_build.map(|b| b.tree.clone());
         self.emit(Event::Finished {
-            tree: &tree,
-            commit: &head,
+            tree: tree.clone(),
+            commit: head.clone(),
             conflicts: st.conflicts,
-            previous_tree,
+            previous_tree: previous_tree.clone(),
         });
 
         if write_lock {
@@ -452,8 +455,8 @@ impl<'a> Run<'a> {
                 pre_provenance_commit: pre_provenance,
                 tree: tree.clone(),
                 built_tree,
-                previous_tree: previous_tree.map(str::to_string),
-                tree_changed: previous_tree != Some(tree.as_str()),
+                tree_changed: previous_tree.as_deref() != Some(tree.as_str()),
+                previous_tree,
                 conflicts: st.conflicts,
                 manifest_entries,
                 results: st.results.clone(),
@@ -505,8 +508,8 @@ impl<'a> Run<'a> {
         // was just committed, so a rebuild stalls here again; the event says
         // so.
         self.emit(Event::FixupCommitted {
-            step: &step,
-            path: &path,
+            step: step.info(),
+            path,
         });
         Ok(())
     }
@@ -531,9 +534,9 @@ impl<'a> Run<'a> {
             None => git::out(&ctx.worktree, &["rev-parse", "HEAD^2"])?,
         };
         self.emit(Event::Harvested {
-            step: &step,
-            what: "resolved",
-            pairs: &harvested,
+            step: step.info(),
+            resolved: Resolved::StackMerge,
+            pairs: harvested.clone(),
         });
         let mut result = EntryResult::new(&entry.name, oid, Status::Merged);
         result.conflicted = true;
@@ -575,7 +578,7 @@ fn ensure_base(ctx: &Ctx, pinned: Option<String>, locked: bool) -> Result<String
             bail!("no base pin recorded and --locked forbids pinning");
         }
         let oid = fetch_base(ctx)?;
-        ctx.emit(Event::PinnedBase { oid: &oid });
+        ctx.emit(Event::PinnedBase { oid: oid.clone() });
         return Ok(oid);
     };
     if !git::has_commit(&ctx.repo, &base) {
@@ -590,8 +593,8 @@ fn ensure_base(ctx: &Ctx, pinned: Option<String>, locked: bool) -> Result<String
     Ok(base)
 }
 
-pub fn build(root: &Path, locked: bool) -> Result<i32> {
-    let ctx = Ctx::open(root, !locked)?;
+pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
+    let ctx = Ctx::open(root, !locked, report)?;
     if state::read(&ctx.worktree).is_ok_and(|st| st.is_some()) {
         bail!(
             "a build is already in progress in {}; finish it with `fork-assembler continue` \
@@ -644,16 +647,18 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         (Prefix::Exact, Some(build))
             if !locked && git::has_commit(&ctx.repo, &build.pre_provenance_commit) =>
         {
-            ctx.emit(Event::UpToDate { tree: &build.tree });
+            ctx.emit(Event::UpToDate {
+                tree: build.tree.clone(),
+            });
             return Ok(0);
         }
-        (Prefix::Extension(prefix_len), Some(build))
+        (Prefix::Extension { at }, Some(build))
             if !locked && git::has_commit(&ctx.repo, &build.pre_provenance_commit) =>
         {
             ctx.emit(Event::Extending {
-                new_entries: snapshot.len() - prefix_len,
+                new_entries: snapshot.len() - at,
             });
-            start = prefix_len;
+            start = at;
             results = build.results.clone();
             extended_from = Some(build.pre_provenance_commit.clone());
             start_commit = build.pre_provenance_commit.clone();
@@ -661,7 +666,7 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         _ => {}
     }
     if start == 0 {
-        ctx.emit(Event::FromBase { base: &base });
+        ctx.emit(Event::FromBase { base: base.clone() });
     }
 
     prepare_worktree(&ctx, &ctx.worktree, &start_commit)?;
@@ -694,8 +699,8 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     run.drive(start, previous.as_ref(), locked)
 }
 
-pub fn cont(root: &Path) -> Result<i32> {
-    let ctx = Ctx::open(root, true)?;
+pub fn cont(root: &Path, report: &dyn Report) -> Result<i32> {
+    let ctx = Ctx::open(root, true, report)?;
     let Some(st) = state::read(&ctx.worktree)? else {
         bail!("no in-progress build found; run `fork-assembler build`");
     };

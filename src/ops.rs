@@ -1,31 +1,55 @@
-//! Non-build verbs: update (the only pin-mover), status, prune, fixup.
+//! Non-build verbs: update (the only pin-mover), status, prune, remove,
+//! fixup. Each returns what it found or did; `output` decides how to say it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Result};
+use serde::Serialize;
 
-use crate::engine::{self, derive, refuse, Ctx};
-use crate::git::{self, short};
+use crate::engine::derive::{self, Anchor};
+use crate::engine::{self, refuse, Ctx};
+use crate::git;
 use crate::lock::{self, EntryResult, Prefix, Status};
-use crate::manifest::{self, edit, entries_noun, Entry};
+use crate::manifest::edit::{self, Removal};
+use crate::manifest::{self, Entry, Exclusion};
+use crate::report::Report;
 use crate::rerere;
 use crate::source;
 use crate::state;
 
-/// Print how a pin moved, in the vocabulary every repin report shares.
-fn report_pin(indent: &str, what: &str, old: Option<&str>, new: &str) {
-    match old {
-        Some(old) if old == new => println!("{indent}{what}: unchanged ({})", short(new)),
-        Some(old) => println!("{indent}{what}: {} -> {}", short(old), short(new)),
-        None => println!("{indent}{what}: pinned {}", short(new)),
-    }
+/// How a pin moved: nothing recorded before, the same OID, or a new one.
+#[derive(Serialize)]
+pub struct PinMove {
+    pub old: Option<String>,
+    pub new: String,
+}
+
+#[derive(Serialize)]
+pub struct ParentUpdate {
+    pub parent: String,
+    pub pin: PinMove,
+}
+
+#[derive(Serialize)]
+pub struct EntryUpdate {
+    pub entry: String,
+    pub pin: PinMove,
+    /// A derived entry's parents, then the anchor re-established from them.
+    pub parents: Vec<ParentUpdate>,
+    pub anchor: Option<Anchor>,
+}
+
+#[derive(Serialize)]
+pub struct UpdateReport {
+    pub base: Option<PinMove>,
+    pub entries: Vec<EntryUpdate>,
 }
 
 /// Repin the base and entries to live heads. `build` never moves existing
 /// pins; this is the only verb that does.
-pub fn update(root: &Path, names: &[String]) -> Result<()> {
-    let ctx = Ctx::open(root, true)?;
+pub fn update(root: &Path, names: &[String], report: &dyn Report) -> Result<UpdateReport> {
+    let ctx = Ctx::open(root, true, report)?;
     let mut lock = lock::load(root)?.unwrap_or_default();
     let all = names.is_empty();
     let wants = |name: &str| all || names.iter().any(|n| n == name);
@@ -36,27 +60,38 @@ pub fn update(root: &Path, names: &[String]) -> Result<()> {
         }
     }
 
+    let mut base = None;
     if wants("base") {
         let new = engine::fetch_base(&ctx)?;
-        report_pin("  ", "base", lock.pins.base.as_deref(), &new);
-        lock.pins.base = Some(new);
+        base = Some(PinMove {
+            old: lock.pins.base.replace(new.clone()),
+            new,
+        });
     }
 
+    let mut entries = Vec::new();
     for entry in &ctx.manifest.entries {
         if !wants(&entry.name) {
             continue;
         }
         let new = engine::fetch_entry(&ctx, entry)?;
         let old = lock.pins.entries.insert(entry.name.clone(), new.clone());
-        report_pin("  ", &entry.name, old.as_deref(), &new);
-        if entry.is_derived() {
-            update_derived(&ctx, &mut lock, entry, &new)?;
-        }
+        let (parents, anchor) = if entry.is_derived() {
+            let (parents, anchor) = update_derived(&ctx, &mut lock, entry, &new)?;
+            (parents, Some(anchor))
+        } else {
+            (Vec::new(), None)
+        };
+        entries.push(EntryUpdate {
+            entry: entry.name.clone(),
+            pin: PinMove { old, new },
+            parents,
+            anchor,
+        });
     }
 
     lock::save(root, &lock)?;
-    println!("wrote {}", lock::FILE);
-    Ok(())
+    Ok(UpdateReport { base, entries })
 }
 
 /// Repin a derived entry's parents and re-establish its anchor, in that order.
@@ -65,21 +100,29 @@ pub fn update(root: &Path, names: &[String]) -> Result<()> {
 /// what the next build reconstructs from, and a `build` that moved them could
 /// produce a different tree from the same lock. The anchor comes last because
 /// two of its three rules are questions about the pins this just moved, and
-/// which rule fired is printed because the anchor decides which commits count
-/// as the entry's own — an operator who cannot audit that boundary cannot tell
-/// duplicated work from replayed work until it is in the tree.
-fn update_derived(ctx: &Ctx, lock: &mut lock::Lock, entry: &Entry, pin: &str) -> Result<()> {
+/// which rule fired is reported because the anchor decides which commits
+/// count as the entry's own — an operator who cannot audit that boundary
+/// cannot tell duplicated work from replayed work until it is in the tree.
+fn update_derived(
+    ctx: &Ctx,
+    lock: &mut lock::Lock,
+    entry: &Entry,
+    pin: &str,
+) -> Result<(Vec<ParentUpdate>, Anchor)> {
     let mut pins = lock
         .pins
         .parents
         .get(&entry.name)
         .cloned()
         .unwrap_or_default();
+    let mut moves = Vec::new();
     for parent in &entry.parents {
         let new = engine::fetch_parent(ctx, entry, parent)?;
         let old = pins.insert(parent.name.clone(), new.clone());
-        let what = format!("parent {}", parent.name);
-        report_pin("    ", &what, old.as_deref(), &new);
+        moves.push(ParentUpdate {
+            parent: parent.name.clone(),
+            pin: PinMove { old, new },
+        });
     }
     pins.retain(|name, _| entry.parents.iter().any(|p| &p.name == name));
 
@@ -98,10 +141,11 @@ fn update_derived(ctx: &Ctx, lock: &mut lock::Lock, entry: &Entry, pin: &str) ->
         lock.pins.anchors.get(&entry.name).map(String::as_str),
         previous_base_tip.as_deref(),
     )?;
-    println!("    anchor {} -- {}", short(&anchor.oid), anchor.describe());
     lock.pins.parents.insert(entry.name.clone(), pins);
-    lock.pins.anchors.insert(entry.name.clone(), anchor.oid);
-    Ok(())
+    lock.pins
+        .anchors
+        .insert(entry.name.clone(), anchor.oid.clone());
+    Ok((moves, anchor))
 }
 
 /// True when the pinned topic is contained in the pinned base: a true merge
@@ -120,63 +164,119 @@ fn contained(repo: &Path, oid: &str, base: &str) -> bool {
     }
 }
 
-/// How a pinned topic stands against the pinned base, for `status`.
-/// `absorbed` is the flag to print when the base already contains it.
-fn base_flag(repo: &Path, pin: &str, base: &str, absorbed: &str) -> Option<String> {
+/// Something `status` has to say about one pinned topic.
+#[derive(Serialize)]
+#[serde(tag = "flag", rename_all = "snake_case")]
+pub enum Flag {
+    /// A tracked rerere pair is attributed to this entry.
+    RerereResolution,
+    Fixup {
+        path: String,
+    },
+    FixupMissing {
+        path: String,
+    },
+    /// The last build did not simply merge or apply it.
+    LastBuild {
+        status: Status,
+    },
+    /// The base already contains it.
+    ContainedInBase,
+    /// It cannot merge with the base on its own; `build` refuses it.
+    ConflictsWithBase,
+    /// The live ref has moved past the pin.
+    LiveHead {
+        oid: String,
+    },
+}
+
+#[derive(Serialize)]
+pub struct ParentStatus {
+    pub name: String,
+    pub source: String,
+    pub pin: Option<String>,
+    pub flags: Vec<Flag>,
+}
+
+#[derive(Serialize)]
+pub struct DerivedStatus {
+    pub parents: Vec<ParentStatus>,
+    /// None until a build has detected it.
+    pub anchor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct EntryStatus {
+    pub name: String,
+    pub source: String,
+    pub pin: Option<String>,
+    pub flags: Vec<Flag>,
+    pub derived: Option<DerivedStatus>,
+}
+
+#[derive(Serialize)]
+pub struct BaseStatus {
+    /// `remote:ref`.
+    pub source: String,
+    pub pin: Option<String>,
+    /// The fetched head, when `--live` asked for it.
+    pub live_head: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct LastBuild {
+    pub commit: String,
+    pub tree: String,
+    pub conflicts: u32,
+    /// How the current manifest and pins relate to it.
+    #[serde(flatten)]
+    pub relation: Prefix,
+}
+
+#[derive(Serialize)]
+pub struct StatusReport {
+    pub base: BaseStatus,
+    pub entries: Vec<EntryStatus>,
+    pub excludes: Vec<Exclusion>,
+    pub last_build: Option<LastBuild>,
+}
+
+/// How a pinned topic stands against the pinned base.
+fn base_flag(repo: &Path, pin: &str, base: &str) -> Option<Flag> {
     if !git::has_commit(repo, pin) {
         None
     } else if contained(repo, pin, base) {
-        Some(absorbed.to_string())
+        Some(Flag::ContainedInBase)
     } else if refuse::conflicts_with_base(repo, base, pin) {
         // Reported here because `build` refuses this outright, and the
         // repair is in another repository. Better to learn it from a
         // status read than from a build that stops and rolls back.
-        Some("CONFLICTS WITH BASE -- rebase the topic; build refuses it".to_string())
+        Some(Flag::ConflictsWithBase)
     } else {
         None
     }
 }
 
-fn flag_text(flags: &[String]) -> String {
-    if flags.is_empty() {
-        String::new()
-    } else {
-        format!("  [{}]", flags.join("; "))
-    }
-}
-
-fn pin_text(pin: Option<&String>) -> String {
-    pin.map_or("UNPINNED".to_string(), |p| short(p).to_string())
-}
-
-pub fn status(root: &Path, live: bool) -> Result<()> {
+pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusReport> {
     let m = manifest::load(root)?;
     let lock = lock::load(root)?.unwrap_or_default();
     // Live checks fetch, so they need a configured source; offline ones
     // only need whatever repository already exists.
     let repo = if live {
-        Some(source::source_repo(root, &m, true)?)
+        Some(source::source_repo(root, &m, true, report)?)
     } else {
         source::source_repo_if_present(root, &m)
     };
     let ctx = repo
         .as_ref()
         .filter(|_| live)
-        .map(|repo| Ctx::new(root, m.clone(), repo.clone()));
+        .map(|repo| Ctx::new(root, m.clone(), repo.clone(), report));
 
-    match &lock.pins.base {
-        Some(base) => println!("base: {} ({}:{})", short(base), m.base.remote, m.base.ref_),
-        None => println!("base: UNPINNED ({}:{})", m.base.remote, m.base.ref_),
-    }
-    if let Some(ctx) = &ctx {
-        let head = engine::fetch_base(ctx)?;
-        if Some(&head) != lock.pins.base.as_ref() {
-            println!(
-                "      live head {} -- run `fork-assembler update base`",
-                short(&head)
-            );
-        }
-    }
+    let base = BaseStatus {
+        source: format!("{}:{}", m.base.remote, m.base.ref_),
+        pin: lock.pins.base.clone(),
+        live_head: ctx.as_ref().map(engine::fetch_base).transpose()?,
+    };
 
     let results: BTreeMap<&str, &EntryResult> = lock
         .build
@@ -184,131 +284,127 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
         .map(|b| b.results.iter().map(|r| (r.name.as_str(), r)).collect())
         .unwrap_or_default();
     let recorded = rerere::index_entry_names(root)?;
-    let base = lock.pins.base.as_deref();
+    let base_pin = lock.pins.base.as_deref();
 
+    let mut entries = Vec::new();
     for entry in &m.entries {
         let pin = lock.pins.entries.get(&entry.name);
         let mut flags = Vec::new();
         if recorded.contains(&entry.name) {
-            flags.push("rerere resolution".to_string());
+            flags.push(Flag::RerereResolution);
         }
-        if let Some(fixup) = &entry.fixup {
-            if root.join(fixup).exists() {
-                flags.push(format!("fixup {fixup}"));
+        if let Some(path) = &entry.fixup {
+            flags.push(if root.join(path).exists() {
+                Flag::Fixup { path: path.clone() }
             } else {
-                flags.push(format!("fixup {fixup} MISSING -- build will fail"));
-            }
+                Flag::FixupMissing { path: path.clone() }
+            });
         }
         if let Some(result) = results.get(entry.name.as_str()) {
             if !matches!(result.status, Status::Merged | Status::Applied) {
-                flags.push(format!(
-                    "last build: {}",
-                    result.status.as_str().to_uppercase()
-                ));
+                flags.push(Flag::LastBuild {
+                    status: result.status,
+                });
             }
         }
         if let (Some(pin), Some(base), Some(repo), false) =
-            (pin, base, repo.as_ref(), entry.kind.is_patch())
+            (pin, base_pin, repo.as_ref(), entry.kind.is_patch())
         {
-            flags.extend(base_flag(
-                repo,
-                pin,
-                base,
-                "contained in base -- prune candidate",
-            ));
+            flags.extend(base_flag(repo, pin, base));
         }
         if let (Some(ctx), false) = (ctx.as_ref(), entry.kind.is_patch()) {
             let head = engine::fetch_entry(ctx, entry)?;
             if Some(&head) != pin {
-                flags.push(format!("live head {} -- pin is behind", short(&head)));
+                flags.push(Flag::LiveHead { oid: head });
             }
         }
-        println!(
-            "  {:<24} {} ({}){}",
-            entry.name,
-            pin_text(pin),
-            entry.source(),
-            flag_text(&flags)
-        );
 
-        // A derived entry's parents are not entries and never will be, so they
-        // print beneath it: they are part of what this one step reconstructs,
-        // and the anchor says where its own work starts.
-        for parent in &entry.parents {
-            let pin = lock
-                .pins
-                .parents
-                .get(&entry.name)
-                .and_then(|pins| pins.get(&parent.name));
-            let mut flags = Vec::new();
-            if let (Some(pin), Some(base), Some(repo)) = (pin, base, repo.as_ref()) {
-                flags.extend(base_flag(
-                    repo,
-                    pin,
-                    base,
-                    "absorbed upstream -- consider removing it from parents",
-                ));
-            }
-            if let Some(ctx) = ctx.as_ref() {
-                let head = engine::fetch_parent(ctx, entry, parent)?;
-                if Some(&head) != pin {
-                    flags.push(format!("live head {} -- pin is behind", short(&head)));
+        let derived = if entry.is_derived() {
+            let mut parents = Vec::new();
+            for parent in &entry.parents {
+                let pin = lock
+                    .pins
+                    .parents
+                    .get(&entry.name)
+                    .and_then(|pins| pins.get(&parent.name));
+                let mut flags = Vec::new();
+                if let (Some(pin), Some(base), Some(repo)) = (pin, base_pin, repo.as_ref()) {
+                    flags.extend(base_flag(repo, pin, base));
                 }
+                if let Some(ctx) = ctx.as_ref() {
+                    let head = engine::fetch_parent(ctx, entry, parent)?;
+                    if Some(&head) != pin {
+                        flags.push(Flag::LiveHead { oid: head });
+                    }
+                }
+                parents.push(ParentStatus {
+                    name: parent.name.clone(),
+                    source: parent.source(),
+                    pin: pin.cloned(),
+                    flags,
+                });
             }
-            println!(
-                "    {:<22} {} ({}){}",
-                format!("parent {}", parent.name),
-                pin_text(pin),
-                parent.source(),
-                flag_text(&flags)
-            );
-        }
-        if entry.is_derived() {
-            match lock.pins.anchors.get(&entry.name) {
-                Some(anchor) => println!("    {:<22} {}", "anchor", short(anchor)),
-                None => println!(
-                    "    {:<22} UNRESOLVED -- the next build detects it",
-                    "anchor"
-                ),
-            }
-        }
+            Some(DerivedStatus {
+                parents,
+                anchor: lock.pins.anchors.get(&entry.name).cloned(),
+            })
+        } else {
+            None
+        };
+        entries.push(EntryStatus {
+            name: entry.name.clone(),
+            source: entry.source(),
+            pin: pin.cloned(),
+            flags,
+            derived,
+        });
     }
 
-    // Exclusions are manifest intent with no pin and no step, so they print
-    // after the stack rather than in it: what the build will never reach, and
-    // what discovery must not re-admit.
-    if !m.excludes.is_empty() {
-        println!("\nexcluded:");
-        for exclusion in &m.excludes {
-            println!("  {}", exclusion.describe());
-        }
-    }
-
-    match &lock.build {
+    let last_build = match &lock.build {
         Some(build) => {
-            println!("\nlast build: commit {}", short(&build.commit));
-            println!("  tree {} ({} conflicts)", build.tree, build.conflicts);
             let fixups = engine::fixup_blobs(root, &m.entries, false)?;
             let snapshot = lock::snapshot(&m.entries, &lock.pins, &fixups);
-            match lock::prefix_relation(&lock, &snapshot, base.unwrap_or_default()) {
-                Prefix::Exact => println!("  manifest matches the lock: `build` is a no-op"),
-                Prefix::Extension(at) => println!(
-                    "  manifest extends the lock: `build` merges only entries {}..{} incrementally",
-                    at + 1,
-                    m.entries.len()
-                ),
-                Prefix::Diverged(reason) => {
-                    println!("  full rebuild needed: {reason}")
-                }
-                Prefix::NoBuild => {}
-            }
+            Some(LastBuild {
+                commit: build.commit.clone(),
+                tree: build.tree.clone(),
+                conflicts: build.conflicts,
+                relation: lock::prefix_relation(&lock, &snapshot, base_pin.unwrap_or_default()),
+            })
         }
-        None => println!("\nno completed build recorded; run `fork-assembler build`"),
-    }
-    Ok(())
+        None => None,
+    };
+    Ok(StatusReport {
+        base,
+        entries,
+        excludes: m.excludes,
+        last_build,
+    })
 }
 
-pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
+#[derive(Serialize)]
+pub struct Contained {
+    pub entry: String,
+    pub pin: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum Pruned {
+    /// No pinned entry is contained in the base.
+    Nothing,
+    DryRun,
+    Removed {
+        removal: Removal,
+    },
+}
+
+#[derive(Serialize)]
+pub struct PruneReport {
+    pub contained: Vec<Contained>,
+    pub outcome: Pruned,
+}
+
+pub fn prune(root: &Path, dry_run: bool) -> Result<PruneReport> {
     let m = manifest::load(root)?;
     let lock = lock::load(root)?.unwrap_or_default();
     let Some(base) = lock.pins.base.clone() else {
@@ -318,7 +414,7 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
         bail!("no source repository available; run `fork-assembler build` first");
     };
 
-    let mut dead = Vec::new();
+    let mut contained_entries = Vec::new();
     for entry in &m.entries {
         if entry.kind.is_patch() {
             continue;
@@ -327,67 +423,58 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
             continue;
         };
         if git::has_commit(&repo, pin) && contained(&repo, pin, &base) {
-            println!("  {}: contained in base ({})", entry.name, short(pin));
-            dead.push(entry.name.clone());
+            contained_entries.push(Contained {
+                entry: entry.name.clone(),
+                pin: pin.clone(),
+            });
         }
     }
-    if dead.is_empty() {
-        println!("nothing to prune: no pinned entry is contained in the base");
-        return Ok(());
-    }
-    let count = format!("{} {}", dead.len(), entries_noun(dead.len()));
-    if dry_run {
-        println!("would remove {count} (dry run)");
-        return Ok(());
-    }
-    let removal = edit::remove_entries(root, &dead)?;
-    println!(
-        "removed {count}; the build suffix from position {} is invalidated -- run `fork-assembler build`",
-        removal.earliest + 1
-    );
-    report_removal(&removal);
-    Ok(())
+    let outcome = if contained_entries.is_empty() {
+        Pruned::Nothing
+    } else if dry_run {
+        Pruned::DryRun
+    } else {
+        let dead: Vec<String> = contained_entries.iter().map(|c| c.entry.clone()).collect();
+        Pruned::Removed {
+            removal: edit::remove_entries(root, &dead)?,
+        }
+    };
+    Ok(PruneReport {
+        contained: contained_entries,
+        outcome,
+    })
 }
 
-/// What a removal detached, so nothing silently vanishes from the build.
-///
-/// A coherence fixup repairs an interaction BETWEEN entries, so removing one
-/// side does not mean the incoherence is gone — an entry that landed upstream
-/// usually still clashes with the topic it clashed with before. The patch is
-/// left on disk and surfaced here.
-///
-/// A parent was kept out of the entry list by the declaration that just left
-/// with its entry. Unlike a fixup it leaves no file to re-home — it leaves a
-/// silence, and a silence is exactly what discovery overwrites: an open PR
-/// that was somebody's parent yesterday is an ordinary candidate today.
-pub fn report_removal(removal: &edit::Removal) {
-    for (name, path) in &removal.orphaned_fixups {
-        println!(
-            "  NOTE: {name} carried the coherence fixup {path}, now unreferenced.\n  \
-             {path} is left on disk: if the incoherence it repaired survives the removal, \
-             re-home it with `fork-assembler fixup OTHER_ENTRY {path}`; otherwise delete it."
-        );
-    }
-    for (name, parents) in &removal.orphaned_parents {
-        println!(
-            "  NOTE: {name} declared {} as parent(s); nothing references them now.\n  \
-             Their commits left the stack with {name}. If they are still open PRs, the next \
-             `add --prs-from` sweep will offer them again -- carry them as entries if they \
-             should be in the stack on their own, or `fork-assembler exclude` them with a reason \
-             if they should not.",
-            parents.join(", ")
-        );
-    }
+pub fn remove(root: &Path, name: String) -> Result<Removal> {
+    edit::remove_entries(root, &[name])
 }
 
-pub fn remove(root: &Path, name: String) -> Result<()> {
-    let removal = edit::remove_entries(root, &[name])?;
-    println!(
-        "entry removed; the build suffix from position {} is invalidated -- run `fork-assembler build`",
-        removal.earliest + 1
-    );
-    report_removal(&removal);
-    Ok(())
+/// Where a captured fixup's diff came from.
+#[derive(Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum CaptureSource {
+    /// The build worktree's uncommitted changes: the state at a fixup
+    /// stall, which is precisely the corrected fixup.
+    Uncommitted,
+    /// The entry's already-committed fixup commit: the state after
+    /// `continue` committed a manual resolution.
+    Commit { oid: String, subject: String },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum FixupReport {
+    Detached {
+        entry: String,
+        /// The entry's position: the suffix a rebuild must redo.
+        index: usize,
+    },
+    Set {
+        entry: String,
+        index: usize,
+        path: String,
+        captured: Option<CaptureSource>,
+    },
 }
 
 /// Attach, re-capture, or detach an entry's coherence fixup.
@@ -397,17 +484,19 @@ pub fn fixup(
     path: Option<&str>,
     capture: bool,
     remove: bool,
-) -> Result<()> {
+) -> Result<FixupReport> {
     if remove {
         let index = edit::set_fixup(root, name, None)?;
-        println!("detached {name}'s coherence fixup (the patch file is left in place)");
-        println!("entry {} changed -- run `fork-assembler build`", index + 1);
-        return Ok(());
+        return Ok(FixupReport::Detached {
+            entry: name.to_string(),
+            index,
+        });
     }
     let Some(rel) = path else {
         bail!("pass the fixup's patch path, or --remove to detach it");
     };
 
+    let mut captured = None;
     if capture {
         let worktree = root.join(engine::WORKTREE);
         if !worktree.exists() {
@@ -420,15 +509,14 @@ pub fn fixup(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let (diff, source) = capture_diff(&worktree, name)?;
-        if diff.is_empty() {
+        let Some((diff, source)) = capture_diff(&worktree, name)? else {
             bail!(
                 "nothing to capture: the build worktree has no uncommitted changes and no \
                  `fork-assembler: fixup {name}` commit"
             );
-        }
+        };
         std::fs::write(&dest, diff)?;
-        println!("captured {rel} from {source}");
+        captured = Some(source);
         // A capture during a stalled build supersedes that build: the fixup
         // blob just changed, so the stalled worktree can only be rebuilt.
         let _ = state::clear(&worktree);
@@ -439,24 +527,23 @@ pub fn fixup(
     }
 
     let index = edit::set_fixup(root, name, Some(rel))?;
-    println!("{name}: coherence fixup set to {rel}");
-    println!(
-        "entry {} now produces a different tree -- run `fork-assembler build`",
-        index + 1
-    );
-    Ok(())
+    Ok(FixupReport::Set {
+        entry: name.to_string(),
+        index,
+        path: rel.to_string(),
+        captured,
+    })
 }
 
-/// The diff a capture should record: the build worktree's uncommitted changes
-/// when there are any (the state at a fixup stall — precisely the corrected
-/// fixup), else the entry's already-committed fixup commit (the state after
-/// `continue` committed a manual resolution).
-fn capture_diff(worktree: &Path, name: &str) -> Result<(Vec<u8>, String)> {
+/// The diff a capture should record, and where it came from: the build
+/// worktree's uncommitted changes when there are any, else the entry's
+/// already-committed fixup commit. None when there is neither.
+fn capture_diff(worktree: &Path, name: &str) -> Result<Option<(Vec<u8>, CaptureSource)>> {
     // Intent-to-add so newly created files appear in the diff.
     let _ = git::raw(worktree, &["add", "-A", "-N"]);
     let pending = git::bytes(worktree, &["diff", "--binary", "HEAD"])?;
     if !pending.is_empty() {
-        return Ok((pending, "the build worktree's uncommitted changes".into()));
+        return Ok(Some((pending, CaptureSource::Uncommitted)));
     }
     let subject = format!("fork-assembler: fixup {name}");
     let log = git::out(worktree, &["log", "--format=%H%x1f%s"])?;
@@ -465,8 +552,14 @@ fn capture_diff(worktree: &Path, name: &str) -> Result<(Vec<u8>, String)> {
         .find_map(|line| line.split_once('\x1f').filter(|(_, s)| *s == subject))
         .map(|(hash, _)| hash.to_string());
     let Some(commit) = commit else {
-        return Ok((Vec::new(), String::new()));
+        return Ok(None);
     };
     let diff = git::bytes(worktree, &["show", "--binary", "--format=", &commit])?;
-    Ok((diff, format!("commit {} ({subject})", short(&commit))))
+    Ok(Some((
+        diff,
+        CaptureSource::Commit {
+            oid: commit,
+            subject,
+        },
+    )))
 }

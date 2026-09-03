@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const FILE: &str = "manifest.toml";
 
@@ -279,7 +279,7 @@ impl Parent {
 /// refusal declarative, since an exclusion nobody can justify six months
 /// later is indistinguishable from an oversight. It is quoted everywhere an
 /// exclusion is reported.
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Exclusion {
     pub target: Target,
     pub reason: Option<String>,
@@ -288,7 +288,8 @@ pub struct Exclusion {
 /// What an exclusion names: the same three shapes an entry can take, minus
 /// everything that only matters to a merge. An exclusion has no step, so it
 /// has no remote to fetch from, no position, and no fixup.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
     /// A topic branch, as the `REMOTE:BRANCH` spec an entry would name.
     Branch { spec: String },
