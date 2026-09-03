@@ -39,10 +39,6 @@ impl Document {
             .with_context(|| format!("writing {}", self.path.display()))
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     fn tables(&self, key: &str) -> impl Iterator<Item = &Table> {
         self.doc
             .get(key)

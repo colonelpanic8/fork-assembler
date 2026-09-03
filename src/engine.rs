@@ -658,7 +658,10 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
             extended_from = Some(build.pre_provenance_commit.clone());
             start_commit = build.pre_provenance_commit.clone();
         }
-        _ => ctx.emit(Event::FromBase { base: &base }),
+        _ => {}
+    }
+    if start == 0 {
+        ctx.emit(Event::FromBase { base: &base });
     }
 
     prepare_worktree(&ctx, &ctx.worktree, &start_commit)?;

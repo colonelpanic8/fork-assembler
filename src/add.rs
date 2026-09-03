@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use toml_edit::{value, Array, InlineTable, Item};
 
 use crate::manifest::edit::{self, Carried, Document, Excluded};
-use crate::manifest::{entries_noun, Exclusion, Target};
+use crate::manifest::{entries_noun, Exclusion, Target, FILE};
 
 /// The refusal an explicitly named target gets when the manifest already
 /// says something about it.
@@ -300,11 +300,7 @@ pub fn add(
 
     if appended > 0 {
         doc.save()?;
-        println!(
-            "{appended} {} appended to {}",
-            entries_noun(appended),
-            doc.path().display()
-        );
+        println!("{appended} {} appended to {FILE}", entries_noun(appended));
     } else {
         println!("manifest unchanged");
     }
