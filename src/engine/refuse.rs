@@ -48,24 +48,6 @@ pub fn conflicts_with_base(repo: &Path, base: &str, oid: &str) -> bool {
     base_conflict_files(repo, base, oid).is_ok_and(|files| !files.is_empty())
 }
 
-/// Roll the build back to nothing in progress.
-///
-impl Ctx<'_> {
-    /// A base conflict is not a stop the operator resumes from — the repair happens
-    /// in a different repository, on the topic branch — so leaving a half-merged
-    /// worktree and a state file behind would only make the next `build` refuse to
-    /// start for an unrelated-looking reason.
-    fn abandon(&self) {
-        for worktree in [self.worktree.clone(), self.derive_worktree()] {
-            if worktree.exists() {
-                let _ = git::raw(&worktree, &["merge", "--abort"]);
-                let _ = git::raw(&worktree, &["cherry-pick", "--abort"]);
-            }
-        }
-        let _ = state::clear(&self.worktree);
-    }
-}
-
 /// What is being checked against the base: an entry's own pin, or one parent of
 /// a derived entry. Both are topics somebody maintains elsewhere, which is the
 /// only thing the refusal needs to know about them.
@@ -161,6 +143,20 @@ fn base_conflict_error(
 }
 
 impl Ctx<'_> {
+    /// A base conflict is not a stop the operator resumes from — the repair happens
+    /// in a different repository, on the topic branch — so leaving a half-merged
+    /// worktree and a state file behind would only make the next `build` refuse to
+    /// start for an unrelated-looking reason.
+    fn abandon(&self) {
+        for worktree in [self.worktree.clone(), self.derive_worktree()] {
+            if worktree.exists() {
+                let _ = git::raw(&worktree, &["merge", "--abort"]);
+                let _ = git::raw(&worktree, &["cherry-pick", "--abort"]);
+            }
+        }
+        let _ = state::clear(&self.worktree);
+    }
+
     /// Refuse the build outright when `topic` cannot merge with the base on its
     /// own. Called the moment a merge conflicts, before any resolution — recorded
     /// or manual — gets a chance to obscure why.

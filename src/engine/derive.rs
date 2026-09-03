@@ -521,11 +521,6 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
     }
 }
 
-/// Reconstruct a derived entry: re-merge its parents onto the pinned base,
-/// then replay the entry's own commits on top.
-///
-/// Returns None when the reconstruction stopped for the human, having already
-/// persisted where it got to.
 impl<'a> Run<'a> {
     pub fn reconstruct(&mut self, step: &Step<'a>, pin: &str) -> Result<Option<DerivedResult>> {
         let mut rc = Reconstruction::open(self, step)?;
@@ -553,28 +548,7 @@ impl<'a> Run<'a> {
         };
         rc.resume_in_flight()
     }
-}
 
-/// Drop the reconstruction worktree once its entry's step has completed.
-///
-/// It survives an unfinished step on purpose: when a build stops on the stack
-/// merge or on a fixup, the reconstruction that produced the conflicting side
-/// is exactly what the operator needs to read next to it.
-impl Ctx<'_> {
-    pub fn clean_derive(&self, entry: &Entry, step_completed: bool) {
-        if step_completed && entry.is_derived() {
-            self.remove_worktree(&self.derive_worktree());
-        }
-    }
-}
-
-/// Publish completed derived-entry reconstructions only after every entry has
-/// assembled successfully. This keeps a later stack conflict from updating a
-/// review branch with a reconstruction that never became an assembled build.
-///
-/// A locked build is a read-only reproducibility check: it deliberately skips
-/// this network write even when the manifest requests publication.
-impl Run<'_> {
     pub fn publish_reconstructions(&self, locked: bool) -> Result<()> {
         let ctx = self.ctx;
         for entry in &ctx.manifest.entries {
@@ -636,5 +610,18 @@ impl Run<'_> {
             });
         }
         Ok(())
+    }
+}
+
+/// Drop the reconstruction worktree once its entry's step has completed.
+///
+/// It survives an unfinished step on purpose: when a build stops on the stack
+/// merge or on a fixup, the reconstruction that produced the conflicting side
+/// is exactly what the operator needs to read next to it.
+impl Ctx<'_> {
+    pub fn clean_derive(&self, entry: &Entry, step_completed: bool) {
+        if step_completed && entry.is_derived() {
+            self.remove_worktree(&self.derive_worktree());
+        }
     }
 }
