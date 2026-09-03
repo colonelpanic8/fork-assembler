@@ -13,10 +13,11 @@ use anyhow::{bail, Context, Result};
 
 use super::pins::derived_ref;
 use super::refuse::{refuse_if_base_conflict, Topic};
-use super::{conflicted_files, prepare_worktree, remove_worktree, report_harvest, Ctx, Run, Step};
+use super::{conflicted_files, prepare_worktree, remove_worktree, Ctx, Run, Step};
 use crate::git;
 use crate::lock::{self, DerivedResult};
 use crate::manifest::Entry;
+use crate::report::{Event, Replay};
 use crate::rerere;
 use crate::state::DeriveState;
 
@@ -204,12 +205,11 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
             Some(ds) if ds.entry_index == step.index => ds,
             _ => {
                 prepare_worktree(run.ctx, &worktree, &run.st.base)?;
-                println!(
-                    "  {} reconstructing from base {} in {}",
-                    step.label,
-                    git::short(&run.st.base),
-                    worktree.display()
-                );
+                run.ctx.emit(Event::Reconstructing {
+                    step,
+                    base: &run.st.base,
+                    worktree: &worktree,
+                });
                 DeriveState {
                     entry_index: step.index,
                     next_parent: 0,
@@ -246,25 +246,14 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
     }
 
     /// Stop for the human, with the progress so far persisted.
-    fn stop(&mut self, doing: &str, unresolved: &[String]) -> Result<()> {
+    fn stop(&mut self, doing: &str, files: &[String]) -> Result<()> {
         self.persist()?;
-        println!(
-            "\n  {} CONFLICT {doing} in {} file(s):",
-            self.step.label,
-            unresolved.len()
-        );
-        for file in unresolved {
-            println!("      {file}");
-        }
-        println!(
-            "\n  Resolve in the DERIVE worktree: {}",
-            self.worktree.display()
-        );
-        println!(
-            "  That worktree holds {}'s reconstruction, not the assembled stack.",
-            self.entry().name
-        );
-        println!("  Stage with `git add`, then: fork-assembler continue");
+        self.ctx().emit(Event::DeriveConflict {
+            step: self.step,
+            doing,
+            files,
+            worktree: &self.worktree,
+        });
         Ok(())
     }
 
@@ -273,7 +262,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
     fn merge_parents(&mut self) -> Result<bool> {
         let ctx = self.ctx();
         let entry = self.entry();
-        let label = &self.step.label;
+        let step = self.step;
         while self.ds.next_parent < entry.parents.len() {
             let parent = &entry.parents[self.ds.next_parent];
             let parent_pin = self
@@ -296,10 +285,10 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // say nothing; the operator wants to hear it, though, because
                 // a parent that is permanently absorbed no longer belongs in
                 // the list.
-                println!(
-                    "  {label} parent {} ABSORBED -- already in the reconstruction",
-                    parent.name
-                );
+                ctx.emit(Event::ParentAbsorbed {
+                    step,
+                    parent: &parent.name,
+                });
             } else {
                 let message = format!(
                     "fork-assembler: merge parent {} (for {})",
@@ -317,11 +306,11 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                     ]),
                 )?;
                 if out.status.success() {
-                    println!(
-                        "  {label} parent {} merged {}",
-                        parent.name,
-                        git::short(&parent_pin)
-                    );
+                    ctx.emit(Event::ParentMerged {
+                        step,
+                        parent: &parent.name,
+                        oid: &parent_pin,
+                    });
                 } else {
                     // Before anything else: a parent that cannot merge with
                     // the base on its own is out of date with upstream, and no
@@ -340,10 +329,10 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                         return Ok(false);
                     }
                     git::out(&self.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-                    println!(
-                        "  {label} parent {} merged; auto-resolved from tracked rerere pairs",
-                        parent.name
-                    );
+                    ctx.emit(Event::ParentAutoResolved {
+                        step,
+                        parent: &parent.name,
+                    });
                 }
             }
             self.ds.next_parent += 1;
@@ -361,11 +350,10 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
         let base_tip = git::out(&self.worktree, &["rev-parse", "HEAD"])?;
         let anchor = self.ensure_anchor(pin)?;
         let delta = delta_commits(&self.ctx().repo, pin, &anchor)?;
-        let label = &self.step.label;
-        match delta.len() {
-            0 => println!("  {label} delta: none -- a pure merge of its parents"),
-            n => println!("  {label} delta: {n} commit(s) of its own after the anchor"),
-        }
+        self.ctx().emit(Event::Delta {
+            step: self.step,
+            commits: delta.len(),
+        });
         self.ds.base_tip = Some(base_tip);
         self.ds.delta = delta;
         self.persist()
@@ -401,12 +389,11 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
             None,
             previous_base_tip.as_deref(),
         )?;
-        println!(
-            "  {} anchor {} -- {}",
-            self.step.label,
-            git::short(&anchor.oid),
-            anchor.describe()
-        );
+        ctx.emit(Event::Anchor {
+            step: self.step,
+            oid: &anchor.oid,
+            rule: anchor.describe(),
+        });
         self.run
             .st
             .anchors
@@ -418,13 +405,14 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
     /// Cherry-pick the entry's own commits onto the parent merge. Returns
     /// false when a pick stopped for the human.
     fn replay_delta(&mut self) -> Result<bool> {
-        let label = &self.step.label;
+        let ctx = self.ctx();
+        let step = self.step;
         while self.ds.next_pick < self.ds.delta.len() {
             let commit = self.ds.delta[self.ds.next_pick].clone();
             let subject = git::out(&self.ctx().repo, &["log", "-1", "--format=%s", &commit])?;
             let out = git::raw(&self.worktree, &replay_cfg(&["cherry-pick", &commit]))?;
-            if out.status.success() {
-                println!("  {label} replayed {} ({subject})", git::short(&commit));
+            let outcome = if out.status.success() {
+                Replay::Clean
             } else {
                 let unresolved = conflicted_files(&self.worktree)?;
                 if !unresolved.is_empty() {
@@ -438,19 +426,19 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // present and there is nothing left to commit at all.
                 if nothing_staged(&self.worktree) {
                     git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
-                    println!(
-                        "  {label} replayed {} ({subject}): EMPTY -- already present",
-                        git::short(&commit)
-                    );
+                    Replay::AlreadyPresent
                 } else {
                     self.run.st.conflicts += 1;
                     git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
-                    println!(
-                        "  {label} replayed {} ({subject}); auto-resolved from tracked rerere pairs",
-                        git::short(&commit)
-                    );
+                    Replay::AutoResolved
                 }
-            }
+            };
+            ctx.emit(Event::Replayed {
+                step,
+                commit: &commit,
+                subject: &subject,
+                outcome,
+            });
             self.ds.next_pick += 1;
             self.persist()?;
         }
@@ -485,7 +473,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
     fn resume_in_flight(&mut self) -> Result<()> {
         let ctx = self.ctx();
         let entry = self.entry();
-        let label = &self.step.label;
+        let step = self.step;
         let git_dir = git::git_dir(&self.worktree)?;
         if git_dir.join("MERGE_HEAD").exists() {
             // Read MERGE_RR before committing: the rerere-enabled commit
@@ -500,7 +488,11 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 Some(parent) => format!("parent {} merged", parent.name),
                 None => "parent merged".to_string(),
             };
-            report_harvest(label, &what, &harvested);
+            ctx.emit(Event::Harvested {
+                step,
+                what: &what,
+                pairs: &harvested,
+            });
             self.ds.next_parent += 1;
         } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
             let merge_rr = rerere::merge_rr(&self.worktree)?;
@@ -515,16 +507,20 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // in the reconstruction, so there is nothing to commit and the
                 // replay simply skips it.
                 git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
-                println!(
-                    "  {label} replayed {}: EMPTY after resolution -- skipped",
-                    git::short(&picked)
-                );
+                ctx.emit(Event::ReplaySkipped {
+                    step,
+                    commit: &picked,
+                });
             } else {
                 git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
                 let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
                 rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
                 let what = format!("replayed {}", git::short(&picked));
-                report_harvest(label, &what, &harvested);
+                ctx.emit(Event::Harvested {
+                    step,
+                    what: &what,
+                    pairs: &harvested,
+                });
             }
             self.ds.next_pick += 1;
         }
@@ -605,11 +601,10 @@ pub fn publish(run: &Run, locked: bool) -> Result<()> {
             continue;
         };
         if locked {
-            println!(
-                "  {} reconstruction publication to {} skipped (--locked)",
-                entry.name,
-                target.source()
-            );
+            ctx.emit(Event::PublishSkipped {
+                entry: &entry.name,
+                target: &target.source(),
+            });
             continue;
         }
 
@@ -641,12 +636,11 @@ pub fn publish(run: &Run, locked: bool) -> Result<()> {
                 target.source()
             )
         })?;
-        println!(
-            "  {} published reconstruction {} -> {}",
-            entry.name,
-            git::short(tip),
-            target.source()
-        );
+        ctx.emit(Event::Published {
+            entry: &entry.name,
+            oid: tip,
+            target: &target.source(),
+        });
     }
     Ok(())
 }

@@ -5,6 +5,7 @@ mod init;
 mod lock;
 mod manifest;
 mod ops;
+mod report;
 mod rerere;
 mod source;
 mod state;

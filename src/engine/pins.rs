@@ -12,6 +12,7 @@ use anyhow::{bail, Result};
 use super::Ctx;
 use crate::git;
 use crate::manifest::{self, Entry, Kind, Parent};
+use crate::report::Event;
 
 /// A private ref namespace so fetched heads never collide with user refs.
 fn holding_ref(entry: &Entry) -> String {
@@ -162,7 +163,10 @@ pub fn ensure_pin(
         );
     }
     let oid = fetch_entry(ctx, entry)?;
-    println!("  pinned {} -> {}", entry.name, git::short(&oid));
+    ctx.emit(Event::Pinned {
+        name: &entry.name,
+        oid: &oid,
+    });
     pins.insert(entry.name.clone(), oid.clone());
     Ok(oid)
 }
@@ -192,12 +196,11 @@ pub fn ensure_parent_pins(
                     );
                 }
                 let oid = fetch_parent(ctx, entry, parent)?;
-                println!(
-                    "  pinned {}'s parent {} -> {}",
-                    entry.name,
-                    parent.name,
-                    git::short(&oid)
-                );
+                ctx.emit(Event::PinnedParent {
+                    entry: &entry.name,
+                    parent: &parent.name,
+                    oid: &oid,
+                });
                 pins.insert(parent.name.clone(), oid);
             }
         }

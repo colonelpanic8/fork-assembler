@@ -7,7 +7,9 @@
 //!
 //! This module owns `Run`, the entry loop, and its two entry points `build`
 //! and `cont`. Pin resolution, derived-entry reconstruction, the base-conflict
-//! refusal, and the provenance record each live in a submodule.
+//! refusal, and the provenance record each live in a submodule. Nothing here
+//! writes to stdout: the run emits `report::Event`s and the `Ctx`'s reporter
+//! decides what they look like.
 
 pub mod derive;
 pub mod pins;
@@ -22,7 +24,8 @@ use chrono::Utc;
 
 use crate::git;
 use crate::lock::{self, EntryResult, Lock, Prefix, Status};
-use crate::manifest::{self, entries_noun, Entry, Kind, Manifest};
+use crate::manifest::{self, Entry, Kind, Manifest};
+use crate::report::{self, Event, Outcome, Report};
 use crate::rerere;
 use crate::source;
 use crate::state::{self, State};
@@ -44,6 +47,7 @@ pub struct Ctx {
     pub manifest: Manifest,
     pub repo: PathBuf,
     pub worktree: PathBuf,
+    pub report: Box<dyn Report>,
 }
 
 impl Ctx {
@@ -53,6 +57,7 @@ impl Ctx {
             worktree: root.join(WORKTREE),
             manifest,
             repo,
+            report: Box::new(report::Text),
         }
     }
 
@@ -66,19 +71,16 @@ impl Ctx {
         self.root.join(DERIVE_WORKTREE)
     }
 
-    /// The entry at `index`, with the label every line about it prints.
+    pub fn emit(&self, event: Event<'_>) {
+        self.report.event(event)
+    }
+
+    /// The entry at `index`, as one step of the run.
     pub fn step(&self, index: usize) -> Step<'_> {
-        let entry = &self.manifest.entries[index];
-        let label = format!(
-            "[{:2}/{}] {:<24}",
-            index + 1,
-            self.manifest.entries.len(),
-            entry.name
-        );
         Step {
             index,
-            entry,
-            label,
+            total: self.manifest.entries.len(),
+            entry: &self.manifest.entries[index],
         }
     }
 }
@@ -86,8 +88,8 @@ impl Ctx {
 /// The entry a run is working on.
 pub struct Step<'a> {
     pub index: usize,
+    pub total: usize,
     pub entry: &'a Entry,
-    pub label: String,
 }
 
 /// One in-progress build: the context it runs in and the state it persists
@@ -130,10 +132,16 @@ fn staged_files(worktree: &Path) -> Result<String> {
     git::out(worktree, &["diff", "--cached", "--name-only"])
 }
 
-/// Apply a tracked patch file and commit it as `message`. `Some(outcome)` =
-/// applied or already applied; `None` = failed, conflict left for the human.
-/// Shared by patch entries and coherence fixups.
-fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Option<&'static str>> {
+/// How applying a patch file went.
+enum Apply {
+    Done(Outcome),
+    /// Failed, conflict left for the human; git's own account of why.
+    Failed(String),
+}
+
+/// Apply a tracked patch file and commit it as `message`. Shared by patch
+/// entries and coherence fixups.
+fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Apply> {
     let patch = ctx.root.join(rel);
     let patch_str = patch.to_string_lossy().to_string();
 
@@ -148,44 +156,31 @@ fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Option<&'stat
     );
     let forward = git::ok(&ctx.worktree, &["apply", "--check", &patch_str]);
     if reverse && !forward {
-        return Ok(Some("already applied"));
+        return Ok(Apply::Done(Outcome::AlreadyApplied));
     }
 
     let applied = git::raw(&ctx.worktree, &["apply", "--3way", &patch_str])?;
     if !applied.status.success() {
-        eprintln!("{}", String::from_utf8_lossy(&applied.stderr).trim_end());
-        return Ok(None);
+        let stderr = String::from_utf8_lossy(&applied.stderr)
+            .trim_end()
+            .to_string();
+        return Ok(Apply::Failed(stderr));
     }
     git::out(&ctx.worktree, &["add", "-A"])?;
     if staged_files(&ctx.worktree)?.is_empty() {
-        return Ok(Some("already applied"));
+        return Ok(Apply::Done(Outcome::AlreadyApplied));
     }
     git::out(&ctx.worktree, &["commit", "-q", "-m", message])?;
-    Ok(Some("applied"))
-}
-
-/// What `continue` says about a resolution it just committed. Harvesting is
-/// what makes a resolution durable; one rerere could not capture leaves the
-/// next rebuild to stop in exactly the same place, and the operator should
-/// hear that now rather than discover it then.
-fn report_harvest(label: &str, what: &str, harvested: &[String]) {
-    if harvested.is_empty() {
-        println!(
-            "  {label} {what}; WARNING: no rerere pair captured \
-             (unrecognizable conflict) -- a rebuild will stop here again"
-        );
-    } else {
-        println!(
-            "  {label} {what}; harvested {} pair(s) into {}",
-            harvested.len(),
-            rerere::DIR,
-        );
-    }
+    Ok(Apply::Done(Outcome::Applied))
 }
 
 impl<'a> Run<'a> {
     pub fn persist(&self) -> Result<()> {
         state::write(&self.ctx.worktree, &self.st)
+    }
+
+    fn emit(&self, event: Event<'_>) {
+        self.ctx.emit(event)
     }
 
     /// Persist that entry `index` is where the build stopped for the human.
@@ -206,37 +201,35 @@ impl<'a> Run<'a> {
     /// fixup rather than re-running the merge.
     fn finish_entry(&mut self, step: &Step, mut result: EntryResult) -> Result<bool> {
         let ctx = self.ctx;
-        let Step {
-            index,
-            entry,
-            label,
-        } = step;
-        if let Some(rel) = &entry.fixup {
-            let blob = patch_blob(&ctx.root, rel)?;
+        let entry = step.entry;
+        if let Some(path) = &entry.fixup {
+            let blob = patch_blob(&ctx.root, path)?;
             let message = format!("fork-assembler: fixup {}", entry.name);
-            match apply_patch_file(ctx, rel, &message)? {
-                Some(outcome) => {
-                    println!("  {label} fixup {rel}: {outcome}");
+            match apply_patch_file(ctx, path, &message)? {
+                Apply::Done(outcome) => {
+                    self.emit(Event::Fixup {
+                        step,
+                        path,
+                        outcome,
+                    });
                     result.fixup = Some(blob);
                 }
-                None => {
+                Apply::Failed(stderr) => {
                     self.st.pending = Some(result);
-                    self.stall(*index)?;
-                    println!("\n  {label} fixup {rel} FAILED to apply");
-                    println!("  The merge is committed; only the fixup is outstanding.");
-                    println!("  Resolve the markers in: {}", ctx.worktree.display());
-                    println!("  Then re-capture the corrected fixup and rebuild:");
-                    println!("      fork-assembler fixup {} {rel} --capture", entry.name);
-                    println!("      fork-assembler build");
-                    println!("  Or commit this resolution once, leaving {rel} stale:");
-                    println!("      git add -A && fork-assembler continue");
+                    self.stall(step.index)?;
+                    self.emit(Event::FixupFailed {
+                        step,
+                        path,
+                        stderr: &stderr,
+                        worktree: &ctx.worktree,
+                    });
                     return Ok(false);
                 }
             }
         }
         self.st.results.push(result);
         self.st.pending = None;
-        self.st.next_index = index + 1;
+        self.st.next_index = step.index + 1;
         self.persist()?;
         Ok(true)
     }
@@ -245,14 +238,19 @@ impl<'a> Run<'a> {
     fn run_patch_entry(&mut self, step: &Step, rel: &str, oid: String) -> Result<Option<i32>> {
         let ctx = self.ctx;
         let message = format!("fork-assembler: {}", step.entry.name);
-        let Some(outcome) = apply_patch_file(ctx, rel, &message)? else {
-            self.stall(step.index)?;
-            println!("\n  {} patch FAILED to apply", step.label);
-            println!("  Resolve in: {}", ctx.worktree.display());
-            println!("  Then: fork-assembler continue");
-            return Ok(Some(STOPPED));
+        let outcome = match apply_patch_file(ctx, rel, &message)? {
+            Apply::Done(outcome) => outcome,
+            Apply::Failed(stderr) => {
+                self.stall(step.index)?;
+                self.emit(Event::PatchFailed {
+                    step,
+                    stderr: &stderr,
+                    worktree: &ctx.worktree,
+                });
+                return Ok(Some(STOPPED));
+            }
         };
-        println!("  {} {outcome}", step.label);
+        self.emit(Event::Applied { step, outcome });
         // Patch entries cannot carry a fixup (the manifest rejects it), so
         // this only records and advances.
         let result = EntryResult::new(&step.entry.name, oid, Status::Applied);
@@ -274,13 +272,9 @@ impl<'a> Run<'a> {
     /// reconstruction — into the stack, then finish the step with its fixup.
     fn run_live_entry(&mut self, step: &Step<'a>, oid: String) -> Result<Option<i32>> {
         let ctx = self.ctx;
-        let Step {
-            index,
-            entry,
-            label,
-        } = step;
+        let entry = step.entry;
         if git::is_ancestor(&ctx.repo, &oid, &self.st.base) {
-            println!("  {label} ABSORBED upstream -- drop candidate");
+            self.emit(Event::Absorbed { step });
             // A derived entry stops here too, before any reconstruction: the
             // base already contains the whole thing, parents and own commits
             // alike, so there is nothing left to rebuild it out of.
@@ -312,19 +306,14 @@ impl<'a> Run<'a> {
         if clean {
             let after = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
             if before == after {
-                println!("  {label} EMPTY -- merge changed nothing, drop candidate");
+                self.emit(Event::Empty { step });
                 result.status = Status::Empty;
             } else {
-                // Naming the reconstruction is the point: the OID that just
-                // landed in the stack is not the pin the lock records for this
-                // entry, and an operator reading the log needs to know which
-                // is which.
-                let what = if derived.is_some() {
-                    "merged reconstruction"
-                } else {
-                    "merged"
-                };
-                println!("  {label} {what} {}", git::short(merging));
+                self.emit(Event::Merged {
+                    step,
+                    oid: merging,
+                    reconstruction: derived.is_some(),
+                });
             }
         } else {
             // A derived entry merges its reconstruction, which already
@@ -341,13 +330,12 @@ impl<'a> Run<'a> {
             self.st.conflicts += 1;
             let unresolved = conflicted_files(&ctx.worktree)?;
             if !unresolved.is_empty() {
-                self.stall(*index)?;
-                println!("\n  {label} CONFLICT in {} file(s):", unresolved.len());
-                for file in &unresolved {
-                    println!("      {file}");
-                }
-                println!("\n  Resolve in: {}", ctx.worktree.display());
-                println!("  Stage with `git add`, then: fork-assembler continue");
+                self.stall(step.index)?;
+                self.emit(Event::Conflict {
+                    step,
+                    files: &unresolved,
+                    worktree: &ctx.worktree,
+                });
                 return Ok(Some(STOPPED));
             }
             // rerere recognized every conflict hunk and staged the recorded
@@ -357,7 +345,7 @@ impl<'a> Run<'a> {
                 .map(|(hash, _)| hash)
                 .collect();
             git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-            println!("  {label} auto-resolved from tracked rerere pairs");
+            self.emit(Event::AutoResolved { step });
             result.conflicted = true;
             result.resolution = Some(rerere::label(&hashes));
         }
@@ -435,20 +423,14 @@ impl<'a> Run<'a> {
         };
         let built_tree = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
 
-        let previous_tree = previous
-            .and_then(|l| l.build.as_ref())
-            .map(|b| b.tree.clone());
-
-        println!("\ntree:   {tree}");
-        println!("commit: {head}");
-        println!("conflicts this run: {}", st.conflicts);
-        match &previous_tree {
-            Some(prev) if *prev == tree => {
-                println!("tree UNCHANGED from previous lock -- nothing downstream needs a bump")
-            }
-            Some(prev) => println!("tree CHANGED (was {prev})"),
-            None => {}
-        }
+        let previous_build = previous.and_then(|l| l.build.as_ref());
+        let previous_tree = previous_build.map(|b| b.tree.as_str());
+        self.emit(Event::Finished {
+            tree: &tree,
+            commit: &head,
+            conflicts: st.conflicts,
+            previous_tree,
+        });
 
         if write_lock {
             let mut lock = previous.cloned().unwrap_or_default();
@@ -470,24 +452,21 @@ impl<'a> Run<'a> {
                 pre_provenance_commit: pre_provenance,
                 tree: tree.clone(),
                 built_tree,
-                previous_tree: previous_tree.clone(),
-                tree_changed: previous_tree.as_deref() != Some(tree.as_str()),
+                previous_tree: previous_tree.map(str::to_string),
+                tree_changed: previous_tree != Some(tree.as_str()),
                 conflicts: st.conflicts,
                 manifest_entries,
                 results: st.results.clone(),
             });
             lock::save(&ctx.root, &lock)?;
-            println!("wrote {}", lock::FILE);
+            self.emit(Event::LockWritten);
         } else {
-            let expected = previous.and_then(|l| l.build.as_ref()).map(|b| &b.tree);
-            match expected {
-                Some(expected) if *expected == tree => {
-                    println!("verified: reproduced the lock's tree exactly")
-                }
+            match previous_tree {
+                Some(expected) if expected == tree => self.emit(Event::Verified),
                 Some(expected) => {
                     bail!("reproduction FAILED: built tree {tree} but the lock records {expected}")
                 }
-                None => println!("(no lock to verify against; lock not written in --locked mode)"),
+                None => self.emit(Event::NothingToVerify),
             }
         }
         state::clear(&ctx.worktree)?;
@@ -501,7 +480,7 @@ impl<'a> Run<'a> {
         let ctx = self.ctx;
         let step = ctx.step(self.st.next_index);
         let entry = step.entry;
-        let rel = entry.fixup.clone().with_context(|| {
+        let path = entry.fixup.clone().with_context(|| {
             format!(
                 "{}: the build stalled in a coherence fixup but the manifest no longer \
                  declares one; abandon the worktree and rebuild",
@@ -510,7 +489,7 @@ impl<'a> Run<'a> {
         })?;
         if staged_files(&ctx.worktree)?.is_empty() {
             bail!(
-                "{}: nothing staged for the fixup {rel}; resolve it and `git add`, \
+                "{}: nothing staged for the fixup {path}; resolve it and `git add`, \
                  or detach it with `fork-assembler fixup {} --remove`",
                 entry.name,
                 entry.name
@@ -518,19 +497,17 @@ impl<'a> Run<'a> {
         }
         let message = format!("fork-assembler: fixup {}", entry.name);
         git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
-        pending.fixup = Some(patch_blob(&ctx.root, &rel)?);
+        pending.fixup = Some(patch_blob(&ctx.root, &path)?);
         self.st.results.push(pending);
         self.st.next_index = step.index + 1;
         self.persist()?;
-        println!("  {} fixup committed as resolved", step.label);
         // The lock now pins a fixup blob whose patch does NOT reproduce what
-        // was just committed, so a rebuild stalls here again. Say so plainly.
-        println!(
-            "  WARNING: {rel} still holds the version that failed; re-capture it with \
-             `fork-assembler fixup {} {rel} --capture` after this build, or the next \
-             rebuild stops here again",
-            entry.name
-        );
+        // was just committed, so a rebuild stalls here again; the event says
+        // so.
+        self.emit(Event::FixupCommitted {
+            step: &step,
+            path: &path,
+        });
         Ok(())
     }
 
@@ -553,7 +530,11 @@ impl<'a> Run<'a> {
             Some(pin) => pin.clone(),
             None => git::out(&ctx.worktree, &["rev-parse", "HEAD^2"])?,
         };
-        report_harvest(&step.label, "resolved", &harvested);
+        self.emit(Event::Harvested {
+            step: &step,
+            what: "resolved",
+            pairs: &harvested,
+        });
         let mut result = EntryResult::new(&entry.name, oid, Status::Merged);
         result.conflicted = true;
         result.resolution = Some(rerere::label(&harvested));
@@ -594,7 +575,7 @@ fn ensure_base(ctx: &Ctx, pinned: Option<String>, locked: bool) -> Result<String
             bail!("no base pin recorded and --locked forbids pinning");
         }
         let oid = fetch_base(ctx)?;
-        println!("  pinned base -> {}", git::short(&oid));
+        ctx.emit(Event::PinnedBase { oid: &oid });
         return Ok(oid);
     };
     if !git::has_commit(&ctx.repo, &base) {
@@ -663,23 +644,21 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         (Prefix::Exact, Some(build))
             if !locked && git::has_commit(&ctx.repo, &build.pre_provenance_commit) =>
         {
-            println!("up to date: tree {}", build.tree);
+            ctx.emit(Event::UpToDate { tree: &build.tree });
             return Ok(0);
         }
         (Prefix::Extension(prefix_len), Some(build))
             if !locked && git::has_commit(&ctx.repo, &build.pre_provenance_commit) =>
         {
-            let new = snapshot.len() - prefix_len;
-            println!(
-                "extending the locked build ({new} new {})",
-                entries_noun(new)
-            );
+            ctx.emit(Event::Extending {
+                new_entries: snapshot.len() - prefix_len,
+            });
             start = prefix_len;
             results = build.results.clone();
             extended_from = Some(build.pre_provenance_commit.clone());
             start_commit = build.pre_provenance_commit.clone();
         }
-        _ => println!("building from base {}", git::short(&base)),
+        _ => ctx.emit(Event::FromBase { base: &base }),
     }
 
     prepare_worktree(&ctx, &ctx.worktree, &start_commit)?;
@@ -690,7 +669,7 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     // common git dir, which every worktree of it shares.
     let seeded = rerere::seed(&ctx.root, &ctx.worktree)?;
     if seeded > 0 {
-        println!("seeded {seeded} tracked rerere pair(s)");
+        ctx.emit(Event::Seeded { pairs: seeded });
     }
     let mut run = Run {
         ctx: &ctx,
@@ -759,11 +738,10 @@ pub fn cont(root: &Path) -> Result<i32> {
         run.resume_patch()?;
     }
 
-    println!(
-        "resuming at entry {}/{}",
-        run.st.next_index + 1,
-        ctx.manifest.entries.len()
-    );
+    ctx.emit(Event::Resuming {
+        index: run.st.next_index,
+        total: ctx.manifest.entries.len(),
+    });
     let previous = lock::load(&ctx.root)?;
     let resume_at = run.st.next_index;
     run.drive(resume_at, previous.as_ref(), false)
