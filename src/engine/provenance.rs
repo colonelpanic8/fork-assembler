@@ -6,13 +6,14 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::Ctx;
+use super::Run;
 use crate::git;
 use crate::lock::EntryResult;
 use crate::manifest::{self, Kind};
-use crate::state::State;
 
-pub fn provenance_json(ctx: &Ctx, st: &State, base: &str) -> Result<Value> {
+pub fn json(run: &Run) -> Result<Value> {
+    let (ctx, st) = (run.ctx, &run.st);
+    let base = st.base.as_str();
     let m = &ctx.manifest;
     let subject = git::out(&ctx.repo, &["log", "-1", "--format=%s", base])?;
     let date = git::out(&ctx.repo, &["log", "-1", "--format=%cI", base])?;

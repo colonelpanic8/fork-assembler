@@ -7,18 +7,18 @@
 //! commits count as the entry's own.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
 use super::pins::derived_ref;
 use super::refuse::{refuse_if_base_conflict, Topic};
-use super::{conflicted_files, prepare_worktree, remove_worktree, report_harvest, Ctx};
+use super::{conflicted_files, prepare_worktree, remove_worktree, report_harvest, Ctx, Run, Step};
 use crate::git;
 use crate::lock::{self, DerivedResult};
 use crate::manifest::Entry;
 use crate::rerere;
-use crate::state::{self, DeriveState, State};
+use crate::state::DeriveState;
 
 /// Which rule established a derived entry's anchor. Printed on every
 /// resolution: the anchor decides which commits are replayed as the entry's
@@ -180,37 +180,357 @@ fn replay_cfg<'a>(args: &[&'a str]) -> Vec<&'a str> {
     cfg
 }
 
-/// Persist the reconstruction's progress. Every step, like the entry loop:
-/// resuming a merge sequence or a cherry-pick sequence at a stale index
-/// re-applies work that is already in.
-fn persist(ctx: &Ctx, st: &mut State, ds: &DeriveState) -> Result<()> {
-    st.derive = Some(ds.clone());
-    state::write(&ctx.worktree, st)
-}
-
-fn stop(ctx: &Ctx, entry: &Entry, label: &str, doing: &str, unresolved: &[String]) {
-    println!(
-        "\n  {label} CONFLICT {doing} in {} file(s):",
-        unresolved.len()
-    );
-    for file in unresolved {
-        println!("      {file}");
-    }
-    println!(
-        "\n  Resolve in the DERIVE worktree: {}",
-        ctx.derive_worktree().display()
-    );
-    println!(
-        "  That worktree holds {}'s reconstruction, not the assembled stack.",
-        entry.name
-    );
-    println!("  Stage with `git add`, then: fork-assembler continue");
-}
-
 /// True when the derive worktree's index holds nothing beyond HEAD: a replay
 /// whose content is already present.
 fn nothing_staged(derive: &Path) -> bool {
     git::ok(derive, &["diff", "--cached", "--quiet", "HEAD"])
+}
+
+/// One derived entry being reconstructed, in the derive worktree, as part of
+/// the run's current step.
+struct Reconstruction<'r, 'a> {
+    run: &'r mut Run<'a>,
+    step: &'r Step<'a>,
+    ds: DeriveState,
+    worktree: PathBuf,
+}
+
+impl<'r, 'a> Reconstruction<'r, 'a> {
+    /// Pick up where the run's state says this entry's reconstruction got
+    /// to, or start one from the pinned base.
+    fn open(run: &'r mut Run<'a>, step: &'r Step<'a>) -> Result<Self> {
+        let worktree = run.ctx.derive_worktree();
+        let ds = match run.st.derive.take() {
+            Some(ds) if ds.entry_index == step.index => ds,
+            _ => {
+                prepare_worktree(run.ctx, &worktree, &run.st.base)?;
+                println!(
+                    "  {} reconstructing from base {} in {}",
+                    step.label,
+                    git::short(&run.st.base),
+                    worktree.display()
+                );
+                DeriveState {
+                    entry_index: step.index,
+                    next_parent: 0,
+                    base_tip: None,
+                    delta: Vec::new(),
+                    next_pick: 0,
+                }
+            }
+        };
+        let mut this = Reconstruction {
+            run,
+            step,
+            ds,
+            worktree,
+        };
+        this.persist()?;
+        Ok(this)
+    }
+
+    fn ctx(&self) -> &'a Ctx {
+        self.run.ctx
+    }
+
+    fn entry(&self) -> &'a Entry {
+        self.step.entry
+    }
+
+    /// Persist the reconstruction's progress. Every step, like the entry
+    /// loop: resuming a merge sequence or a cherry-pick sequence at a stale
+    /// index re-applies work that is already in.
+    fn persist(&mut self) -> Result<()> {
+        self.run.st.derive = Some(self.ds.clone());
+        self.run.persist()
+    }
+
+    /// Stop for the human, with the progress so far persisted.
+    fn stop(&mut self, doing: &str, unresolved: &[String]) -> Result<()> {
+        self.persist()?;
+        println!(
+            "\n  {} CONFLICT {doing} in {} file(s):",
+            self.step.label,
+            unresolved.len()
+        );
+        for file in unresolved {
+            println!("      {file}");
+        }
+        println!(
+            "\n  Resolve in the DERIVE worktree: {}",
+            self.worktree.display()
+        );
+        println!(
+            "  That worktree holds {}'s reconstruction, not the assembled stack.",
+            self.entry().name
+        );
+        println!("  Stage with `git add`, then: fork-assembler continue");
+        Ok(())
+    }
+
+    /// Merge each parent onto the base in declaration order. Returns false
+    /// when a merge stopped for the human.
+    fn merge_parents(&mut self) -> Result<bool> {
+        let ctx = self.ctx();
+        let entry = self.entry();
+        let label = &self.step.label;
+        while self.ds.next_parent < entry.parents.len() {
+            let parent = &entry.parents[self.ds.next_parent];
+            let parent_pin = self
+                .run
+                .st
+                .parent_pins
+                .get(&entry.name)
+                .and_then(|pins| pins.get(&parent.name))
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "{}: parent {} pin vanished mid-build",
+                        entry.name, parent.name
+                    )
+                })?;
+            let head = git::out(&self.worktree, &["rev-parse", "HEAD"])?;
+            if git::is_ancestor(&ctx.repo, &parent_pin, &head) {
+                // Either the base already contains this parent, or an earlier
+                // parent does. Merging it would add an empty merge commit and
+                // say nothing; the operator wants to hear it, though, because
+                // a parent that is permanently absorbed no longer belongs in
+                // the list.
+                println!(
+                    "  {label} parent {} ABSORBED -- already in the reconstruction",
+                    parent.name
+                );
+            } else {
+                let message = format!(
+                    "fork-assembler: merge parent {} (for {})",
+                    parent.name, entry.name
+                );
+                let out = git::raw(
+                    &self.worktree,
+                    &rerere::with_cfg(&[
+                        "merge",
+                        "--no-ff",
+                        "--no-edit",
+                        "-m",
+                        &message,
+                        &parent_pin,
+                    ]),
+                )?;
+                if out.status.success() {
+                    println!(
+                        "  {label} parent {} merged {}",
+                        parent.name,
+                        git::short(&parent_pin)
+                    );
+                } else {
+                    // Before anything else: a parent that cannot merge with
+                    // the base on its own is out of date with upstream, and no
+                    // amount of reconstruction here makes it apply again.
+                    refuse_if_base_conflict(
+                        ctx,
+                        entry,
+                        Topic::parent(entry, parent, &parent_pin),
+                        &self.run.st.base,
+                    )?;
+                    self.run.st.conflicts += 1;
+                    let unresolved = conflicted_files(&self.worktree)?;
+                    if !unresolved.is_empty() {
+                        let doing = format!("merging parent {}", parent.name);
+                        self.stop(&doing, &unresolved)?;
+                        return Ok(false);
+                    }
+                    git::out(&self.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+                    println!(
+                        "  {label} parent {} merged; auto-resolved from tracked rerere pairs",
+                        parent.name
+                    );
+                }
+            }
+            self.ds.next_parent += 1;
+            self.persist()?;
+        }
+        Ok(true)
+    }
+
+    /// Record the parent merge's tip and work out the entry's own commits,
+    /// once. The anchor decides where those start.
+    fn take_delta(&mut self, pin: &str) -> Result<()> {
+        if self.ds.base_tip.is_some() {
+            return Ok(());
+        }
+        let base_tip = git::out(&self.worktree, &["rev-parse", "HEAD"])?;
+        let anchor = self.ensure_anchor(pin)?;
+        let delta = delta_commits(&self.ctx().repo, pin, &anchor)?;
+        let label = &self.step.label;
+        match delta.len() {
+            0 => println!("  {label} delta: none -- a pure merge of its parents"),
+            n => println!("  {label} delta: {n} commit(s) of its own after the anchor"),
+        }
+        self.ds.base_tip = Some(base_tip);
+        self.ds.delta = delta;
+        self.persist()
+    }
+
+    /// The anchor this build must replay from: whatever is already pinned,
+    /// or — on a first build, where nothing has established one yet — the
+    /// rules in `resolve_anchor`. A build never re-resolves a pinned anchor,
+    /// for the reason it never moves a pin: what a build replays would then
+    /// depend on when it ran.
+    fn ensure_anchor(&mut self, pin: &str) -> Result<String> {
+        let ctx = self.ctx();
+        let entry = self.entry();
+        if let Some(anchor) = self.run.st.anchors.get(&entry.name) {
+            return Ok(anchor.clone());
+        }
+        let previous_base_tip = lock::load(&ctx.root)?
+            .and_then(|l| l.build)
+            .and_then(|b| b.results.into_iter().find(|r| r.name == entry.name))
+            .and_then(|r| r.derived)
+            .map(|d| d.base_tip);
+        let no_parents = BTreeMap::new();
+        let anchor = resolve_anchor(
+            &ctx.repo,
+            entry,
+            pin,
+            Some(&self.run.st.base),
+            self.run
+                .st
+                .parent_pins
+                .get(&entry.name)
+                .unwrap_or(&no_parents),
+            None,
+            previous_base_tip.as_deref(),
+        )?;
+        println!(
+            "  {} anchor {} -- {}",
+            self.step.label,
+            git::short(&anchor.oid),
+            anchor.describe()
+        );
+        self.run
+            .st
+            .anchors
+            .insert(entry.name.clone(), anchor.oid.clone());
+        self.persist()?;
+        Ok(anchor.oid)
+    }
+
+    /// Cherry-pick the entry's own commits onto the parent merge. Returns
+    /// false when a pick stopped for the human.
+    fn replay_delta(&mut self) -> Result<bool> {
+        let label = &self.step.label;
+        while self.ds.next_pick < self.ds.delta.len() {
+            let commit = self.ds.delta[self.ds.next_pick].clone();
+            let subject = git::out(&self.ctx().repo, &["log", "-1", "--format=%s", &commit])?;
+            let out = git::raw(&self.worktree, &replay_cfg(&["cherry-pick", &commit]))?;
+            if out.status.success() {
+                println!("  {label} replayed {} ({subject})", git::short(&commit));
+            } else {
+                let unresolved = conflicted_files(&self.worktree)?;
+                if !unresolved.is_empty() {
+                    self.run.st.conflicts += 1;
+                    let doing = format!("replaying {} ({subject})", git::short(&commit));
+                    self.stop(&doing, &unresolved)?;
+                    return Ok(false);
+                }
+                // Nothing conflicted, so either rerere replayed every hunk and
+                // staged the result, or the commit's content is already
+                // present and there is nothing left to commit at all.
+                if nothing_staged(&self.worktree) {
+                    git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
+                    println!(
+                        "  {label} replayed {} ({subject}): EMPTY -- already present",
+                        git::short(&commit)
+                    );
+                } else {
+                    self.run.st.conflicts += 1;
+                    git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
+                    println!(
+                        "  {label} replayed {} ({subject}); auto-resolved from tracked rerere pairs",
+                        git::short(&commit)
+                    );
+                }
+            }
+            self.ds.next_pick += 1;
+            self.persist()?;
+        }
+        Ok(true)
+    }
+
+    /// Park the reconstructed tip and record the result in the run.
+    fn finish(self) -> Result<DerivedResult> {
+        let entry = self.entry();
+        let tip = git::out(&self.worktree, &["rev-parse", "HEAD"])?;
+        let base_tip = self
+            .ds
+            .base_tip
+            .clone()
+            .context("reconstruction finished without recording its parent merge")?;
+        git::out(&self.ctx().repo, &["update-ref", &derived_ref(entry), &tip])?;
+        let derived = DerivedResult { base_tip, tip };
+        self.run.st.derive = None;
+        self.run
+            .st
+            .derived
+            .insert(entry.name.clone(), derived.clone());
+        self.run.persist()?;
+        Ok(derived)
+    }
+
+    /// Finish whatever `continue` found open in the derive worktree — a
+    /// parent merge or a cherry-pick the human resolved — and advance that
+    /// sequence's index. Nothing in flight means the human committed the
+    /// resolution by hand, and re-entering the reconstruction is then the
+    /// whole of the repair.
+    fn resume_in_flight(&mut self) -> Result<()> {
+        let ctx = self.ctx();
+        let entry = self.entry();
+        let label = &self.step.label;
+        let git_dir = git::git_dir(&self.worktree)?;
+        if git_dir.join("MERGE_HEAD").exists() {
+            // Read MERGE_RR before committing: the rerere-enabled commit
+            // records the postimages and clears it.
+            let merge_rr = rerere::merge_rr(&self.worktree)?;
+            git::out(&self.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+            let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
+            // Attributed to the entry, not the parent: the entry is what the
+            // manifest carries and what a later build will replay this for.
+            rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
+            let what = match entry.parents.get(self.ds.next_parent) {
+                Some(parent) => format!("parent {} merged", parent.name),
+                None => "parent merged".to_string(),
+            };
+            report_harvest(label, &what, &harvested);
+            self.ds.next_parent += 1;
+        } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
+            let merge_rr = rerere::merge_rr(&self.worktree)?;
+            let picked = self
+                .ds
+                .delta
+                .get(self.ds.next_pick)
+                .cloned()
+                .unwrap_or_default();
+            if nothing_staged(&self.worktree) {
+                // The resolution kept nothing: the commit's content is already
+                // in the reconstruction, so there is nothing to commit and the
+                // replay simply skips it.
+                git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
+                println!(
+                    "  {label} replayed {}: EMPTY after resolution -- skipped",
+                    git::short(&picked)
+                );
+            } else {
+                git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
+                let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
+                rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
+                let what = format!("replayed {}", git::short(&picked));
+                report_harvest(label, &what, &harvested);
+            }
+            self.ds.next_pick += 1;
+        }
+        self.run.st.next_index = self.ds.entry_index;
+        self.persist()
+    }
 }
 
 /// Reconstruct a derived entry: re-merge its parents onto the pinned base,
@@ -218,202 +538,35 @@ fn nothing_staged(derive: &Path) -> bool {
 ///
 /// Returns None when the reconstruction stopped for the human, having already
 /// persisted where it got to.
-pub fn reconstruct(
-    ctx: &Ctx,
-    st: &mut State,
-    index: usize,
-    entry: &Entry,
-    label: &str,
+pub fn reconstruct<'a>(
+    run: &mut Run<'a>,
+    step: &Step<'a>,
     pin: &str,
 ) -> Result<Option<DerivedResult>> {
-    let derive = ctx.derive_worktree();
-    let mut ds = match st.derive.take() {
-        Some(ds) if ds.entry_index == index => ds,
-        _ => {
-            prepare_worktree(ctx, &derive, &st.base)?;
-            println!(
-                "  {label} reconstructing from base {} in {}",
-                git::short(&st.base),
-                derive.display()
-            );
-            DeriveState {
-                entry_index: index,
-                next_parent: 0,
-                base_tip: None,
-                delta: Vec::new(),
-                next_pick: 0,
-            }
-        }
-    };
-    persist(ctx, st, &ds)?;
-
-    while ds.next_parent < entry.parents.len() {
-        let parent = &entry.parents[ds.next_parent];
-        let parent_pin = st
-            .parent_pins
-            .get(&entry.name)
-            .and_then(|pins| pins.get(&parent.name))
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "{}: parent {} pin vanished mid-build",
-                    entry.name, parent.name
-                )
-            })?;
-        let head = git::out(&derive, &["rev-parse", "HEAD"])?;
-        if git::is_ancestor(&ctx.repo, &parent_pin, &head) {
-            // Either the base already contains this parent, or an earlier
-            // parent does. Merging it would add an empty merge commit and say
-            // nothing; the operator wants to hear it, though, because a parent
-            // that is permanently absorbed no longer belongs in the list.
-            println!(
-                "  {label} parent {} ABSORBED -- already in the reconstruction",
-                parent.name
-            );
-        } else {
-            let message = format!(
-                "fork-assembler: merge parent {} (for {})",
-                parent.name, entry.name
-            );
-            let out = git::raw(
-                &derive,
-                &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, &parent_pin]),
-            )?;
-            if out.status.success() {
-                println!(
-                    "  {label} parent {} merged {}",
-                    parent.name,
-                    git::short(&parent_pin)
-                );
-            } else {
-                // Before anything else: a parent that cannot merge with the
-                // base on its own is out of date with upstream, and no amount
-                // of reconstruction here makes it apply again.
-                refuse_if_base_conflict(
-                    ctx,
-                    entry,
-                    Topic::parent(entry, parent, &parent_pin),
-                    &st.base,
-                )?;
-                st.conflicts += 1;
-                let unresolved = conflicted_files(&derive)?;
-                if !unresolved.is_empty() {
-                    persist(ctx, st, &ds)?;
-                    let doing = format!("merging parent {}", parent.name);
-                    stop(ctx, entry, label, &doing, &unresolved);
-                    return Ok(None);
-                }
-                git::out(&derive, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-                println!(
-                    "  {label} parent {} merged; auto-resolved from tracked rerere pairs",
-                    parent.name
-                );
-            }
-        }
-        ds.next_parent += 1;
-        persist(ctx, st, &ds)?;
+    let mut rc = Reconstruction::open(run, step)?;
+    if !rc.merge_parents()? {
+        return Ok(None);
     }
-
-    if ds.base_tip.is_none() {
-        let base_tip = git::out(&derive, &["rev-parse", "HEAD"])?;
-        let anchor = ensure_anchor(ctx, st, entry, label, pin)?;
-        let delta = delta_commits(&ctx.repo, pin, &anchor)?;
-        match delta.len() {
-            0 => println!("  {label} delta: none -- a pure merge of its parents"),
-            n => println!("  {label} delta: {n} commit(s) of its own after the anchor"),
-        }
-        ds.base_tip = Some(base_tip);
-        ds.delta = delta;
-        persist(ctx, st, &ds)?;
+    rc.take_delta(pin)?;
+    if !rc.replay_delta()? {
+        return Ok(None);
     }
-
-    while ds.next_pick < ds.delta.len() {
-        let commit = ds.delta[ds.next_pick].clone();
-        let subject = git::out(&ctx.repo, &["log", "-1", "--format=%s", &commit])?;
-        let out = git::raw(&derive, &replay_cfg(&["cherry-pick", &commit]))?;
-        if out.status.success() {
-            println!("  {label} replayed {} ({subject})", git::short(&commit));
-        } else {
-            let unresolved = conflicted_files(&derive)?;
-            if !unresolved.is_empty() {
-                st.conflicts += 1;
-                persist(ctx, st, &ds)?;
-                let doing = format!("replaying {} ({subject})", git::short(&commit));
-                stop(ctx, entry, label, &doing, &unresolved);
-                return Ok(None);
-            }
-            // Nothing conflicted, so either rerere replayed every hunk and
-            // staged the result, or the commit's content is already present
-            // and there is nothing left to commit at all.
-            if nothing_staged(&derive) {
-                git::out(&derive, &replay_cfg(&["cherry-pick", "--skip"]))?;
-                println!(
-                    "  {label} replayed {} ({subject}): EMPTY -- already present",
-                    git::short(&commit)
-                );
-            } else {
-                st.conflicts += 1;
-                git::out(&derive, &replay_cfg(&["cherry-pick", "--continue"]))?;
-                println!(
-                    "  {label} replayed {} ({subject}); auto-resolved from tracked rerere pairs",
-                    git::short(&commit)
-                );
-            }
-        }
-        ds.next_pick += 1;
-        persist(ctx, st, &ds)?;
-    }
-
-    let tip = git::out(&derive, &["rev-parse", "HEAD"])?;
-    let base_tip = ds
-        .base_tip
-        .clone()
-        .context("reconstruction finished without recording its parent merge")?;
-    git::out(&ctx.repo, &["update-ref", &derived_ref(entry), &tip])?;
-    let derived = DerivedResult { base_tip, tip };
-    st.derive = None;
-    st.derived.insert(entry.name.clone(), derived.clone());
-    state::write(&ctx.worktree, st)?;
-    Ok(Some(derived))
+    rc.finish().map(Some)
 }
 
-/// The anchor this build must replay from: whatever is already pinned, or —
-/// on a first build, where nothing has established one yet — the rules in
-/// `resolve_anchor`. A build never re-resolves a pinned anchor, for the reason
-/// it never moves a pin: what a build replays would then depend on when it ran.
-fn ensure_anchor(
-    ctx: &Ctx,
-    st: &mut State,
-    entry: &Entry,
-    label: &str,
-    pin: &str,
-) -> Result<String> {
-    if let Some(anchor) = st.anchors.get(&entry.name) {
-        return Ok(anchor.clone());
-    }
-    let previous_base_tip = lock::load(&ctx.root)?
-        .and_then(|l| l.build)
-        .and_then(|b| b.results.into_iter().find(|r| r.name == entry.name))
-        .and_then(|r| r.derived)
-        .map(|d| d.base_tip);
-    let no_parents = BTreeMap::new();
-    let anchor = resolve_anchor(
-        &ctx.repo,
-        entry,
-        pin,
-        Some(&st.base),
-        st.parent_pins.get(&entry.name).unwrap_or(&no_parents),
-        None,
-        previous_base_tip.as_deref(),
-    )?;
-    println!(
-        "  {label} anchor {} -- {}",
-        git::short(&anchor.oid),
-        anchor.describe()
-    );
-    st.anchors.insert(entry.name.clone(), anchor.oid.clone());
-    state::write(&ctx.worktree, st)?;
-    Ok(anchor.oid)
+/// Resume a run that stalled inside a reconstruction: `ds` is the progress it
+/// persisted. The entry loop then re-enters the reconstruction where it left
+/// off, merges the result into the stack, and carries on.
+pub fn resume<'a>(run: &mut Run<'a>, ds: DeriveState) -> Result<()> {
+    let step = run.ctx.step(ds.entry_index);
+    let worktree = run.ctx.derive_worktree();
+    let mut rc = Reconstruction {
+        run,
+        step: &step,
+        ds,
+        worktree,
+    };
+    rc.resume_in_flight()
 }
 
 /// Drop the reconstruction worktree once its entry's step has completed.
@@ -427,67 +580,20 @@ pub fn clean(ctx: &Ctx, entry: &Entry, step_completed: bool) {
     }
 }
 
-/// Finish whatever `continue` found open in the derive worktree — a parent
-/// merge or a cherry-pick the human resolved — and advance that sequence's
-/// index, so the entry loop re-enters the reconstruction where it left off.
-/// Nothing in flight means the human committed the resolution by hand, and
-/// re-entering is then the whole of the repair.
-pub fn resume(ctx: &Ctx, st: &mut State, mut ds: DeriveState, label: &str) -> Result<()> {
-    let derive = ctx.derive_worktree();
-    let git_dir = git::git_dir(&derive)?;
-    let entry = &ctx.manifest.entries[ds.entry_index];
-    if git_dir.join("MERGE_HEAD").exists() {
-        // Read MERGE_RR before committing: the rerere-enabled commit
-        // records the postimages and clears it.
-        let merge_rr = rerere::merge_rr(&derive)?;
-        git::out(&derive, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-        let harvested = rerere::harvest(&ctx.root, &derive)?;
-        // Attributed to the entry, not the parent: the entry is what the
-        // manifest carries and what a later build will replay this for.
-        rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-        let what = match entry.parents.get(ds.next_parent) {
-            Some(parent) => format!("parent {} merged", parent.name),
-            None => "parent merged".to_string(),
-        };
-        report_harvest(label, &what, &harvested);
-        ds.next_parent += 1;
-    } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
-        let merge_rr = rerere::merge_rr(&derive)?;
-        let picked = ds.delta.get(ds.next_pick).cloned().unwrap_or_default();
-        if nothing_staged(&derive) {
-            // The resolution kept nothing: the commit's content is already in
-            // the reconstruction, so there is nothing to commit and the
-            // replay simply skips it.
-            git::out(&derive, &replay_cfg(&["cherry-pick", "--skip"]))?;
-            println!(
-                "  {label} replayed {}: EMPTY after resolution -- skipped",
-                git::short(&picked)
-            );
-        } else {
-            git::out(&derive, &replay_cfg(&["cherry-pick", "--continue"]))?;
-            let harvested = rerere::harvest(&ctx.root, &derive)?;
-            rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-            let what = format!("replayed {}", git::short(&picked));
-            report_harvest(label, &what, &harvested);
-        }
-        ds.next_pick += 1;
-    }
-    st.next_index = ds.entry_index;
-    persist(ctx, st, &ds)
-}
-
 /// Publish completed derived-entry reconstructions only after every entry has
 /// assembled successfully. This keeps a later stack conflict from updating a
 /// review branch with a reconstruction that never became an assembled build.
 ///
 /// A locked build is a read-only reproducibility check: it deliberately skips
 /// this network write even when the manifest requests publication.
-pub fn publish(ctx: &Ctx, st: &State, locked: bool) -> Result<()> {
+pub fn publish(run: &Run, locked: bool) -> Result<()> {
+    let ctx = run.ctx;
     for entry in &ctx.manifest.entries {
         let Some(target) = &entry.reconstruction_publish else {
             continue;
         };
-        let Some(tip) = st
+        let Some(tip) = run
+            .st
             .results
             .iter()
             .find(|result| result.name == entry.name)
