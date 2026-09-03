@@ -30,7 +30,7 @@ use crate::rerere;
 use crate::source;
 use crate::state::{self, State};
 
-pub use pins::{fetch_base, fetch_entry, fetch_parent, fixup_blobs, patch_blob};
+pub use pins::{fixup_blobs, patch_blob};
 
 pub const WORKTREE: &str = ".worktrees/build";
 
@@ -99,30 +99,6 @@ pub struct Run<'a> {
     pub st: State,
 }
 
-fn remove_worktree(ctx: &Ctx, path: &Path) {
-    if path.exists() {
-        let _ = git::raw(
-            &ctx.repo,
-            &["worktree", "remove", "--force", &path.to_string_lossy()],
-        );
-    }
-    // A deleted-but-registered worktree (e.g. the directory was rm -rf'd)
-    // blocks re-adding at the same path.
-    let _ = git::raw(&ctx.repo, &["worktree", "prune"]);
-}
-
-fn prepare_worktree(ctx: &Ctx, path: &Path, at: &str) -> Result<()> {
-    remove_worktree(ctx, path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    git::out(
-        &ctx.repo,
-        &["worktree", "add", "--detach", &path.to_string_lossy(), at],
-    )?;
-    Ok(())
-}
-
 fn conflicted_files(worktree: &Path) -> Result<Vec<String>> {
     let out = git::out(worktree, &["diff", "--name-only", "--diff-filter=U"])?;
     Ok(out.lines().map(str::to_string).collect())
@@ -139,39 +115,88 @@ enum Apply {
     Failed(String),
 }
 
-/// Apply a tracked patch file and commit it as `message`. Shared by patch
-/// entries and coherence fixups.
-fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Apply> {
-    let patch = ctx.root.join(rel);
-    let patch_str = patch.to_string_lossy().to_string();
-
-    // "Reverse-applies" alone does not mean "already applied": a patch that
-    // DELETES a duplicated block reverse-applies against the surviving copy,
-    // because the copies are byte-identical and context matching cannot tell
-    // them apart. Only trust the reverse check when the patch also cannot be
-    // applied forwards.
-    let reverse = git::ok(
-        &ctx.worktree,
-        &["apply", "--reverse", "--check", &patch_str],
-    );
-    let forward = git::ok(&ctx.worktree, &["apply", "--check", &patch_str]);
-    if reverse && !forward {
-        return Ok(Apply::Done(Outcome::AlreadyApplied));
+impl Ctx<'_> {
+    fn remove_worktree(&self, path: &Path) {
+        if path.exists() {
+            let _ = git::raw(
+                &self.repo,
+                &["worktree", "remove", "--force", &path.to_string_lossy()],
+            );
+        }
+        // A deleted-but-registered worktree (e.g. the directory was rm -rf'd)
+        // blocks re-adding at the same path.
+        let _ = git::raw(&self.repo, &["worktree", "prune"]);
     }
 
-    let applied = git::raw(&ctx.worktree, &["apply", "--3way", &patch_str])?;
-    if !applied.status.success() {
-        let stderr = String::from_utf8_lossy(&applied.stderr)
-            .trim_end()
-            .to_string();
-        return Ok(Apply::Failed(stderr));
+    fn prepare_worktree(&self, path: &Path, at: &str) -> Result<()> {
+        self.remove_worktree(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        git::out(
+            &self.repo,
+            &["worktree", "add", "--detach", &path.to_string_lossy(), at],
+        )?;
+        Ok(())
     }
-    git::out(&ctx.worktree, &["add", "-A"])?;
-    if staged_files(&ctx.worktree)?.is_empty() {
-        return Ok(Apply::Done(Outcome::AlreadyApplied));
+
+    /// Apply a tracked patch file and commit it as `message`. Shared by patch
+    /// entries and coherence fixups.
+    fn apply_patch_file(&self, rel: &str, message: &str) -> Result<Apply> {
+        let patch = self.root.join(rel);
+        let patch_str = patch.to_string_lossy().to_string();
+
+        // "Reverse-applies" alone does not mean "already applied": a patch that
+        // DELETES a duplicated block reverse-applies against the surviving copy,
+        // because the copies are byte-identical and context matching cannot tell
+        // them apart. Only trust the reverse check when the patch also cannot be
+        // applied forwards.
+        let reverse = git::ok(
+            &self.worktree,
+            &["apply", "--reverse", "--check", &patch_str],
+        );
+        let forward = git::ok(&self.worktree, &["apply", "--check", &patch_str]);
+        if reverse && !forward {
+            return Ok(Apply::Done(Outcome::AlreadyApplied));
+        }
+
+        let applied = git::raw(&self.worktree, &["apply", "--3way", &patch_str])?;
+        if !applied.status.success() {
+            let stderr = String::from_utf8_lossy(&applied.stderr)
+                .trim_end()
+                .to_string();
+            return Ok(Apply::Failed(stderr));
+        }
+        git::out(&self.worktree, &["add", "-A"])?;
+        if staged_files(&self.worktree)?.is_empty() {
+            return Ok(Apply::Done(Outcome::AlreadyApplied));
+        }
+        git::out(&self.worktree, &["commit", "-q", "-m", message])?;
+        Ok(Apply::Done(Outcome::Applied))
     }
-    git::out(&ctx.worktree, &["commit", "-q", "-m", message])?;
-    Ok(Apply::Done(Outcome::Applied))
+
+    /// The pinned base, fetched once if the object is missing, or pinned fresh
+    /// when nothing has pinned it yet.
+    fn ensure_base(&self, pinned: Option<String>, locked: bool) -> Result<String> {
+        let Some(base) = pinned else {
+            if locked {
+                bail!("no base pin recorded and --locked forbids pinning");
+            }
+            let oid = self.fetch_base()?;
+            self.emit(Event::PinnedBase { oid: oid.clone() });
+            return Ok(oid);
+        };
+        if !git::has_commit(&self.repo, &base) {
+            if locked {
+                bail!("pinned base {base} is not present locally and --locked forbids fetching");
+            }
+            self.fetch_base()?;
+            if !git::has_commit(&self.repo, &base) {
+                bail!("pinned base {base} is not reachable from the live base ref");
+            }
+        }
+        Ok(base)
+    }
 }
 
 impl<'a> Run<'a> {
@@ -205,7 +230,7 @@ impl<'a> Run<'a> {
         if let Some(path) = &entry.fixup {
             let blob = patch_blob(&ctx.root, path)?;
             let message = format!("fork-assembler: fixup {}", entry.name);
-            match apply_patch_file(ctx, path, &message)? {
+            match ctx.apply_patch_file(path, &message)? {
                 Apply::Done(outcome) => {
                     self.emit(Event::Fixup {
                         step: step.info(),
@@ -238,7 +263,7 @@ impl<'a> Run<'a> {
     fn run_patch_entry(&mut self, step: &Step, rel: &str, oid: String) -> Result<Option<i32>> {
         let ctx = self.ctx;
         let message = format!("fork-assembler: {}", step.entry.name);
-        let outcome = match apply_patch_file(ctx, rel, &message)? {
+        let outcome = match ctx.apply_patch_file(rel, &message)? {
             Apply::Done(outcome) => outcome,
             Apply::Failed(stderr) => {
                 self.stall(step.index)?;
@@ -293,7 +318,7 @@ impl<'a> Run<'a> {
         // whatever its parents were then. What gets merged is the
         // reconstruction; what gets recorded is still the pin.
         let derived = if entry.is_derived() {
-            match derive::reconstruct(self, step, &oid)? {
+            match self.reconstruct(step, &oid)? {
                 Some(derived) => Some(derived),
                 None => return Ok(Some(STOPPED)),
             }
@@ -323,8 +348,7 @@ impl<'a> Run<'a> {
             // contains the base; its topics were checked against the base one
             // at a time as they were merged in.
             if !entry.is_derived() {
-                refuse::refuse_if_base_conflict(
-                    ctx,
+                ctx.refuse_if_base_conflict(
                     entry,
                     refuse::Topic::entry(entry, &oid),
                     &self.st.base,
@@ -354,7 +378,7 @@ impl<'a> Run<'a> {
         }
         result.derived = derived;
         let done = self.finish_entry(step, result)?;
-        derive::clean(ctx, entry, done);
+        ctx.clean_derive(entry, done);
         Ok((!done).then_some(STOPPED))
     }
 
@@ -388,7 +412,7 @@ impl<'a> Run<'a> {
         match self.run_entries(start)? {
             Some(code) => Ok(code),
             None => {
-                derive::publish(self, locked)?;
+                self.publish_reconstructions(locked)?;
                 self.finalize(previous, !locked)?;
                 Ok(0)
             }
@@ -405,7 +429,7 @@ impl<'a> Run<'a> {
         let tree = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
 
         let head = if let Some(file) = &ctx.manifest.provenance_file {
-            let provenance = provenance::json(self)?;
+            let provenance = self.provenance()?;
             let body = serde_json::to_string_pretty(&provenance)? + "\n";
             std::fs::write(ctx.worktree.join(file), body)?;
             git::out(&ctx.worktree, &["add", file])?;
@@ -547,7 +571,7 @@ impl<'a> Run<'a> {
         // report it EMPTY. It also runs this entry's fixup, which can stall
         // in turn — the resolution and its fixup are one step.
         let done = self.finish_entry(&step, result)?;
-        derive::clean(ctx, entry, done);
+        ctx.clean_derive(entry, done);
         Ok(done)
     }
 
@@ -570,29 +594,6 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The pinned base, fetched once if the object is missing, or pinned fresh
-/// when nothing has pinned it yet.
-fn ensure_base(ctx: &Ctx, pinned: Option<String>, locked: bool) -> Result<String> {
-    let Some(base) = pinned else {
-        if locked {
-            bail!("no base pin recorded and --locked forbids pinning");
-        }
-        let oid = fetch_base(ctx)?;
-        ctx.emit(Event::PinnedBase { oid: oid.clone() });
-        return Ok(oid);
-    };
-    if !git::has_commit(&ctx.repo, &base) {
-        if locked {
-            bail!("pinned base {base} is not present locally and --locked forbids fetching");
-        }
-        fetch_base(ctx)?;
-        if !git::has_commit(&ctx.repo, &base) {
-            bail!("pinned base {base} is not reachable from the live base ref");
-        }
-    }
-    Ok(base)
-}
-
 pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
     let ctx = Ctx::open(root, !locked, report)?;
     if state::read(&ctx.worktree).is_ok_and(|st| st.is_some()) {
@@ -608,12 +609,12 @@ pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
         .as_ref()
         .map(|l| l.pins.clone())
         .unwrap_or_default();
-    let base = ensure_base(&ctx, pins.base.take(), locked)?;
+    let base = ctx.ensure_base(pins.base.take(), locked)?;
 
     for entry in &ctx.manifest.entries {
-        pins::ensure_pin(&ctx, entry, &mut pins.entries, locked)?;
+        ctx.ensure_pin(entry, &mut pins.entries, locked)?;
         if entry.is_derived() {
-            pins::ensure_parent_pins(&ctx, entry, &mut pins.parents, locked)?;
+            ctx.ensure_parent_pins(entry, &mut pins.parents, locked)?;
         }
     }
     // Pins for entries the manifest no longer carries are not facts about
@@ -669,10 +670,10 @@ pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
         ctx.emit(Event::FromBase { base: base.clone() });
     }
 
-    prepare_worktree(&ctx, &ctx.worktree, &start_commit)?;
+    ctx.prepare_worktree(&ctx.worktree, &start_commit)?;
     // Any reconstruction worktree still here belongs to a build that is over:
     // this one refused to start while state existed.
-    remove_worktree(&ctx, &ctx.derive_worktree());
+    ctx.remove_worktree(&ctx.derive_worktree());
     // One seeding covers both worktrees: rr-cache lives in the source repo's
     // common git dir, which every worktree of it shares.
     let seeded = rerere::seed(&ctx.root, &ctx.worktree)?;
@@ -735,7 +736,7 @@ pub fn cont(root: &Path, report: &dyn Report) -> Result<i32> {
     let git_dir = git::git_dir(&stalled_worktree)?;
 
     if let Some(ds) = run.st.derive.take() {
-        derive::resume(&mut run, ds)?;
+        run.resume_derive(ds)?;
     } else if let Some(pending) = run.st.pending.take() {
         run.resume_fixup(pending)?;
     } else if git_dir.join("MERGE_HEAD").exists() {

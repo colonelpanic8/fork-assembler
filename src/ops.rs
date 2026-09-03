@@ -62,7 +62,7 @@ pub fn update(root: &Path, names: &[String], report: &dyn Report) -> Result<Upda
 
     let mut base = None;
     if wants("base") {
-        let new = engine::fetch_base(&ctx)?;
+        let new = ctx.fetch_base()?;
         base = Some(PinMove {
             old: lock.pins.base.replace(new.clone()),
             new,
@@ -74,7 +74,7 @@ pub fn update(root: &Path, names: &[String], report: &dyn Report) -> Result<Upda
         if !wants(&entry.name) {
             continue;
         }
-        let new = engine::fetch_entry(&ctx, entry)?;
+        let new = ctx.fetch_entry(entry)?;
         let old = lock.pins.entries.insert(entry.name.clone(), new.clone());
         let (parents, anchor) = if entry.is_derived() {
             let (parents, anchor) = update_derived(&ctx, &mut lock, entry, &new)?;
@@ -117,7 +117,7 @@ fn update_derived(
         .unwrap_or_default();
     let mut moves = Vec::new();
     for parent in &entry.parents {
-        let new = engine::fetch_parent(ctx, entry, parent)?;
+        let new = ctx.fetch_parent(entry, parent)?;
         let old = pins.insert(parent.name.clone(), new.clone());
         moves.push(ParentUpdate {
             parent: parent.name.clone(),
@@ -275,7 +275,7 @@ pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusRepo
     let base = BaseStatus {
         source: format!("{}:{}", m.base.remote, m.base.ref_),
         pin: lock.pins.base.clone(),
-        live_head: ctx.as_ref().map(engine::fetch_base).transpose()?,
+        live_head: ctx.as_ref().map(Ctx::fetch_base).transpose()?,
     };
 
     let results: BTreeMap<&str, &EntryResult> = lock
@@ -313,7 +313,7 @@ pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusRepo
             flags.extend(base_flag(repo, pin, base));
         }
         if let (Some(ctx), false) = (ctx.as_ref(), entry.kind.is_patch()) {
-            let head = engine::fetch_entry(ctx, entry)?;
+            let head = ctx.fetch_entry(entry)?;
             if Some(&head) != pin {
                 flags.push(Flag::LiveHead { oid: head });
             }
@@ -332,7 +332,7 @@ pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusRepo
                     flags.extend(base_flag(repo, pin, base));
                 }
                 if let Some(ctx) = ctx.as_ref() {
-                    let head = engine::fetch_parent(ctx, entry, parent)?;
+                    let head = ctx.fetch_parent(entry, parent)?;
                     if Some(&head) != pin {
                         flags.push(Flag::LiveHead { oid: head });
                     }

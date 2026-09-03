@@ -50,18 +50,20 @@ pub fn conflicts_with_base(repo: &Path, base: &str, oid: &str) -> bool {
 
 /// Roll the build back to nothing in progress.
 ///
-/// A base conflict is not a stop the operator resumes from — the repair happens
-/// in a different repository, on the topic branch — so leaving a half-merged
-/// worktree and a state file behind would only make the next `build` refuse to
-/// start for an unrelated-looking reason.
-fn abandon(ctx: &Ctx) {
-    for worktree in [ctx.worktree.clone(), ctx.derive_worktree()] {
-        if worktree.exists() {
-            let _ = git::raw(&worktree, &["merge", "--abort"]);
-            let _ = git::raw(&worktree, &["cherry-pick", "--abort"]);
+impl Ctx<'_> {
+    /// A base conflict is not a stop the operator resumes from — the repair happens
+    /// in a different repository, on the topic branch — so leaving a half-merged
+    /// worktree and a state file behind would only make the next `build` refuse to
+    /// start for an unrelated-looking reason.
+    fn abandon(&self) {
+        for worktree in [self.worktree.clone(), self.derive_worktree()] {
+            if worktree.exists() {
+                let _ = git::raw(&worktree, &["merge", "--abort"]);
+                let _ = git::raw(&worktree, &["cherry-pick", "--abort"]);
+            }
         }
+        let _ = state::clear(&self.worktree);
     }
-    let _ = state::clear(&ctx.worktree);
 }
 
 /// What is being checked against the base: an entry's own pin, or one parent of
@@ -158,14 +160,16 @@ fn base_conflict_error(
     )
 }
 
-/// Refuse the build outright when `topic` cannot merge with the base on its
-/// own. Called the moment a merge conflicts, before any resolution — recorded
-/// or manual — gets a chance to obscure why.
-pub fn refuse_if_base_conflict(ctx: &Ctx, entry: &Entry, topic: Topic, base: &str) -> Result<()> {
-    let files = base_conflict_files(&ctx.repo, base, topic.oid)?;
-    if files.is_empty() {
-        return Ok(());
+impl Ctx<'_> {
+    /// Refuse the build outright when `topic` cannot merge with the base on its
+    /// own. Called the moment a merge conflicts, before any resolution — recorded
+    /// or manual — gets a chance to obscure why.
+    pub fn refuse_if_base_conflict(&self, entry: &Entry, topic: Topic, base: &str) -> Result<()> {
+        let files = base_conflict_files(&self.repo, base, topic.oid)?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.abandon();
+        Err(base_conflict_error(self, entry, &topic, base, &files))
     }
-    abandon(ctx);
-    Err(base_conflict_error(ctx, entry, &topic, base, &files))
 }

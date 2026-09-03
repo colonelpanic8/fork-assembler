@@ -13,8 +13,8 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use super::pins::derived_ref;
-use super::refuse::{refuse_if_base_conflict, Topic};
-use super::{conflicted_files, prepare_worktree, remove_worktree, Ctx, Run, Step};
+use super::refuse::Topic;
+use super::{conflicted_files, Ctx, Run, Step};
 use crate::git;
 use crate::lock::{self, DerivedResult};
 use crate::manifest::Entry;
@@ -190,7 +190,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
         let ds = match run.st.derive.take() {
             Some(ds) if ds.entry_index == step.index => ds,
             _ => {
-                prepare_worktree(run.ctx, &worktree, &run.st.base)?;
+                run.ctx.prepare_worktree(&worktree, &run.st.base)?;
                 run.ctx.emit(Event::Reconstructing {
                     step: step.info(),
                     base: run.st.base.clone(),
@@ -301,8 +301,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                     // Before anything else: a parent that cannot merge with
                     // the base on its own is out of date with upstream, and no
                     // amount of reconstruction here makes it apply again.
-                    refuse_if_base_conflict(
-                        ctx,
+                    ctx.refuse_if_base_conflict(
                         entry,
                         Topic::parent(entry, parent, &parent_pin),
                         &self.run.st.base,
@@ -527,35 +526,33 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
 ///
 /// Returns None when the reconstruction stopped for the human, having already
 /// persisted where it got to.
-pub fn reconstruct<'a>(
-    run: &mut Run<'a>,
-    step: &Step<'a>,
-    pin: &str,
-) -> Result<Option<DerivedResult>> {
-    let mut rc = Reconstruction::open(run, step)?;
-    if !rc.merge_parents()? {
-        return Ok(None);
+impl<'a> Run<'a> {
+    pub fn reconstruct(&mut self, step: &Step<'a>, pin: &str) -> Result<Option<DerivedResult>> {
+        let mut rc = Reconstruction::open(self, step)?;
+        if !rc.merge_parents()? {
+            return Ok(None);
+        }
+        rc.take_delta(pin)?;
+        if !rc.replay_delta()? {
+            return Ok(None);
+        }
+        rc.finish().map(Some)
     }
-    rc.take_delta(pin)?;
-    if !rc.replay_delta()? {
-        return Ok(None);
-    }
-    rc.finish().map(Some)
-}
 
-/// Resume a run that stalled inside a reconstruction: `ds` is the progress it
-/// persisted. The entry loop then re-enters the reconstruction where it left
-/// off, merges the result into the stack, and carries on.
-pub fn resume<'a>(run: &mut Run<'a>, ds: DeriveState) -> Result<()> {
-    let step = run.ctx.step(ds.entry_index);
-    let worktree = run.ctx.derive_worktree();
-    let mut rc = Reconstruction {
-        run,
-        step: &step,
-        ds,
-        worktree,
-    };
-    rc.resume_in_flight()
+    /// Resume a run that stalled inside a reconstruction: `ds` is the progress it
+    /// persisted. The entry loop then re-enters the reconstruction where it left
+    /// off, merges the result into the stack, and carries on.
+    pub fn resume_derive(&mut self, ds: DeriveState) -> Result<()> {
+        let step = self.ctx.step(ds.entry_index);
+        let worktree = self.ctx.derive_worktree();
+        let mut rc = Reconstruction {
+            run: self,
+            step: &step,
+            ds,
+            worktree,
+        };
+        rc.resume_in_flight()
+    }
 }
 
 /// Drop the reconstruction worktree once its entry's step has completed.
@@ -563,9 +560,11 @@ pub fn resume<'a>(run: &mut Run<'a>, ds: DeriveState) -> Result<()> {
 /// It survives an unfinished step on purpose: when a build stops on the stack
 /// merge or on a fixup, the reconstruction that produced the conflicting side
 /// is exactly what the operator needs to read next to it.
-pub fn clean(ctx: &Ctx, entry: &Entry, step_completed: bool) {
-    if step_completed && entry.is_derived() {
-        remove_worktree(ctx, &ctx.derive_worktree());
+impl Ctx<'_> {
+    pub fn clean_derive(&self, entry: &Entry, step_completed: bool) {
+        if step_completed && entry.is_derived() {
+            self.remove_worktree(&self.derive_worktree());
+        }
     }
 }
 
@@ -575,65 +574,67 @@ pub fn clean(ctx: &Ctx, entry: &Entry, step_completed: bool) {
 ///
 /// A locked build is a read-only reproducibility check: it deliberately skips
 /// this network write even when the manifest requests publication.
-pub fn publish(run: &Run, locked: bool) -> Result<()> {
-    let ctx = run.ctx;
-    for entry in &ctx.manifest.entries {
-        let Some(target) = &entry.reconstruction_publish else {
-            continue;
-        };
-        let Some(tip) = run
-            .st
-            .results
-            .iter()
-            .find(|result| result.name == entry.name)
-            .and_then(|result| result.derived.as_ref())
-            .map(|derived| derived.tip.as_str())
-        else {
-            // An absorbed or empty entry has no newly reconstructed branch to
-            // publish. Its normal build result already explains why.
-            continue;
-        };
-        if locked {
-            ctx.emit(Event::PublishSkipped {
+impl Run<'_> {
+    pub fn publish_reconstructions(&self, locked: bool) -> Result<()> {
+        let ctx = self.ctx;
+        for entry in &ctx.manifest.entries {
+            let Some(target) = &entry.reconstruction_publish else {
+                continue;
+            };
+            let Some(tip) = self
+                .st
+                .results
+                .iter()
+                .find(|result| result.name == entry.name)
+                .and_then(|result| result.derived.as_ref())
+                .map(|derived| derived.tip.as_str())
+            else {
+                // An absorbed or empty entry has no newly reconstructed branch to
+                // publish. Its normal build result already explains why.
+                continue;
+            };
+            if locked {
+                ctx.emit(Event::PublishSkipped {
+                    entry: entry.name.clone(),
+                    target: target.source(),
+                });
+                continue;
+            }
+
+            let destination = format!("refs/heads/{}", target.branch);
+            let out = git::raw(
+                &ctx.repo,
+                &["ls-remote", "--heads", &target.remote, &destination],
+            )?;
+            if !out.status.success() {
+                bail!(
+                    "{}: could not read reconstruction publish target {}: {}",
+                    entry.name,
+                    target.source(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let expected = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+                .unwrap_or_default();
+            let lease = format!("--force-with-lease={destination}:{expected}");
+            let source = format!("{tip}:{destination}");
+            git::out(&ctx.repo, &["push", &lease, &target.remote, &source]).with_context(|| {
+                format!(
+                    "{}: publishing reconstructed {} to {}",
+                    entry.name,
+                    git::short(tip),
+                    target.source()
+                )
+            })?;
+            ctx.emit(Event::Published {
                 entry: entry.name.clone(),
+                oid: tip.to_string(),
                 target: target.source(),
             });
-            continue;
         }
-
-        let destination = format!("refs/heads/{}", target.branch);
-        let out = git::raw(
-            &ctx.repo,
-            &["ls-remote", "--heads", &target.remote, &destination],
-        )?;
-        if !out.status.success() {
-            bail!(
-                "{}: could not read reconstruction publish target {}: {}",
-                entry.name,
-                target.source(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        let expected = String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .map(str::to_string)
-            .unwrap_or_default();
-        let lease = format!("--force-with-lease={destination}:{expected}");
-        let source = format!("{tip}:{destination}");
-        git::out(&ctx.repo, &["push", &lease, &target.remote, &source]).with_context(|| {
-            format!(
-                "{}: publishing reconstructed {} to {}",
-                entry.name,
-                git::short(tip),
-                target.source()
-            )
-        })?;
-        ctx.emit(Event::Published {
-            entry: entry.name.clone(),
-            oid: tip.to_string(),
-            target: target.source(),
-        });
+        Ok(())
     }
-    Ok(())
 }
