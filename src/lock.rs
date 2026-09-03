@@ -13,6 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::git;
 use crate::manifest::Entry;
 
 pub const FILE: &str = "manifest.lock.json";
@@ -126,8 +127,7 @@ pub struct EntryResult {
     /// not the reconstruction that was merged in its place; `derived` records
     /// that.
     pub oid: String,
-    /// merged | absorbed | empty | applied
-    pub status: String,
+    pub status: Status,
     #[serde(default)]
     pub conflicted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,6 +139,47 @@ pub struct EntryResult {
     /// What reconstructing a derived entry produced, when this entry is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<DerivedResult>,
+}
+
+/// How an entry's step ended.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    /// Merged into the stack (a derived entry: its reconstruction was).
+    Merged,
+    /// Already contained in the base; nothing merged.
+    Absorbed,
+    /// Merged, but the tree did not change.
+    Empty,
+    /// A patch entry, applied.
+    Applied,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Merged => "merged",
+            Status::Absorbed => "absorbed",
+            Status::Empty => "empty",
+            Status::Applied => "applied",
+        }
+    }
+}
+
+impl EntryResult {
+    /// A result with nothing yet to say about conflicts, fixups, or
+    /// reconstruction.
+    pub fn new(name: &str, oid: String, status: Status) -> EntryResult {
+        EntryResult {
+            name: name.to_string(),
+            oid,
+            status,
+            conflicted: false,
+            resolution: None,
+            fixup: None,
+            derived: None,
+        }
+    }
 }
 
 /// The two commits a reconstruction produced. Neither is reproducible as an
@@ -271,8 +312,8 @@ pub fn prefix_relation(lock: &Lock, current: &[SnapshotEntry], base_pin: &str) -
     if build.base != base_pin {
         return Prefix::Diverged(format!(
             "base pin moved ({} -> {})",
-            &build.base[..12.min(build.base.len())],
-            &base_pin[..12.min(base_pin.len())]
+            git::short(&build.base),
+            git::short(base_pin)
         ));
     }
     if build.results.len() != build.manifest_entries.len() {

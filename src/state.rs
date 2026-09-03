@@ -81,12 +81,7 @@ pub struct DeriveState {
 }
 
 fn state_path(worktree: &Path) -> Result<PathBuf> {
-    let git_dir = git::out(worktree, &["rev-parse", "--git-dir"])?;
-    let mut dir = PathBuf::from(&git_dir);
-    if !dir.is_absolute() {
-        dir = worktree.join(dir);
-    }
-    Ok(dir.join(FILE))
+    Ok(git::git_dir(worktree)?.join(FILE))
 }
 
 pub fn read(worktree: &Path) -> Result<Option<State>> {

@@ -1,17 +1,25 @@
-//! Non-build verbs: update (the only pin-mover), status, prune.
+//! Non-build verbs: update (the only pin-mover), status, prune, fixup.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::engine::{self, Ctx};
-use crate::git;
-use crate::lock::{self, Prefix};
-use crate::manifest::{self, Kind};
+use crate::engine::{self, derive, refuse, Ctx};
+use crate::git::{self, short};
+use crate::lock::{self, EntryResult, Prefix, Status};
+use crate::manifest::{self, edit, entries_noun, Entry};
+use crate::rerere;
 use crate::source;
+use crate::state;
 
-fn short(oid: &str) -> &str {
-    &oid[..12.min(oid.len())]
+/// Print how a pin moved, in the vocabulary every repin report shares.
+fn report_pin(indent: &str, what: &str, old: Option<&str>, new: &str) {
+    match old {
+        Some(old) if old == new => println!("{indent}{what}: unchanged ({})", short(new)),
+        Some(old) => println!("{indent}{what}: {} -> {}", short(old), short(new)),
+        None => println!("{indent}{what}: pinned {}", short(new)),
+    }
 }
 
 /// Repin the base and entries to live heads. `build` never moves existing
@@ -23,19 +31,14 @@ pub fn update(root: &Path, names: &[String]) -> Result<()> {
     let wants = |name: &str| all || names.iter().any(|n| n == name);
 
     for name in names {
-        if name != "base" && !ctx.manifest.entries.iter().any(|e| &e.name == name) {
+        if name != "base" && !ctx.manifest.has_entry(name) {
             bail!("no entry named {name:?} in the manifest");
         }
     }
 
     if wants("base") {
-        let old = lock.pins.base.clone();
         let new = engine::fetch_base(&ctx)?;
-        match old {
-            Some(old) if old == new => println!("  base: unchanged ({})", short(&new)),
-            Some(old) => println!("  base: {} -> {}", short(&old), short(&new)),
-            None => println!("  base: pinned {}", short(&new)),
-        }
+        report_pin("  ", "base", lock.pins.base.as_deref(), &new);
         lock.pins.base = Some(new);
     }
 
@@ -44,14 +47,9 @@ pub fn update(root: &Path, names: &[String]) -> Result<()> {
             continue;
         }
         let new = engine::fetch_entry(&ctx, entry)?;
-        let old = lock.pins.entries.get(&entry.name).cloned();
-        match old {
-            Some(old) if old == new => println!("  {}: unchanged ({})", entry.name, short(&new)),
-            Some(old) => println!("  {}: {} -> {}", entry.name, short(&old), short(&new)),
-            None => println!("  {}: pinned {}", entry.name, short(&new)),
-        }
-        lock.pins.entries.insert(entry.name.clone(), new.clone());
-        if !entry.parents.is_empty() {
+        let old = lock.pins.entries.insert(entry.name.clone(), new.clone());
+        report_pin("  ", &entry.name, old.as_deref(), &new);
+        if entry.is_derived() {
             update_derived(&ctx, &mut lock, entry, &new)?;
         }
     }
@@ -70,12 +68,7 @@ pub fn update(root: &Path, names: &[String]) -> Result<()> {
 /// which rule fired is printed because the anchor decides which commits count
 /// as the entry's own — an operator who cannot audit that boundary cannot tell
 /// duplicated work from replayed work until it is in the tree.
-fn update_derived(
-    ctx: &Ctx,
-    lock: &mut lock::Lock,
-    entry: &manifest::Entry,
-    pin: &str,
-) -> Result<()> {
+fn update_derived(ctx: &Ctx, lock: &mut lock::Lock, entry: &Entry, pin: &str) -> Result<()> {
     let mut pins = lock
         .pins
         .parents
@@ -84,19 +77,9 @@ fn update_derived(
         .unwrap_or_default();
     for parent in &entry.parents {
         let new = engine::fetch_parent(ctx, entry, parent)?;
-        match pins.get(&parent.name) {
-            Some(old) if *old == new => {
-                println!("    parent {}: unchanged ({})", parent.name, short(&new))
-            }
-            Some(old) => println!(
-                "    parent {}: {} -> {}",
-                parent.name,
-                short(old),
-                short(&new)
-            ),
-            None => println!("    parent {}: pinned {}", parent.name, short(&new)),
-        }
-        pins.insert(parent.name.clone(), new);
+        let old = pins.insert(parent.name.clone(), new.clone());
+        let what = format!("parent {}", parent.name);
+        report_pin("    ", &what, old.as_deref(), &new);
     }
     pins.retain(|name, _| entry.parents.iter().any(|p| &p.name == name));
 
@@ -106,7 +89,7 @@ fn update_derived(
         .and_then(|b| b.results.iter().find(|r| r.name == entry.name))
         .and_then(|r| r.derived.as_ref())
         .map(|d| d.base_tip.clone());
-    let anchor = engine::resolve_anchor(
+    let anchor = derive::resolve_anchor(
         &ctx.repo,
         entry,
         pin,
@@ -125,7 +108,7 @@ fn update_derived(
 /// (ancestor) or a squash/rebase equivalent (every topic commit has an
 /// upstream patch-id equivalent per `git cherry`).
 fn contained(repo: &Path, oid: &str, base: &str) -> bool {
-    if git::ok(repo, &["merge-base", "--is-ancestor", oid, base]) {
+    if git::is_ancestor(repo, oid, base) {
         return true;
     }
     match git::out(repo, &["cherry", base, oid]) {
@@ -137,44 +120,71 @@ fn contained(repo: &Path, oid: &str, base: &str) -> bool {
     }
 }
 
+/// How a pinned topic stands against the pinned base, for `status`.
+/// `absorbed` is the flag to print when the base already contains it.
+fn base_flag(repo: &Path, pin: &str, base: &str, absorbed: &str) -> Option<String> {
+    if !git::has_commit(repo, pin) {
+        None
+    } else if contained(repo, pin, base) {
+        Some(absorbed.to_string())
+    } else if refuse::conflicts_with_base(repo, base, pin) {
+        // Reported here because `build` refuses this outright, and the
+        // repair is in another repository. Better to learn it from a
+        // status read than from a build that stops and rolls back.
+        Some("CONFLICTS WITH BASE -- rebase the topic; build refuses it".to_string())
+    } else {
+        None
+    }
+}
+
+fn flag_text(flags: &[String]) -> String {
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", flags.join("; "))
+    }
+}
+
+fn pin_text(pin: Option<&String>) -> String {
+    pin.map_or("UNPINNED".to_string(), |p| short(p).to_string())
+}
+
 pub fn status(root: &Path, live: bool) -> Result<()> {
     let m = manifest::load(root)?;
-    let lck = lock::load(root)?;
-    let lock = lck.clone().unwrap_or_default();
+    let lock = lock::load(root)?.unwrap_or_default();
+    // Live checks fetch, so they need a configured source; offline ones
+    // only need whatever repository already exists.
     let repo = if live {
         Some(source::source_repo(root, &m, true)?)
     } else {
         source::source_repo_if_present(root, &m)
     };
-    let ctx = repo.as_ref().map(|r| Ctx {
-        root: root.to_path_buf(),
-        manifest: manifest::load(root).expect("manifest already loaded once"),
-        repo: r.clone(),
-        worktree: root.join(engine::WORKTREE),
-    });
+    let ctx = repo
+        .as_ref()
+        .filter(|_| live)
+        .map(|repo| Ctx::new(root, m.clone(), repo.clone()));
 
     match &lock.pins.base {
         Some(base) => println!("base: {} ({}:{})", short(base), m.base.remote, m.base.ref_),
         None => println!("base: UNPINNED ({}:{})", m.base.remote, m.base.ref_),
     }
-    if live {
-        if let Some(ctx) = &ctx {
-            let head = engine::fetch_base(ctx)?;
-            if Some(&head) != lock.pins.base.as_ref() {
-                println!(
-                    "      live head {} -- run `fork-assembler update base`",
-                    short(&head)
-                );
-            }
+    if let Some(ctx) = &ctx {
+        let head = engine::fetch_base(ctx)?;
+        if Some(&head) != lock.pins.base.as_ref() {
+            println!(
+                "      live head {} -- run `fork-assembler update base`",
+                short(&head)
+            );
         }
     }
 
-    let results: std::collections::BTreeMap<&str, &lock::EntryResult> = lock
+    let results: BTreeMap<&str, &EntryResult> = lock
         .build
         .as_ref()
         .map(|b| b.results.iter().map(|r| (r.name.as_str(), r)).collect())
         .unwrap_or_default();
-    let recorded = crate::rerere::index_entry_names(root)?;
+    let recorded = rerere::index_entry_names(root)?;
+    let base = lock.pins.base.as_deref();
 
     for entry in &m.entries {
         let pin = lock.pins.entries.get(&entry.name);
@@ -190,47 +200,35 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
             }
         }
         if let Some(result) = results.get(entry.name.as_str()) {
-            if result.status != "merged" && result.status != "applied" {
-                flags.push(format!("last build: {}", result.status.to_uppercase()));
+            if !matches!(result.status, Status::Merged | Status::Applied) {
+                flags.push(format!(
+                    "last build: {}",
+                    result.status.as_str().to_uppercase()
+                ));
             }
         }
-        if let (Some(pin), Some(base), Some(repo), false) = (
-            pin,
-            lock.pins.base.as_ref(),
-            repo.as_ref(),
-            matches!(entry.kind, Kind::Patch { .. }),
-        ) {
-            if git::has_commit(repo, pin) && contained(repo, pin, base) {
-                flags.push("contained in base -- prune candidate".to_string());
-            } else if git::has_commit(repo, pin) && engine::conflicts_with_base(repo, base, pin) {
-                // Reported here because `build` refuses this outright, and the
-                // repair is in another repository. Better to learn it from a
-                // status read than from a build that stops and rolls back.
-                flags.push("CONFLICTS WITH BASE -- rebase the topic; build refuses it".to_string());
+        if let (Some(pin), Some(base), Some(repo), false) =
+            (pin, base, repo.as_ref(), entry.kind.is_patch())
+        {
+            flags.extend(base_flag(
+                repo,
+                pin,
+                base,
+                "contained in base -- prune candidate",
+            ));
+        }
+        if let (Some(ctx), false) = (ctx.as_ref(), entry.kind.is_patch()) {
+            let head = engine::fetch_entry(ctx, entry)?;
+            if Some(&head) != pin {
+                flags.push(format!("live head {} -- pin is behind", short(&head)));
             }
         }
-        if live {
-            if let (Some(ctx), false) = (ctx.as_ref(), matches!(entry.kind, Kind::Patch { .. })) {
-                let head = engine::fetch_entry(ctx, entry)?;
-                if Some(&head) != pin {
-                    flags.push(format!("live head {} -- pin is behind", short(&head)));
-                }
-            }
-        }
-        let pin_text = pin
-            .map(|p| short(p).to_string())
-            .unwrap_or("UNPINNED".into());
-        let flag_text = if flags.is_empty() {
-            String::new()
-        } else {
-            format!("  [{}]", flags.join("; "))
-        };
         println!(
             "  {:<24} {} ({}){}",
             entry.name,
-            pin_text,
+            pin_text(pin),
             entry.source(),
-            flag_text
+            flag_text(&flags)
         );
 
         // A derived entry's parents are not entries and never will be, so they
@@ -243,20 +241,15 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
                 .get(&entry.name)
                 .and_then(|pins| pins.get(&parent.name));
             let mut flags = Vec::new();
-            if let (Some(pin), Some(base), Some(repo)) =
-                (pin, lock.pins.base.as_ref(), repo.as_ref())
-            {
-                if git::has_commit(repo, pin) && contained(repo, pin, base) {
-                    flags
-                        .push("absorbed upstream -- consider removing it from parents".to_string());
-                } else if git::has_commit(repo, pin) && engine::conflicts_with_base(repo, base, pin)
-                {
-                    flags.push(
-                        "CONFLICTS WITH BASE -- rebase the topic; build refuses it".to_string(),
-                    );
-                }
+            if let (Some(pin), Some(base), Some(repo)) = (pin, base, repo.as_ref()) {
+                flags.extend(base_flag(
+                    repo,
+                    pin,
+                    base,
+                    "absorbed upstream -- consider removing it from parents",
+                ));
             }
-            if let Some(ctx) = ctx.as_ref().filter(|_| live) {
+            if let Some(ctx) = ctx.as_ref() {
                 let head = engine::fetch_parent(ctx, entry, parent)?;
                 if Some(&head) != pin {
                     flags.push(format!("live head {} -- pin is behind", short(&head)));
@@ -265,17 +258,12 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
             println!(
                 "    {:<22} {} ({}){}",
                 format!("parent {}", parent.name),
-                pin.map(|p| short(p).to_string())
-                    .unwrap_or("UNPINNED".into()),
+                pin_text(pin),
                 parent.source(),
-                if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("  [{}]", flags.join("; "))
-                }
+                flag_text(&flags)
             );
         }
-        if !entry.parents.is_empty() {
+        if entry.is_derived() {
             match lock.pins.anchors.get(&entry.name) {
                 Some(anchor) => println!("    {:<22} {}", "anchor", short(anchor)),
                 None => println!(
@@ -302,8 +290,7 @@ pub fn status(root: &Path, live: bool) -> Result<()> {
             println!("  tree {} ({} conflicts)", build.tree, build.conflicts);
             let fixups = engine::fixup_blobs(root, &m.entries, false)?;
             let snapshot = lock::snapshot(&m.entries, &lock.pins, &fixups);
-            let base_pin = lock.pins.base.clone().unwrap_or_default();
-            match lock::prefix_relation(&lock, &snapshot, &base_pin) {
+            match lock::prefix_relation(&lock, &snapshot, base.unwrap_or_default()) {
                 Prefix::Exact => println!("  manifest matches the lock: `build` is a no-op"),
                 Prefix::Extension(at) => println!(
                     "  manifest extends the lock: `build` merges only entries {}..{} incrementally",
@@ -333,7 +320,7 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
 
     let mut dead = Vec::new();
     for entry in &m.entries {
-        if matches!(entry.kind, Kind::Patch { .. }) {
+        if entry.kind.is_patch() {
             continue;
         }
         let Some(pin) = lock.pins.entries.get(&entry.name) else {
@@ -348,31 +335,32 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<()> {
         println!("nothing to prune: no pinned entry is contained in the base");
         return Ok(());
     }
+    let count = format!("{} {}", dead.len(), entries_noun(dead.len()));
     if dry_run {
-        println!(
-            "would remove {} entr{} (dry run)",
-            dead.len(),
-            if dead.len() == 1 { "y" } else { "ies" }
-        );
+        println!("would remove {count} (dry run)");
         return Ok(());
     }
-    let removal = manifest::remove_entries(root, &dead)?;
+    let removal = edit::remove_entries(root, &dead)?;
     println!(
-        "removed {} entr{}; the build suffix from position {} is invalidated -- run `fork-assembler build`",
-        dead.len(),
-        if dead.len() == 1 { "y" } else { "ies" },
+        "removed {count}; the build suffix from position {} is invalidated -- run `fork-assembler build`",
         removal.earliest + 1
     );
-    report_orphaned_fixups(&removal);
-    report_orphaned_parents(&removal);
+    report_removal(&removal);
     Ok(())
 }
 
+/// What a removal detached, so nothing silently vanishes from the build.
+///
 /// A coherence fixup repairs an interaction BETWEEN entries, so removing one
 /// side does not mean the incoherence is gone — an entry that landed upstream
-/// usually still clashes with the topic it clashed with before. Surface the
-/// detached patch instead of letting it silently vanish from the build.
-pub fn report_orphaned_fixups(removal: &manifest::Removal) {
+/// usually still clashes with the topic it clashed with before. The patch is
+/// left on disk and surfaced here.
+///
+/// A parent was kept out of the entry list by the declaration that just left
+/// with its entry. Unlike a fixup it leaves no file to re-home — it leaves a
+/// silence, and a silence is exactly what discovery overwrites: an open PR
+/// that was somebody's parent yesterday is an ordinary candidate today.
+pub fn report_removal(removal: &edit::Removal) {
     for (name, path) in &removal.orphaned_fixups {
         println!(
             "  NOTE: {name} carried the coherence fixup {path}, now unreferenced.\n  \
@@ -380,13 +368,6 @@ pub fn report_orphaned_fixups(removal: &manifest::Removal) {
              re-home it with `fork-assembler fixup OTHER_ENTRY {path}`; otherwise delete it."
         );
     }
-}
-
-/// A parent was kept out of the entry list by the declaration that just left
-/// with its entry. Unlike a fixup it leaves no file to re-home — it leaves a
-/// silence, and a silence is exactly what discovery overwrites: an open PR
-/// that was somebody's parent yesterday is an ordinary candidate today.
-pub fn report_orphaned_parents(removal: &manifest::Removal) {
     for (name, parents) in &removal.orphaned_parents {
         println!(
             "  NOTE: {name} declared {} as parent(s); nothing references them now.\n  \
@@ -399,6 +380,16 @@ pub fn report_orphaned_parents(removal: &manifest::Removal) {
     }
 }
 
+pub fn remove(root: &Path, name: String) -> Result<()> {
+    let removal = edit::remove_entries(root, &[name])?;
+    println!(
+        "entry removed; the build suffix from position {} is invalidated -- run `fork-assembler build`",
+        removal.earliest + 1
+    );
+    report_removal(&removal);
+    Ok(())
+}
+
 /// Attach, re-capture, or detach an entry's coherence fixup.
 pub fn fixup(
     root: &Path,
@@ -408,7 +399,7 @@ pub fn fixup(
     remove: bool,
 ) -> Result<()> {
     if remove {
-        let index = manifest::set_fixup(root, name, None)?;
+        let index = edit::set_fixup(root, name, None)?;
         println!("detached {name}'s coherence fixup (the patch file is left in place)");
         println!("entry {} changed -- run `fork-assembler build`", index + 1);
         return Ok(());
@@ -440,14 +431,14 @@ pub fn fixup(
         println!("captured {rel} from {source}");
         // A capture during a stalled build supersedes that build: the fixup
         // blob just changed, so the stalled worktree can only be rebuilt.
-        let _ = crate::state::clear(&worktree);
+        let _ = state::clear(&worktree);
     } else if !root.join(rel).exists() {
         bail!(
             "patch file {rel} does not exist (pass --capture to write it from the build worktree)"
         );
     }
 
-    let index = manifest::set_fixup(root, name, Some(rel))?;
+    let index = edit::set_fixup(root, name, Some(rel))?;
     println!("{name}: coherence fixup set to {rel}");
     println!(
         "entry {} now produces a different tree -- run `fork-assembler build`",
@@ -477,8 +468,5 @@ fn capture_diff(worktree: &Path, name: &str) -> Result<(Vec<u8>, String)> {
         return Ok((Vec::new(), String::new()));
     };
     let diff = git::bytes(worktree, &["show", "--binary", "--format=", &commit])?;
-    Ok((
-        diff,
-        format!("commit {} ({subject})", &commit[..12.min(commit.len())]),
-    ))
+    Ok((diff, format!("commit {} ({subject})", short(&commit))))
 }

@@ -1,5 +1,10 @@
 //! `manifest.toml` — INTENT: named remotes, the base, the ordered entries,
 //! and the targets deliberately not carried.
+//!
+//! This is the typed view: `load` parses and validates the whole document.
+//! The verbs that edit the file in place, comment-preserving, live in `edit`.
+
+pub mod edit;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -7,7 +12,6 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use toml_edit::{DocumentMut, Item};
 
 pub const FILE: &str = "manifest.toml";
 
@@ -76,6 +80,7 @@ struct RawExclude {
     reason: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Manifest {
     pub remotes: BTreeMap<String, String>,
     pub base: Base,
@@ -85,6 +90,7 @@ pub struct Manifest {
     pub excludes: Vec<Exclusion>,
 }
 
+#[derive(Clone)]
 pub struct Base {
     pub remote: String,
     pub ref_: String,
@@ -148,38 +154,6 @@ pub struct Parent {
     pub kind: Kind,
 }
 
-impl Parent {
-    /// Stable human identity of what this parent tracks, for lock snapshots —
-    /// the same spelling `Entry::source` uses, since they name the same kinds
-    /// of thing.
-    pub fn source(&self) -> String {
-        match &self.kind {
-            Kind::Branch { remote, branch, .. } => format!("{remote}:{branch}"),
-            Kind::Pr { remote, number } => format!("{remote}#{number}"),
-            Kind::Patch { path } => path.clone(),
-        }
-    }
-
-    pub fn pr_number(&self) -> Option<i64> {
-        match &self.kind {
-            Kind::Branch { pr, .. } => *pr,
-            Kind::Pr { number, .. } => Some(*number),
-            Kind::Patch { .. } => None,
-        }
-    }
-
-    /// The target this parent names, so refusals can talk about it in `add`'s
-    /// vocabulary.
-    pub fn target(&self) -> Target {
-        match &self.kind {
-            Kind::Pr { number, .. } => Target::Pr { number: *number },
-            _ => Target::Branch {
-                spec: self.source(),
-            },
-        }
-    }
-}
-
 #[derive(Clone)]
 pub enum Kind {
     /// A live topic branch on a named remote. `pr` is optional metadata: the
@@ -204,12 +178,15 @@ impl Kind {
             Kind::Patch { .. } => "patch",
         }
     }
-}
 
-impl Entry {
-    /// Stable human identity of what this entry tracks, for lock snapshots.
+    pub fn is_patch(&self) -> bool {
+        matches!(self, Kind::Patch { .. })
+    }
+
+    /// Stable human identity of what this tracks, as `status` and the lock
+    /// spell it.
     pub fn source(&self) -> String {
-        match &self.kind {
+        match self {
             Kind::Branch { remote, branch, .. } => format!("{remote}:{branch}"),
             Kind::Pr { remote, number } => format!("{remote}#{number}"),
             Kind::Patch { path } => path.clone(),
@@ -217,11 +194,46 @@ impl Entry {
     }
 
     pub fn pr_number(&self) -> Option<i64> {
-        match &self.kind {
+        match self {
             Kind::Branch { pr, .. } => *pr,
             Kind::Pr { number, .. } => Some(*number),
             Kind::Patch { .. } => None,
         }
+    }
+
+    /// The remote and the ref on it to fetch, for the two kinds that track
+    /// one.
+    pub fn remote_ref(&self) -> Option<(&str, String)> {
+        match self {
+            Kind::Branch { remote, branch, .. } => Some((remote, format!("refs/heads/{branch}"))),
+            Kind::Pr { remote, number } => Some((remote, format!("refs/pull/{number}/head"))),
+            Kind::Patch { .. } => None,
+        }
+    }
+
+    /// What this tracks, in `add`'s vocabulary.
+    pub fn target(&self) -> Target {
+        match self {
+            Kind::Branch { .. } => Target::Branch {
+                spec: self.source(),
+            },
+            Kind::Pr { number, .. } => Target::Pr { number: *number },
+            Kind::Patch { path } => Target::Patch { path: path.clone() },
+        }
+    }
+}
+
+impl Entry {
+    pub fn source(&self) -> String {
+        self.kind.source()
+    }
+
+    pub fn pr_number(&self) -> Option<i64> {
+        self.kind.pr_number()
+    }
+
+    pub fn is_derived(&self) -> bool {
+        !self.parents.is_empty()
     }
 
     /// Does this entry track the same live ref `parent` names? The same
@@ -236,6 +248,20 @@ impl Entry {
         matches!(self.kind, Kind::Branch { .. })
             && matches!(parent.kind, Kind::Branch { .. })
             && self.source() == parent.source()
+    }
+}
+
+impl Parent {
+    pub fn source(&self) -> String {
+        self.kind.source()
+    }
+
+    pub fn pr_number(&self) -> Option<i64> {
+        self.kind.pr_number()
+    }
+
+    pub fn target(&self) -> Target {
+        self.kind.target()
     }
 }
 
@@ -262,7 +288,7 @@ pub struct Exclusion {
 /// What an exclusion names: the same three shapes an entry can take, minus
 /// everything that only matters to a merge. An exclusion has no step, so it
 /// has no remote to fetch from, no position, and no fixup.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Target {
     /// A topic branch, as the `REMOTE:BRANCH` spec an entry would name.
     Branch { spec: String },
@@ -311,34 +337,27 @@ impl Exclusion {
         Ok(Exclusion { target, reason })
     }
 
-    /// Does `entry` carry what this exclusion refuses?
-    pub fn matches(&self, entry: &Entry) -> bool {
-        match (&self.target, &entry.kind) {
-            (Target::Pr { number }, _) => entry.pr_number() == Some(*number),
-            (Target::Branch { spec }, Kind::Branch { .. }) => &entry.source() == spec,
+    /// Does `kind` — an entry's or a parent's — track what this exclusion
+    /// refuses? A PR number matches wherever it surfaces; a branch or patch
+    /// matches its own shape exactly.
+    pub fn matches(&self, kind: &Kind) -> bool {
+        match (&self.target, kind) {
+            (Target::Pr { number }, _) => kind.pr_number() == Some(*number),
+            (Target::Branch { spec }, Kind::Branch { .. }) => &kind.source() == spec,
             (Target::Patch { path }, Kind::Patch { path: carried }) => carried == path,
             _ => false,
         }
     }
 
-    /// Does `parent` name what this exclusion refuses? Matched exactly as an
-    /// entry is: a parent has the same identity a carried target has, and the
-    /// collision it creates is the same kind of contradiction.
-    pub fn matches_parent(&self, parent: &Parent) -> bool {
-        match (&self.target, &parent.kind) {
-            (Target::Pr { number }, _) => parent.pr_number() == Some(*number),
-            (Target::Branch { spec }, Kind::Branch { .. }) => &parent.source() == spec,
-            _ => false,
-        }
+    /// The recorded reason, or the phrase every report uses in its absence.
+    pub fn reason_text(&self) -> &str {
+        self.reason.as_deref().unwrap_or("no reason recorded")
     }
 
     /// Label plus the recorded reason: what every message reporting this
     /// exclusion prints, so the refusal always arrives with its justification.
     pub fn describe(&self) -> String {
-        match &self.reason {
-            Some(reason) => format!("{} ({reason})", self.target.label()),
-            None => format!("{} (no reason recorded)", self.target.label()),
-        }
+        format!("{} ({})", self.target.label(), self.reason_text())
     }
 }
 
@@ -350,8 +369,24 @@ impl Manifest {
             .with_context(|| format!("remote {name:?} is not defined under [remotes]"))
     }
 
-    pub fn names(&self) -> Vec<String> {
-        self.entries.iter().map(|e| e.name.clone()).collect()
+    pub fn has_entry(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.name == name)
+    }
+
+    pub fn position(&self, name: &str) -> Result<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.name == name)
+            .with_context(|| format!("no entry named {name:?} in the manifest"))
+    }
+}
+
+/// "entry" or "entries", for counts in reports.
+pub fn entries_noun(n: usize) -> &'static str {
+    if n == 1 {
+        "entry"
+    } else {
+        "entries"
     }
 }
 
@@ -398,6 +433,42 @@ pub fn entry_name(
     bail!("an entry must name a `branch`, a `pr`, or a `patch`");
 }
 
+/// The live-ref shapes an entry and a parent share: `branch = "REMOTE:BRANCH"`
+/// (optionally with `pr = N` metadata), or `pr = N` on `remote` (default: the
+/// base remote). `None` when the declaration names neither.
+fn parse_ref_kind(
+    subject: &str,
+    branch: Option<&str>,
+    pr: Option<i64>,
+    remote: Option<&str>,
+    base_remote: &str,
+) -> Result<Option<Kind>> {
+    let kind = match (branch, pr) {
+        (Some(spec), pr) => {
+            if remote.is_some() {
+                bail!(
+                    "{subject}: branch {spec:?} names its remote as REMOTE:BRANCH; \
+                     drop the `remote` field"
+                );
+            }
+            let Some((remote, branch)) = spec.split_once(':') else {
+                bail!("{subject}: branch {spec:?} must be REMOTE:BRANCH");
+            };
+            Kind::Branch {
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+                pr,
+            }
+        }
+        (None, Some(number)) => Kind::Pr {
+            remote: remote.unwrap_or(base_remote).to_string(),
+            number,
+        },
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(kind))
+}
+
 /// One `parents` element: the entry shapes minus `patch`, named by the same
 /// rules an entry is named by, so a parent and the entry it could have been
 /// answer to the same name.
@@ -408,72 +479,26 @@ fn convert_parent(raw: RawParent, base_remote: &str, entry: &str) -> Result<Pare
              commits this entry merged in, and a patch has no commits to re-merge"
         );
     }
-    let kind = match (&raw.branch, raw.pr) {
-        (Some(spec), pr) => {
-            if raw.remote.is_some() {
-                bail!(
-                    "entry {entry:?}: parent {spec:?} names its remote as REMOTE:BRANCH; \
-                     drop the `remote` field"
-                );
-            }
-            let Some((remote, branch)) = spec.split_once(':') else {
-                bail!("entry {entry:?}: parent {spec:?}: branch parents are REMOTE:BRANCH");
-            };
-            Kind::Branch {
-                remote: remote.to_string(),
-                branch: branch.to_string(),
-                pr,
-            }
-        }
-        (None, Some(number)) => Kind::Pr {
-            remote: raw
-                .remote
-                .clone()
-                .unwrap_or_else(|| base_remote.to_string()),
-            number,
-        },
-        (None, None) => bail!(
-            "entry {entry:?}: a parent must name a `branch = \"remote:branch\"` or a `pr = N`"
-        ),
-    };
+    if raw.branch.is_none() && raw.pr.is_none() {
+        bail!("entry {entry:?}: a parent must name a `branch = \"remote:branch\"` or a `pr = N`");
+    }
     let name = entry_name(raw.name.as_deref(), raw.branch.as_deref(), raw.pr, None)?;
     if name.is_empty() {
         bail!("entry {entry:?}: a parent's name cannot be empty");
     }
+    let subject = format!("entry {entry:?}: parent {name:?}");
+    let kind = parse_ref_kind(
+        &subject,
+        raw.branch.as_deref(),
+        raw.pr,
+        raw.remote.as_deref(),
+        base_remote,
+    )?
+    .expect("a branch or pr is present");
     Ok(Parent { name, kind })
 }
 
 fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
-    let kind = match (&raw.branch, raw.pr, &raw.patch) {
-        (Some(spec), pr, None) => {
-            if raw.remote.is_some() {
-                bail!(
-                    "entry {spec:?}: branch entries name their remote as REMOTE:BRANCH; \
-                     drop the `remote` field"
-                );
-            }
-            let Some((remote, branch)) = spec.split_once(':') else {
-                bail!("entry {spec:?}: branch entries are REMOTE:BRANCH");
-            };
-            Kind::Branch {
-                remote: remote.to_string(),
-                branch: branch.to_string(),
-                pr,
-            }
-        }
-        (None, Some(number), None) => Kind::Pr {
-            remote: raw
-                .remote
-                .clone()
-                .unwrap_or_else(|| base_remote.to_string()),
-            number,
-        },
-        (None, None, Some(path)) => Kind::Patch { path: path.clone() },
-        _ => bail!(
-            "an entry must be exactly one of: `branch = \"remote:branch\"` \
-             (optionally with `pr = N` metadata), `pr = N`, or `patch = \"file\"`"
-        ),
-    };
     let name = entry_name(
         raw.name.as_deref(),
         raw.branch.as_deref(),
@@ -483,40 +508,53 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
     if name.is_empty() || name == "base" {
         bail!("invalid entry name {name:?} (empty and \"base\" are reserved)");
     }
-    if raw.fixup.is_some() && matches!(kind, Kind::Patch { .. }) {
-        bail!(
-            "entry {name:?}: patch entries cannot carry a `fixup` \
-             (a patch that needs fixing up is just a patch that needs editing)"
-        );
-    }
-    if !raw.parents.is_empty() && matches!(kind, Kind::Patch { .. }) {
-        bail!(
-            "entry {name:?}: patch entries cannot carry `parents` \
-             (parents describe commits a branch merged in, and a patch has no history \
-             to reconstruct)"
-        );
+    let subject = format!("entry {name:?}");
+    let live = parse_ref_kind(
+        &subject,
+        raw.branch.as_deref(),
+        raw.pr,
+        raw.remote.as_deref(),
+        base_remote,
+    )?;
+    let kind = match (live, raw.patch) {
+        (Some(kind), None) => kind,
+        (None, Some(path)) => Kind::Patch { path },
+        _ => bail!(
+            "{subject}: an entry must be exactly one of: `branch = \"remote:branch\"` \
+             (optionally with `pr = N` metadata), `pr = N`, or `patch = \"file\"`"
+        ),
+    };
+    if kind.is_patch() {
+        if raw.fixup.is_some() {
+            bail!(
+                "{subject}: patch entries cannot carry a `fixup` \
+                 (a patch that needs fixing up is just a patch that needs editing)"
+            );
+        }
+        if !raw.parents.is_empty() {
+            bail!(
+                "{subject}: patch entries cannot carry `parents` \
+                 (parents describe commits a branch merged in, and a patch has no history \
+                 to reconstruct)"
+            );
+        }
     }
     let reconstruction_publish = match raw.reconstruction_publish {
         Some(spec) => {
             if raw.parents.is_empty() {
-                bail!(
-                    "entry {name:?}: `reconstruction_publish` only applies to derived entries with `parents`"
-                );
+                bail!("{subject}: `reconstruction_publish` only applies to derived entries with `parents`");
             }
-            let Some((remote, branch)) = spec.split_once(':') else {
-                bail!(
-                    "entry {name:?}: reconstruction publish target {spec:?} must be REMOTE:BRANCH"
-                );
-            };
-            if remote.is_empty() || branch.is_empty() {
-                bail!(
-                    "entry {name:?}: reconstruction publish target {spec:?} must be REMOTE:BRANCH"
-                );
+            match spec.split_once(':') {
+                Some((remote, branch)) if !remote.is_empty() && !branch.is_empty() => {
+                    Some(ReconstructionPublish {
+                        remote: remote.to_string(),
+                        branch: branch.to_string(),
+                    })
+                }
+                _ => {
+                    bail!("{subject}: reconstruction publish target {spec:?} must be REMOTE:BRANCH")
+                }
             }
-            Some(ReconstructionPublish {
-                remote: remote.to_string(),
-                branch: branch.to_string(),
-            })
         }
         None => None,
     };
@@ -526,7 +564,7 @@ fn convert_entry(raw: RawEntry, base_remote: &str) -> Result<Entry> {
         let parent = convert_parent(raw_parent, base_remote, &name)?;
         if !named.insert(parent.name.clone()) {
             bail!(
-                "entry {name:?}: duplicate parent name {:?}; set an explicit `name` on one of them",
+                "{subject}: duplicate parent name {:?}; set an explicit `name` on one of them",
                 parent.name
             );
         }
@@ -581,7 +619,7 @@ pub fn load(root: &Path) -> Result<Manifest> {
     // the maintainer knows which. Fail every command until it is resolved,
     // rather than silently honoring whichever the code happens to read last.
     for exclusion in &excludes {
-        if let Some(entry) = entries.iter().find(|e| exclusion.matches(e)) {
+        if let Some(entry) = entries.iter().find(|e| exclusion.matches(&e.kind)) {
             bail!(
                 "manifest both carries and excludes {}: entry {:?} tracks it \
                  while an [[exclude]] refuses it -- delete whichever is wrong",
@@ -608,17 +646,14 @@ pub fn load(root: &Path) -> Result<Manifest> {
                     entry.name
                 );
             }
-            if let Some(exclusion) = excludes.iter().find(|x| x.matches_parent(parent)) {
+            if let Some(exclusion) = excludes.iter().find(|x| x.matches(&parent.kind)) {
                 bail!(
                     "{} is declared as a parent of {:?} and also refused by an [[exclude]] \
                      ({}) -- delete the exclusion; declaring a parent already keeps discovery \
                      away from it, and states why",
                     parent.target().label(),
                     entry.name,
-                    exclusion
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "no reason recorded".into()),
+                    exclusion.reason_text(),
                 );
             }
         }
@@ -640,11 +675,8 @@ pub fn load(root: &Path) -> Result<Manifest> {
     manifest.remote_url(&manifest.base.remote)?;
     for entry in &manifest.entries {
         for kind in std::iter::once(&entry.kind).chain(entry.parents.iter().map(|p| &p.kind)) {
-            match kind {
-                Kind::Branch { remote, .. } | Kind::Pr { remote, .. } => {
-                    manifest.remote_url(remote)?;
-                }
-                Kind::Patch { .. } => {}
+            if let Some((remote, _)) = kind.remote_ref() {
+                manifest.remote_url(remote)?;
             }
         }
         if let Some(target) = &entry.reconstruction_publish {
@@ -665,218 +697,4 @@ pub fn slug_from_url(url: &str) -> Result<String> {
         (Some(o), Some(r)) if !o.is_empty() && !r.is_empty() => Ok(format!("{o}/{r}")),
         _ => bail!("cannot derive owner/repo from remote url {url:?}"),
     }
-}
-
-/// What removing entries detached along with them.
-pub struct Removal {
-    /// Position of the earliest removed entry: the suffix invalidated.
-    pub earliest: usize,
-    /// (entry name, fixup path) for each removed entry that carried a
-    /// coherence fixup. The files are left on disk: a fixup is owned by the
-    /// *interaction* between entries, so when one side of that interaction
-    /// leaves (typically because it landed upstream), the incoherence it
-    /// repaired often persists and the patch needs re-homing rather than
-    /// deleting. Callers must surface these.
-    pub orphaned_fixups: Vec<(String, String)>,
-    /// (entry name, parent labels) for each removed derived entry. A parent
-    /// was kept out of the entry list by the declaration that just vanished,
-    /// so unlike a fixup it leaves no file behind — it leaves a hole in the
-    /// manifest's intent, and an open PR discovery will offer again. Callers
-    /// must surface these.
-    pub orphaned_parents: Vec<(String, Vec<String>)>,
-}
-
-/// Remove the named entries from manifest.toml (comment-preserving).
-pub fn remove_entries(root: &Path, names: &[String]) -> Result<Removal> {
-    let manifest = load(root)?;
-    let all = manifest.names();
-    let mut indices = Vec::new();
-    for name in names {
-        let idx = all
-            .iter()
-            .position(|n| n == name)
-            .with_context(|| format!("no entry named {name:?} in the manifest"))?;
-        indices.push(idx);
-    }
-    indices.sort_unstable();
-    indices.dedup();
-    let earliest = indices[0];
-    let orphaned_fixups = indices
-        .iter()
-        .filter_map(|idx| {
-            let entry = &manifest.entries[*idx];
-            entry.fixup.clone().map(|path| (entry.name.clone(), path))
-        })
-        .collect();
-    let orphaned_parents = indices
-        .iter()
-        .filter_map(|idx| {
-            let entry = &manifest.entries[*idx];
-            let labels: Vec<String> = entry.parents.iter().map(|p| p.target().label()).collect();
-            (!labels.is_empty()).then(|| (entry.name.clone(), labels))
-        })
-        .collect();
-
-    let path = root.join(FILE);
-    let mut doc = fs::read_to_string(&path)?
-        .parse::<DocumentMut>()
-        .with_context(|| format!("parsing {}", path.display()))?;
-    let arr = doc
-        .get_mut("entry")
-        .and_then(Item::as_array_of_tables_mut)
-        .context("manifest has no [[entry]] tables")?;
-    for idx in indices.iter().rev() {
-        arr.remove(*idx);
-    }
-    fs::write(&path, doc.to_string())?;
-    Ok(Removal {
-        earliest,
-        orphaned_fixups,
-        orphaned_parents,
-    })
-}
-
-/// What `record_exclusion` did to the manifest.
-pub enum Excluded {
-    /// A new `[[exclude]]` table was appended.
-    Added,
-    /// The target was already excluded, with the reason left as it was.
-    AlreadyRecorded,
-    /// The target was already excluded and its reason was replaced.
-    ReasonUpdated { previous: Option<String> },
-}
-
-/// Record an exclusion in manifest.toml (comment-preserving), idempotently.
-///
-/// Refuses when the target is currently carried. Removing an entry
-/// invalidates every later entry's build, and that consequence belongs to
-/// `remove`, which reports it; a bookkeeping verb must not trigger it as a
-/// side effect.
-///
-/// Never touches the lock: an exclusion says nothing about any assembled
-/// tree, so nothing needs rebuilding after one.
-pub fn record_exclusion(root: &Path, target: &Target, reason: Option<&str>) -> Result<Excluded> {
-    let manifest = load(root)?;
-    let exclusion = Exclusion {
-        target: target.clone(),
-        reason: reason.map(str::to_string),
-    };
-    if let Some(entry) = manifest.entries.iter().find(|e| exclusion.matches(e)) {
-        bail!(
-            "{} is carried by entry {:?}; run `fork-assembler remove {}` first \
-             (that invalidates the build from its position, which is why \
-             excluding will not do it for you)",
-            target.label(),
-            entry.name,
-            entry.name
-        );
-    }
-
-    let path = root.join(FILE);
-    let mut doc = fs::read_to_string(&path)?
-        .parse::<DocumentMut>()
-        .with_context(|| format!("parsing {}", path.display()))?;
-    let existing = doc
-        .get("exclude")
-        .and_then(Item::as_array_of_tables)
-        .map(|arr| {
-            arr.iter()
-                .position(|t| read_exclude_target(t).as_ref() == Some(target))
-        })
-        .unwrap_or(None);
-
-    if let Some(index) = existing {
-        let table = doc
-            .get_mut("exclude")
-            .and_then(Item::as_array_of_tables_mut)
-            .and_then(|arr| arr.get_mut(index))
-            .context("exclusion vanished between read and edit")?;
-        let previous = table
-            .get("reason")
-            .and_then(Item::as_str)
-            .map(str::to_string);
-        match reason {
-            Some(reason) if previous.as_deref() != Some(reason) => {
-                table["reason"] = toml_edit::value(reason);
-                fs::write(&path, doc.to_string())?;
-                return Ok(Excluded::ReasonUpdated { previous });
-            }
-            _ => return Ok(Excluded::AlreadyRecorded),
-        }
-    }
-
-    let excludes = doc
-        .entry("exclude")
-        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
-    let arr = excludes
-        .as_array_of_tables_mut()
-        .context("`exclude` is set to something other than [[exclude]] tables")?;
-    let mut table = toml_edit::Table::new();
-    match target {
-        Target::Branch { spec } => table["branch"] = toml_edit::value(spec.as_str()),
-        Target::Pr { number } => table["pr"] = toml_edit::value(*number),
-        Target::Patch { path } => table["patch"] = toml_edit::value(path.as_str()),
-    }
-    if let Some(reason) = reason {
-        table["reason"] = toml_edit::value(reason);
-    }
-    arr.push(table);
-    fs::write(&path, doc.to_string())?;
-    Ok(Excluded::Added)
-}
-
-/// The target an `[[exclude]]` table names, reading the live document rather
-/// than the typed load, so the editing verbs see exactly what is on disk.
-pub fn read_exclude_target(table: &toml_edit::Table) -> Option<Target> {
-    if let Some(spec) = table.get("branch").and_then(Item::as_str) {
-        return Some(Target::Branch {
-            spec: spec.to_string(),
-        });
-    }
-    if let Some(number) = table.get("pr").and_then(Item::as_integer) {
-        return Some(Target::Pr { number });
-    }
-    table
-        .get("patch")
-        .and_then(Item::as_str)
-        .map(|path| Target::Patch {
-            path: path.to_string(),
-        })
-}
-
-/// Attach (`Some`) or detach (`None`) an entry's coherence fixup in
-/// manifest.toml. Returns the entry's position: the suffix a rebuild must
-/// redo, since the entry's own step now produces a different tree.
-pub fn set_fixup(root: &Path, name: &str, fixup: Option<&str>) -> Result<usize> {
-    let manifest = load(root)?;
-    let index = manifest
-        .entries
-        .iter()
-        .position(|e| e.name == name)
-        .with_context(|| format!("no entry named {name:?} in the manifest"))?;
-    if matches!(manifest.entries[index].kind, Kind::Patch { .. }) {
-        bail!(
-            "{name}: patch entries cannot carry a fixup; edit {} instead",
-            manifest.entries[index].source()
-        );
-    }
-
-    let path = root.join(FILE);
-    let mut doc = fs::read_to_string(&path)?
-        .parse::<DocumentMut>()
-        .with_context(|| format!("parsing {}", path.display()))?;
-    let table = doc
-        .get_mut("entry")
-        .and_then(Item::as_array_of_tables_mut)
-        .context("manifest has no [[entry]] tables")?
-        .get_mut(index)
-        .context("entry vanished between load and edit")?;
-    match fixup {
-        Some(rel) => table["fixup"] = toml_edit::value(rel),
-        None => {
-            table.remove("fixup");
-        }
-    }
-    fs::write(&path, doc.to_string())?;
-    Ok(index)
 }

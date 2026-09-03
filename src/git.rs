@@ -5,7 +5,7 @@
 //! disables hooks and signing so generated commits are reproducible and never
 //! blocked by machine-local configuration.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
@@ -34,20 +34,6 @@ pub fn raw(dir: &Path, args: &[&str]) -> Result<Output> {
         .with_context(|| format!("failed to run git {}", args.join(" ")))
 }
 
-/// Run git, requiring success; returns trimmed stdout.
-pub fn out(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = raw(dir, args)?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed in {}:\n{}",
-            args.join(" "),
-            dir.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// Run git, requiring success; returns stdout verbatim — no trimming, no
 /// lossy UTF-8 conversion. For output that must survive byte-for-byte, such
 /// as generated patches, where a stripped trailing newline breaks `git apply`.
@@ -64,6 +50,13 @@ pub fn bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Run git, requiring success; returns trimmed stdout.
+pub fn out(dir: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&bytes(dir, args)?)
+        .trim()
+        .to_string())
+}
+
 /// True when the git command exits zero.
 pub fn ok(dir: &Path, args: &[&str]) -> bool {
     raw(dir, args).map(|o| o.status.success()).unwrap_or(false)
@@ -72,4 +65,25 @@ pub fn ok(dir: &Path, args: &[&str]) -> bool {
 /// True when `oid` resolves to a commit present in `dir`'s object store.
 pub fn has_commit(dir: &Path, oid: &str) -> bool {
     ok(dir, &["cat-file", "-e", &format!("{oid}^{{commit}}")])
+}
+
+/// True when `commit` is reachable from `of`.
+pub fn is_ancestor(dir: &Path, commit: &str, of: &str) -> bool {
+    ok(dir, &["merge-base", "--is-ancestor", commit, of])
+}
+
+/// The worktree's own git dir, absolute — where an in-flight merge or
+/// cherry-pick records itself, and where this tool keeps its build state.
+pub fn git_dir(worktree: &Path) -> Result<PathBuf> {
+    let dir = PathBuf::from(out(worktree, &["rev-parse", "--git-dir"])?);
+    Ok(if dir.is_absolute() {
+        dir
+    } else {
+        worktree.join(dir)
+    })
+}
+
+/// The abbreviated form every report prints an OID in.
+pub fn short(oid: &str) -> &str {
+    &oid[..12.min(oid.len())]
 }

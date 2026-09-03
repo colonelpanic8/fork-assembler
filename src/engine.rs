@@ -4,19 +4,30 @@
 //! entries with no pin yet get pinned from live refs on their first build.
 //! The assembled branch is compiled output. `tree` (pre-provenance) is the
 //! reproducibility invariant.
+//!
+//! This module owns the entry loop and its two entry points, `build` and
+//! `cont`. Pin resolution, derived-entry reconstruction, the base-conflict
+//! refusal, and the provenance record each live in a submodule.
 
-use std::collections::{BTreeMap, BTreeSet};
+pub mod derive;
+pub mod pins;
+pub mod provenance;
+pub mod refuse;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::git;
-use crate::lock::{self, DerivedResult, EntryResult, Lock, Prefix};
-use crate::manifest::{self, Entry, Kind, Manifest, Parent};
+use crate::lock::{self, EntryResult, Lock, Prefix, Status};
+use crate::manifest::{self, entries_noun, Entry, Kind, Manifest};
 use crate::rerere;
 use crate::source;
-use crate::state::{self, DeriveState, State};
+use crate::state::{self, State};
+
+pub use pins::{fetch_base, fetch_entry, fetch_parent, fixup_blobs, patch_blob};
 
 pub const WORKTREE: &str = ".worktrees/build";
 
@@ -28,10 +39,6 @@ pub const DERIVE_WORKTREE: &str = ".worktrees/derive";
 /// Exit code signalling "stopped for human resolution".
 pub const STOPPED: i32 = 2;
 
-fn short(oid: &str) -> &str {
-    &oid[..12.min(oid.len())]
-}
-
 pub struct Ctx {
     pub root: PathBuf,
     pub manifest: Manifest,
@@ -40,251 +47,32 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    pub fn open(root: &Path, allow_clone: bool) -> Result<Ctx> {
-        let manifest = manifest::load(root)?;
-        let repo = source::source_repo(root, &manifest, allow_clone)?;
-        Ok(Ctx {
+    pub fn new(root: &Path, manifest: Manifest, repo: PathBuf) -> Ctx {
+        Ctx {
             root: root.to_path_buf(),
             worktree: root.join(WORKTREE),
             manifest,
             repo,
-        })
+        }
+    }
+
+    pub fn open(root: &Path, allow_clone: bool) -> Result<Ctx> {
+        let manifest = manifest::load(root)?;
+        let repo = source::source_repo(root, &manifest, allow_clone)?;
+        Ok(Ctx::new(root, manifest, repo))
     }
 
     pub fn derive_worktree(&self) -> PathBuf {
         self.root.join(DERIVE_WORKTREE)
     }
-}
 
-/// A private ref namespace so fetched heads never collide with user refs.
-fn holding_ref(entry: &Entry) -> String {
-    format!(
-        "refs/fork-assembler/{}",
-        manifest::sanitize_name(&entry.name)
-    )
-}
-
-/// Parents get their own namespace under the entry that declares them: two
-/// entries may legitimately declare the same parent, and each reconstruction
-/// is standalone, so the holding refs must not be shared between them.
-fn parent_holding_ref(entry: &Entry, parent: &Parent) -> String {
-    format!(
-        "refs/fork-assembler/parents/{}/{}",
-        manifest::sanitize_name(&entry.name),
-        manifest::sanitize_name(&parent.name)
-    )
-}
-
-/// Where a reconstructed tip is parked. Nothing reads it back — the lock
-/// records the OID — but it keeps the reconstruction reachable for the rest of
-/// the build and leaves it inspectable afterwards, once the derive worktree is
-/// gone.
-fn derived_ref(entry: &Entry) -> String {
-    format!(
-        "refs/fork-assembler/derived/{}",
-        manifest::sanitize_name(&entry.name)
-    )
-}
-
-fn fetch_into(ctx: &Ctx, remote: &str, spec: &str, holding: &str) -> Result<String> {
-    git::out(&ctx.repo, &["fetch", remote, spec])?;
-    git::out(&ctx.repo, &["rev-parse", holding])
-}
-
-pub fn fetch_entry(ctx: &Ctx, entry: &Entry) -> Result<String> {
-    let holding = holding_ref(entry);
-    match &entry.kind {
-        Kind::Branch { remote, branch, .. } => fetch_into(
-            ctx,
-            remote,
-            &format!("+refs/heads/{branch}:{holding}"),
-            &holding,
-        ),
-        Kind::Pr { remote, number } => fetch_into(
-            ctx,
-            remote,
-            &format!("+refs/pull/{number}/head:{holding}"),
-            &holding,
-        ),
-        Kind::Patch { path } => patch_blob(&ctx.root, path),
+    fn label(&self, index: usize, name: &str) -> String {
+        format!(
+            "[{:2}/{}] {name:<24}",
+            index + 1,
+            self.manifest.entries.len()
+        )
     }
-}
-
-pub fn fetch_parent(ctx: &Ctx, entry: &Entry, parent: &Parent) -> Result<String> {
-    let holding = parent_holding_ref(entry, parent);
-    match &parent.kind {
-        Kind::Branch { remote, branch, .. } => fetch_into(
-            ctx,
-            remote,
-            &format!("+refs/heads/{branch}:{holding}"),
-            &holding,
-        ),
-        Kind::Pr { remote, number } => fetch_into(
-            ctx,
-            remote,
-            &format!("+refs/pull/{number}/head:{holding}"),
-            &holding,
-        ),
-        // The manifest refuses a patch parent, so this arm is unreachable.
-        Kind::Patch { path } => bail!("{}: parent {path:?} is a patch", entry.name),
-    }
-}
-
-pub fn fetch_base(ctx: &Ctx) -> Result<String> {
-    let remote = ctx.manifest.base.remote.clone();
-    let ref_ = ctx.manifest.base.ref_.clone();
-    let spec = format!("+refs/heads/{ref_}:refs/fork-assembler/base");
-    git::out(&ctx.repo, &["fetch", &remote, &spec])?;
-    git::out(&ctx.repo, &["rev-parse", "refs/fork-assembler/base"])
-}
-
-pub fn patch_blob(root: &Path, rel: &str) -> Result<String> {
-    let path = root.join(rel);
-    if !path.exists() {
-        bail!("patch file {rel} does not exist");
-    }
-    git::out(root, &["hash-object", &path.to_string_lossy()])
-}
-
-/// Blob hash per entry carrying a coherence fixup, for lock snapshots.
-/// `strict` fails on a missing file (what `build` wants); otherwise the entry
-/// is left out of the map (what `status` wants, so it can still report).
-pub fn fixup_blobs(
-    root: &Path,
-    entries: &[Entry],
-    strict: bool,
-) -> Result<BTreeMap<String, String>> {
-    let mut blobs = BTreeMap::new();
-    for entry in entries {
-        let Some(rel) = &entry.fixup else { continue };
-        match patch_blob(root, rel) {
-            Ok(blob) => {
-                blobs.insert(entry.name.clone(), blob);
-            }
-            Err(err) if strict => {
-                return Err(err.context(format!("{}: coherence fixup", entry.name)))
-            }
-            Err(_) => {}
-        }
-    }
-    Ok(blobs)
-}
-
-/// Resolve the pin for one entry, pinning from live refs when permitted.
-fn ensure_pin(
-    ctx: &Ctx,
-    entry: &Entry,
-    pins: &mut BTreeMap<String, String>,
-    locked: bool,
-) -> Result<String> {
-    if let Some(pin) = pins.get(&entry.name) {
-        let pin = pin.clone();
-        match &entry.kind {
-            Kind::Patch { path } => {
-                let current = patch_blob(&ctx.root, path)?;
-                if current != pin {
-                    bail!(
-                        "{}: patch file content changed since it was pinned; run `fork-assembler update {}`",
-                        entry.name,
-                        entry.name
-                    );
-                }
-            }
-            _ => {
-                if !git::has_commit(&ctx.repo, &pin) {
-                    if locked {
-                        bail!(
-                            "{}: pinned OID {pin} is not present locally and --locked forbids fetching",
-                            entry.name
-                        );
-                    }
-                    fetch_entry(ctx, entry)?;
-                    if !git::has_commit(&ctx.repo, &pin) {
-                        bail!(
-                            "{}: pinned OID {pin} is not reachable from its live ref; \
-                             the branch moved on or was rewritten (fetch it manually or `fork-assembler update {}`)",
-                            entry.name,
-                            entry.name
-                        );
-                    }
-                }
-            }
-        }
-        return Ok(pin);
-    }
-    if locked {
-        bail!(
-            "{}: no pin recorded and --locked forbids pinning; run `fork-assembler build` or `update` first",
-            entry.name
-        );
-    }
-    let oid = fetch_entry(ctx, entry)?;
-    println!("  pinned {} -> {}", entry.name, short(&oid));
-    pins.insert(entry.name.clone(), oid.clone());
-    Ok(oid)
-}
-
-/// Resolve every parent pin of one derived entry, pinning from live refs on
-/// its first build. Parents obey the entry pin rule exactly: `build` may
-/// establish one that has never been pinned, and moves none that has.
-fn ensure_parent_pins(
-    ctx: &Ctx,
-    entry: &Entry,
-    parent_pins: &mut BTreeMap<String, BTreeMap<String, String>>,
-    locked: bool,
-) -> Result<()> {
-    let mut pins = parent_pins.get(&entry.name).cloned().unwrap_or_default();
-    for parent in &entry.parents {
-        match pins.get(&parent.name).cloned() {
-            Some(pin) => {
-                if !git::has_commit(&ctx.repo, &pin) {
-                    if locked {
-                        bail!(
-                            "{}: parent {} is pinned at {pin}, which is not present locally, \
-                             and --locked forbids fetching",
-                            entry.name,
-                            parent.name
-                        );
-                    }
-                    fetch_parent(ctx, entry, parent)?;
-                    if !git::has_commit(&ctx.repo, &pin) {
-                        bail!(
-                            "{}: parent {} is pinned at {pin}, which is not reachable from its \
-                             live ref; the parent was rewritten (fetch it manually or \
-                             `fork-assembler update {}`)",
-                            entry.name,
-                            parent.name,
-                            entry.name
-                        );
-                    }
-                }
-            }
-            None => {
-                if locked {
-                    bail!(
-                        "{}: parent {} has no pin recorded and --locked forbids pinning; \
-                         run `fork-assembler build` or `update {}` first",
-                        entry.name,
-                        parent.name,
-                        entry.name
-                    );
-                }
-                let oid = fetch_parent(ctx, entry, parent)?;
-                println!(
-                    "  pinned {}'s parent {} -> {}",
-                    entry.name,
-                    parent.name,
-                    short(&oid)
-                );
-                pins.insert(parent.name.clone(), oid);
-            }
-        }
-    }
-    // Parents that the manifest no longer declares stop being facts about this
-    // entry the moment the declaration goes.
-    pins.retain(|name, _| entry.parents.iter().any(|p| &p.name == name));
-    parent_pins.insert(entry.name.clone(), pins);
-    Ok(())
 }
 
 fn remove_worktree(ctx: &Ctx, path: &Path) {
@@ -316,159 +104,8 @@ fn conflicted_files(worktree: &Path) -> Result<Vec<String>> {
     Ok(out.lines().map(str::to_string).collect())
 }
 
-/// The files that conflict when `oid` is merged with the base ALONE — nothing
-/// else in the stack involved. A non-empty answer means the topic is simply out
-/// of date with upstream, which is a fact about the topic and not about this
-/// assembly.
-///
-/// `merge-tree --write-tree` answers this without a worktree, using the same
-/// merge machinery the real merge will use.
-fn base_conflict_files(repo: &Path, base: &str, oid: &str) -> Result<Vec<String>> {
-    let out = git::raw(
-        repo,
-        &["merge-tree", "--write-tree", "--name-only", base, oid],
-    )?;
-    // 0 = merged clean, 1 = conflicts. Anything else means merge-tree could not
-    // answer the question at all (unrelated histories, a missing object), and
-    // an unanswered question is not a base conflict.
-    if out.status.code() != Some(1) {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout
-        .lines()
-        .skip(1) // the merged tree's OID
-        .take_while(|line| !line.trim().is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-/// True when `oid` cannot merge with the base on its own. For reporting, where
-/// only the answer matters and a merge-tree that cannot answer means "no".
-pub fn conflicts_with_base(repo: &Path, base: &str, oid: &str) -> bool {
-    base_conflict_files(repo, base, oid).is_ok_and(|files| !files.is_empty())
-}
-
-/// Roll the build back to nothing in progress.
-///
-/// A base conflict is not a stop the operator resumes from — the repair happens
-/// in a different repository, on the topic branch — so leaving a half-merged
-/// worktree and a state file behind would only make the next `build` refuse to
-/// start for an unrelated-looking reason.
-fn abandon(ctx: &Ctx) {
-    for worktree in [ctx.worktree.clone(), ctx.derive_worktree()] {
-        if worktree.exists() {
-            let _ = git::raw(&worktree, &["merge", "--abort"]);
-            let _ = git::raw(&worktree, &["cherry-pick", "--abort"]);
-        }
-    }
-    let _ = state::clear(&ctx.worktree);
-}
-
-/// What is being checked against the base: an entry's own pin, or one parent of
-/// a derived entry. Both are topics somebody maintains elsewhere, which is the
-/// only thing the refusal needs to know about them.
-pub struct Topic<'a> {
-    /// How to name it to the operator.
-    pub label: String,
-    /// What it tracks, as `status` and the lock spell it.
-    pub source: String,
-    /// Whether it is a pull request, which changes where the fix gets pushed.
-    pub is_pr: bool,
-    pub oid: &'a str,
-}
-
-impl<'a> Topic<'a> {
-    fn entry(entry: &Entry, oid: &'a str) -> Topic<'a> {
-        Topic {
-            label: entry.name.clone(),
-            source: entry.source(),
-            is_pr: matches!(entry.kind, Kind::Pr { .. }),
-            oid,
-        }
-    }
-
-    fn parent(entry: &Entry, parent: &Parent, oid: &'a str) -> Topic<'a> {
-        Topic {
-            label: format!("{}: parent {}", entry.name, parent.name),
-            source: parent.source(),
-            is_pr: matches!(parent.kind, Kind::Pr { .. }),
-            oid,
-        }
-    }
-}
-
-/// The refusal.
-///
-/// A topic that conflicts with the base conflicts with nothing this repository
-/// owns, so nothing this repository can record is a fix. Recording a resolution
-/// here would hide a broken topic from its own author and reviewers, and would
-/// have to be re-resolved on every base bump — the conflict comes back with the
-/// next upstream commit that touches those files, forever.
-fn base_conflict_error(
-    ctx: &Ctx,
-    entry: &Entry,
-    topic: &Topic,
-    base: &str,
-    files: &[String],
-) -> anyhow::Error {
-    let Topic {
-        label,
-        source,
-        is_pr,
-        oid,
-    } = topic;
-    let repo = ctx.repo.display();
-    let push_hint = if *is_pr {
-        "  # then push the result to the PR's head branch. If the PR is someone\n  \
-         # else's, ask its author to rebase, or `fork-assembler exclude` it with\n  \
-         # that as the reason -- do not carry a topic that no longer applies."
-    } else {
-        "  # then push the result to the branch this entry tracks (force-with-lease)."
-    };
-    anyhow::anyhow!(
-        "{label} conflicts with the BASE ITSELF, not with anything else in the stack.\n\
-         \n  \
-         base    {} ({}:{})\n  \
-         topic   {} ({source})\n  \
-         file(s) {}\n\
-         \n\
-         This is not an assembly conflict, and it will not be resolved here. A tracked \
-         resolution would paper over a topic that no longer applies to upstream: it would \
-         hide the breakage from the topic's own author and reviewers, and it would have to \
-         be re-resolved every time the base moves.\n\
-         \n\
-         Fix it where it lives. Bring the topic up to date against the base, resolve the \
-         conflict there, and publish that:\n\
-         \n  \
-         git -C {repo} checkout -B onto-base {}\n  \
-         git -C {repo} rebase {}\n\
-         {push_hint}\n\
-         \n\
-         Then `fork-assembler update {}` and build again.\n\
-         \n\
-         This build has been rolled back; nothing is left in progress.",
-        short(base),
-        ctx.manifest.base.remote,
-        ctx.manifest.base.ref_,
-        short(oid),
-        files.join(", "),
-        short(oid),
-        short(base),
-        entry.name,
-    )
-}
-
-/// Refuse the build outright when `topic` cannot merge with the base on its
-/// own. Called the moment a merge conflicts, before any resolution — recorded
-/// or manual — gets a chance to obscure why.
-fn refuse_if_base_conflict(ctx: &Ctx, entry: &Entry, topic: Topic, base: &str) -> Result<()> {
-    let files = base_conflict_files(&ctx.repo, base, topic.oid)?;
-    if files.is_empty() {
-        return Ok(());
-    }
-    abandon(ctx);
-    Err(base_conflict_error(ctx, entry, &topic, base, &files))
+fn staged_files(worktree: &Path) -> Result<String> {
+    git::out(worktree, &["diff", "--cached", "--name-only"])
 }
 
 fn merge_entry(ctx: &Ctx, entry: &Entry, oid: &str) -> Result<bool> {
@@ -478,415 +115,6 @@ fn merge_entry(ctx: &Ctx, entry: &Entry, oid: &str) -> Result<bool> {
         &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, oid]),
     )?;
     Ok(out.status.success())
-}
-
-/// git config for the replay phase: the rerere pair machinery plus an editor
-/// that exits successfully without opening anything. `cherry-pick` and its
-/// `--continue` want an editor by default, and a build has no terminal to give
-/// them one.
-fn replay_cfg<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    let mut cfg = vec!["-c", "core.editor=true"];
-    cfg.extend(rerere::with_cfg(args));
-    cfg
-}
-
-fn is_ancestor(repo: &Path, commit: &str, of: &str) -> bool {
-    git::ok(repo, &["merge-base", "--is-ancestor", commit, of])
-}
-
-/// Which rule established a derived entry's anchor. Printed on every
-/// resolution: the anchor decides which commits are replayed as the entry's
-/// own, so an operator who cannot see how it was chosen cannot audit the
-/// boundary — and a wrong boundary silently duplicates or drops work.
-pub enum AnchorRule {
-    /// The last reconstruction's parent merge is an ancestor of the new pin:
-    /// the operator pushed the reconstructed tip, and everything the PR has
-    /// gained since (review commits, say) is the entry's own work.
-    PushedReconstruction,
-    /// The recorded anchor is still an ancestor of the pin, so it still marks
-    /// the same boundary.
-    Kept,
-    /// Walked the pin's first-parent chain to the first commit that is a merge
-    /// or is already contained in the base or a parent.
-    Detected,
-}
-
-pub struct Anchor {
-    pub oid: String,
-    pub rule: AnchorRule,
-}
-
-impl Anchor {
-    /// The audit sentence: which rule fired and what it means.
-    pub fn describe(&self) -> &'static str {
-        match self.rule {
-            AnchorRule::PushedReconstruction => {
-                "the last reconstruction's parent merge is an ancestor of the pin \
-                 -- the reconstructed tip was pushed, so everything above it is the \
-                 entry's own work"
-            }
-            AnchorRule::Kept => "unchanged: the recorded anchor is still an ancestor of the pin",
-            AnchorRule::Detected => {
-                "detected: the first-parent walk stopped at the first merge or \
-                 already-contained commit"
-            }
-        }
-    }
-}
-
-/// The commit in a derived entry's history after which its own commits start.
-///
-/// Everything about a derived entry depends on getting this right, and the
-/// obvious alternatives get it wrong. `git cherry` and `rev-list C ^A ^B` both
-/// answer "which commits are C's own?" by comparing against the parents' *live
-/// tips*, which is exactly the comparison that breaks when a parent is rebased:
-/// the parent commits embedded in C's history stop matching anything reachable
-/// from the new tips, and get replayed as C's own work — duplicating the old
-/// version of the parent on top of the new one. Anchoring on a commit inside
-/// C's own history instead makes the delta `<pin> ^<anchor>`, which no movement
-/// of a parent can perturb.
-///
-/// The rules are tried in order and the winner is reported, because the two
-/// cheap rules exist to preserve a boundary that was already established and
-/// only the last one guesses.
-pub fn resolve_anchor(
-    repo: &Path,
-    entry: &Entry,
-    pin: &str,
-    base: Option<&str>,
-    parent_pins: &BTreeMap<String, String>,
-    previous_anchor: Option<&str>,
-    previous_base_tip: Option<&str>,
-) -> Result<Anchor> {
-    if let Some(base_tip) = previous_base_tip {
-        if git::has_commit(repo, base_tip) && is_ancestor(repo, base_tip, pin) {
-            return Ok(Anchor {
-                oid: base_tip.to_string(),
-                rule: AnchorRule::PushedReconstruction,
-            });
-        }
-    }
-    if let Some(anchor) = previous_anchor {
-        if git::has_commit(repo, anchor) && is_ancestor(repo, anchor, pin) {
-            return Ok(Anchor {
-                oid: anchor.to_string(),
-                rule: AnchorRule::Kept,
-            });
-        }
-    }
-    Ok(Anchor {
-        oid: detect_anchor(repo, entry, pin, base, parent_pins)?,
-        rule: AnchorRule::Detected,
-    })
-}
-
-/// Walk the pin's first-parent chain down to the first commit that is a merge,
-/// or that the base or some parent already contains. That commit is the
-/// boundary: above it is work this entry added, below it is history it merged
-/// or inherited. The tip itself qualifying means the entry is a pure merge of
-/// its parents and its delta is empty.
-fn detect_anchor(
-    repo: &Path,
-    entry: &Entry,
-    pin: &str,
-    base: Option<&str>,
-    parent_pins: &BTreeMap<String, String>,
-) -> Result<String> {
-    // One rev-list answers "contained?" for the whole chain at once: a commit
-    // it prints is reachable from the pin along first parents and from none of
-    // the boundaries.
-    let mut args = vec!["rev-list".to_string(), "--first-parent".into(), pin.into()];
-    for boundary in base
-        .into_iter()
-        .chain(parent_pins.values().map(String::as_str))
-    {
-        args.push(format!("^{boundary}"));
-    }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let uncontained: BTreeSet<String> =
-        git::out(repo, &refs)?.lines().map(str::to_string).collect();
-
-    let log = git::out(repo, &["log", "--first-parent", "--format=%H %P", pin])?;
-    for line in log.lines() {
-        let (oid, parents) = line.split_once(' ').unwrap_or((line, ""));
-        let is_merge = parents.split_whitespace().count() > 1;
-        if is_merge || !uncontained.contains(oid) {
-            return Ok(oid.to_string());
-        }
-    }
-    bail!(
-        "{}: cannot find the anchor for this derived entry. Walking {}'s first-parent \
-         chain reached the root without meeting a merge commit or a commit already \
-         contained in the base or in a parent, so there is no boundary between the \
-         entry's own work and what it inherited.\n\
-         A derived entry must MERGE its parents in; one that cherry-picks or rebases \
-         them onto itself keeps no record of where they end. Either rebuild the branch \
-         as merges of {}, or drop its `parents` declaration and carry it as an \
-         ordinary entry.",
-        entry.name,
-        short(pin),
-        entry
-            .parents
-            .iter()
-            .map(|p| p.name.clone())
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
-}
-
-/// The entry's own commits, oldest first. Merges are excluded: replaying one
-/// commit at a time cannot reproduce a merge, and a derived entry whose own
-/// work contains merges is outside what this reconstructs (see DESIGN.md).
-fn delta_commits(repo: &Path, pin: &str, anchor: &str) -> Result<Vec<String>> {
-    let excluded = format!("^{anchor}");
-    let out = git::out(
-        repo,
-        &["rev-list", "--reverse", "--no-merges", pin, &excluded],
-    )?;
-    Ok(out.lines().map(str::to_string).collect())
-}
-
-/// Persist the reconstruction's progress. Every step, like the entry loop:
-/// resuming a merge sequence or a cherry-pick sequence at a stale index
-/// re-applies work that is already in.
-fn persist_derive(ctx: &Ctx, st: &mut State, ds: &DeriveState) -> Result<()> {
-    st.derive = Some(ds.clone());
-    state::write(&ctx.worktree, st)
-}
-
-fn stop_in_derive(ctx: &Ctx, entry: &Entry, label: &str, doing: &str, unresolved: &[String]) {
-    println!(
-        "\n  {label} CONFLICT {doing} in {} file(s):",
-        unresolved.len()
-    );
-    for file in unresolved {
-        println!("      {file}");
-    }
-    println!(
-        "\n  Resolve in the DERIVE worktree: {}",
-        ctx.derive_worktree().display()
-    );
-    println!(
-        "  That worktree holds {}'s reconstruction, not the assembled stack.",
-        entry.name
-    );
-    println!("  Stage with `git add`, then: fork-assembler continue");
-}
-
-/// Reconstruct a derived entry: re-merge its parents onto the pinned base,
-/// then replay the entry's own commits on top. The result is merged into the
-/// stack in place of the entry's pin, which is stale by construction — it was
-/// built against whatever its parents were at the time.
-///
-/// Returns None when the reconstruction stopped for the human, having already
-/// persisted where it got to.
-fn reconstruct(
-    ctx: &Ctx,
-    st: &mut State,
-    index: usize,
-    entry: &Entry,
-    label: &str,
-    pin: &str,
-) -> Result<Option<DerivedResult>> {
-    let derive = ctx.derive_worktree();
-    let mut ds = match st.derive.take() {
-        Some(ds) if ds.entry_index == index => ds,
-        _ => {
-            prepare_worktree(ctx, &derive, &st.base)?;
-            println!(
-                "  {label} reconstructing from base {} in {}",
-                short(&st.base),
-                derive.display()
-            );
-            DeriveState {
-                entry_index: index,
-                next_parent: 0,
-                base_tip: None,
-                delta: Vec::new(),
-                next_pick: 0,
-            }
-        }
-    };
-    persist_derive(ctx, st, &ds)?;
-
-    while ds.next_parent < entry.parents.len() {
-        let parent = &entry.parents[ds.next_parent];
-        let parent_pin = st
-            .parent_pins
-            .get(&entry.name)
-            .and_then(|pins| pins.get(&parent.name))
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "{}: parent {} pin vanished mid-build",
-                    entry.name, parent.name
-                )
-            })?;
-        let head = git::out(&derive, &["rev-parse", "HEAD"])?;
-        if is_ancestor(&ctx.repo, &parent_pin, &head) {
-            // Either the base already contains this parent, or an earlier
-            // parent does. Merging it would add an empty merge commit and say
-            // nothing; the operator wants to hear it, though, because a parent
-            // that is permanently absorbed no longer belongs in the list.
-            println!(
-                "  {label} parent {} ABSORBED -- already in the reconstruction",
-                parent.name
-            );
-        } else {
-            let message = format!(
-                "fork-assembler: merge parent {} (for {})",
-                parent.name, entry.name
-            );
-            let out = git::raw(
-                &derive,
-                &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, &parent_pin]),
-            )?;
-            if !out.status.success() {
-                // Before anything else: a parent that cannot merge with the
-                // base on its own is out of date with upstream, and no amount
-                // of reconstruction here makes it apply again.
-                refuse_if_base_conflict(
-                    ctx,
-                    entry,
-                    Topic::parent(entry, parent, &parent_pin),
-                    &st.base,
-                )?;
-                st.conflicts += 1;
-                let unresolved = conflicted_files(&derive)?;
-                if unresolved.is_empty() {
-                    git::out(&derive, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-                    println!(
-                        "  {label} parent {} merged; auto-resolved from tracked rerere pairs",
-                        parent.name
-                    );
-                } else {
-                    persist_derive(ctx, st, &ds)?;
-                    stop_in_derive(
-                        ctx,
-                        entry,
-                        label,
-                        &format!("merging parent {}", parent.name),
-                        &unresolved,
-                    );
-                    return Ok(None);
-                }
-            } else {
-                println!(
-                    "  {label} parent {} merged {}",
-                    parent.name,
-                    short(&parent_pin)
-                );
-            }
-        }
-        ds.next_parent += 1;
-        persist_derive(ctx, st, &ds)?;
-    }
-
-    if ds.base_tip.is_none() {
-        let base_tip = git::out(&derive, &["rev-parse", "HEAD"])?;
-        let anchor = ensure_anchor(ctx, st, entry, label, pin)?;
-        let delta = delta_commits(&ctx.repo, pin, &anchor)?;
-        match delta.len() {
-            0 => println!("  {label} delta: none -- a pure merge of its parents"),
-            n => println!("  {label} delta: {n} commit(s) of its own after the anchor"),
-        }
-        ds.base_tip = Some(base_tip);
-        ds.delta = delta;
-        persist_derive(ctx, st, &ds)?;
-    }
-
-    while ds.next_pick < ds.delta.len() {
-        let commit = ds.delta[ds.next_pick].clone();
-        let subject = git::out(&ctx.repo, &["log", "-1", "--format=%s", &commit])?;
-        let out = git::raw(&derive, &replay_cfg(&["cherry-pick", &commit]))?;
-        if !out.status.success() {
-            let unresolved = conflicted_files(&derive)?;
-            if !unresolved.is_empty() {
-                st.conflicts += 1;
-                persist_derive(ctx, st, &ds)?;
-                stop_in_derive(
-                    ctx,
-                    entry,
-                    label,
-                    &format!("replaying {} ({subject})", short(&commit)),
-                    &unresolved,
-                );
-                return Ok(None);
-            }
-            // Nothing conflicted, so either rerere replayed every hunk and
-            // staged the result, or the commit's content is already present
-            // and there is nothing left to commit at all.
-            if git::ok(&derive, &["diff", "--cached", "--quiet", "HEAD"]) {
-                git::out(&derive, &replay_cfg(&["cherry-pick", "--skip"]))?;
-                println!(
-                    "  {label} replayed {} ({subject}): EMPTY -- already present",
-                    short(&commit)
-                );
-            } else {
-                st.conflicts += 1;
-                git::out(&derive, &replay_cfg(&["cherry-pick", "--continue"]))?;
-                println!(
-                    "  {label} replayed {} ({subject}); auto-resolved from tracked rerere pairs",
-                    short(&commit)
-                );
-            }
-        } else {
-            println!("  {label} replayed {} ({subject})", short(&commit));
-        }
-        ds.next_pick += 1;
-        persist_derive(ctx, st, &ds)?;
-    }
-
-    let tip = git::out(&derive, &["rev-parse", "HEAD"])?;
-    let base_tip = ds
-        .base_tip
-        .clone()
-        .context("reconstruction finished without recording its parent merge")?;
-    git::out(&ctx.repo, &["update-ref", &derived_ref(entry), &tip])?;
-    let derived = DerivedResult { base_tip, tip };
-    st.derive = None;
-    st.derived.insert(entry.name.clone(), derived.clone());
-    state::write(&ctx.worktree, st)?;
-    Ok(Some(derived))
-}
-
-/// The anchor this build must replay from: whatever is already pinned, or —
-/// on a first build, where nothing has established one yet — the rules in
-/// `resolve_anchor`. A build never re-resolves a pinned anchor, for the reason
-/// it never moves a pin: what a build replays would then depend on when it ran.
-fn ensure_anchor(
-    ctx: &Ctx,
-    st: &mut State,
-    entry: &Entry,
-    label: &str,
-    pin: &str,
-) -> Result<String> {
-    if let Some(anchor) = st.anchors.get(&entry.name) {
-        return Ok(anchor.clone());
-    }
-    let previous_base_tip = lock::load(&ctx.root)?
-        .and_then(|l| l.build)
-        .and_then(|b| b.results.into_iter().find(|r| r.name == entry.name))
-        .and_then(|r| r.derived)
-        .map(|d| d.base_tip);
-    let no_parents = BTreeMap::new();
-    let anchor = resolve_anchor(
-        &ctx.repo,
-        entry,
-        pin,
-        Some(&st.base),
-        st.parent_pins.get(&entry.name).unwrap_or(&no_parents),
-        None,
-        previous_base_tip.as_deref(),
-    )?;
-    println!(
-        "  {label} anchor {} -- {}",
-        short(&anchor.oid),
-        anchor.describe()
-    );
-    st.anchors.insert(entry.name.clone(), anchor.oid.clone());
-    state::write(&ctx.worktree, st)?;
-    Ok(anchor.oid)
 }
 
 /// Apply a tracked patch file and commit it as `message`. `Some(outcome)` =
@@ -901,12 +129,12 @@ fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Option<&'stat
     // because the copies are byte-identical and context matching cannot tell
     // them apart. Only trust the reverse check when the patch also cannot be
     // applied forwards.
-    let reverse = git::raw(
+    let reverse = git::ok(
         &ctx.worktree,
         &["apply", "--reverse", "--check", &patch_str],
-    )?;
-    let forward = git::raw(&ctx.worktree, &["apply", "--check", &patch_str])?;
-    if reverse.status.success() && !forward.status.success() {
+    );
+    let forward = git::ok(&ctx.worktree, &["apply", "--check", &patch_str]);
+    if reverse && !forward {
         return Ok(Some("already applied"));
     }
 
@@ -916,11 +144,18 @@ fn apply_patch_file(ctx: &Ctx, rel: &str, message: &str) -> Result<Option<&'stat
         return Ok(None);
     }
     git::out(&ctx.worktree, &["add", "-A"])?;
-    if git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty() {
+    if staged_files(&ctx.worktree)?.is_empty() {
         return Ok(Some("already applied"));
     }
     git::out(&ctx.worktree, &["commit", "-q", "-m", message])?;
     Ok(Some("applied"))
+}
+
+/// Persist that entry `index` is where the build stopped for the human.
+fn stall(ctx: &Ctx, st: &mut State, index: usize) -> Result<Option<i32>> {
+    st.next_index = index;
+    state::write(&ctx.worktree, st)?;
+    Ok(Some(STOPPED))
 }
 
 /// Complete an entry's step: apply its coherence fixup, if any, then record
@@ -950,8 +185,7 @@ fn finish_entry(
             }
             None => {
                 st.pending = Some(result);
-                st.next_index = index;
-                state::write(&ctx.worktree, st)?;
+                stall(ctx, st, index)?;
                 println!("\n  {label} fixup {rel} FAILED to apply");
                 println!("  The merge is committed; only the fixup is outstanding.");
                 println!("  Resolve the markers in: {}", ctx.worktree.display());
@@ -971,139 +205,83 @@ fn finish_entry(
     Ok(true)
 }
 
-/// The core loop: process entries[start..], persisting state after each.
-/// Returns Some(exit_code) when stopped for the human, None when complete.
-fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
-    let entries = &ctx.manifest.entries;
-    let total = entries.len();
-    for (index, entry) in entries.iter().enumerate().skip(start) {
-        let label = format!("[{:2}/{total}] {:<24}", index + 1, entry.name);
-        let oid = st
-            .pins
-            .get(&entry.name)
-            .cloned()
-            .with_context(|| format!("{}: pin vanished mid-build", entry.name))?;
+/// One patch entry's step.
+fn run_patch_entry(
+    ctx: &Ctx,
+    st: &mut State,
+    index: usize,
+    entry: &Entry,
+    label: &str,
+    rel: &str,
+    oid: String,
+) -> Result<Option<i32>> {
+    let message = format!("fork-assembler: {}", entry.name);
+    let Some(outcome) = apply_patch_file(ctx, rel, &message)? else {
+        stall(ctx, st, index)?;
+        println!("\n  {label} patch FAILED to apply");
+        println!("  Resolve in: {}", ctx.worktree.display());
+        println!("  Then: fork-assembler continue");
+        return Ok(Some(STOPPED));
+    };
+    println!("  {label} {outcome}");
+    // Patch entries cannot carry a fixup (the manifest rejects it), so this
+    // only records and advances.
+    finish_entry(
+        ctx,
+        st,
+        index,
+        entry,
+        label,
+        EntryResult::new(&entry.name, oid, Status::Applied),
+    )?;
+    Ok(None)
+}
 
-        if let Kind::Patch { path } = &entry.kind {
-            let rel = path.clone();
-            let message = format!("fork-assembler: {}", entry.name);
-            match apply_patch_file(ctx, &rel, &message)? {
-                Some(outcome) => {
-                    println!("  {label} {outcome}");
-                    let result = EntryResult {
-                        name: entry.name.clone(),
-                        oid,
-                        status: "applied".into(),
-                        conflicted: false,
-                        resolution: None,
-                        fixup: None,
-                        derived: None,
-                    };
-                    // Patch entries cannot carry a fixup (manifest rejects
-                    // it), so this only records and advances.
-                    finish_entry(ctx, st, index, entry, &label, result)?;
-                }
-                None => {
-                    st.next_index = index;
-                    state::write(&ctx.worktree, st)?;
-                    println!("\n  {label} patch FAILED to apply");
-                    println!("  Resolve in: {}", ctx.worktree.display());
-                    println!("  Then: fork-assembler continue");
-                    return Ok(Some(STOPPED));
-                }
-            }
-            continue;
+/// One live entry's step: merge it — or, for a derived entry, its
+/// reconstruction — into the stack, then finish the step with its fixup.
+fn run_live_entry(
+    ctx: &Ctx,
+    st: &mut State,
+    index: usize,
+    entry: &Entry,
+    label: &str,
+    oid: String,
+) -> Result<Option<i32>> {
+    if git::is_ancestor(&ctx.repo, &oid, &st.base) {
+        println!("  {label} ABSORBED upstream -- drop candidate");
+        // A derived entry stops here too, before any reconstruction: the
+        // base already contains the whole thing, parents and own commits
+        // alike, so there is nothing left to rebuild it out of.
+        // The fixup still runs: this entry's content reaching the tree via
+        // the base rather than via a merge does not mean the incoherence
+        // it repaired went away. If it did, the fixup reports "already
+        // applied"; if it did not, it applies as usual.
+        let result = EntryResult::new(&entry.name, oid, Status::Absorbed);
+        return Ok((!finish_entry(ctx, st, index, entry, label, result)?).then_some(STOPPED));
+    }
+
+    // A derived entry's pin is stale by construction: it was built against
+    // whatever its parents were then. What gets merged is the
+    // reconstruction; what gets recorded is still the pin.
+    let derived = if entry.is_derived() {
+        match derive::reconstruct(ctx, st, index, entry, label, &oid)? {
+            Some(derived) => Some(derived),
+            None => return Ok(Some(STOPPED)),
         }
+    } else {
+        None
+    };
+    let merging = derived.as_ref().map_or(oid.as_str(), |d| d.tip.as_str());
 
-        if git::ok(&ctx.repo, &["merge-base", "--is-ancestor", &oid, &st.base]) {
-            println!("  {label} ABSORBED upstream -- drop candidate");
-            // A derived entry stops here too, before any reconstruction: the
-            // base already contains the whole thing, parents and own commits
-            // alike, so there is nothing left to rebuild it out of.
-            // The fixup still runs: this entry's content reaching the tree via
-            // the base rather than via a merge does not mean the incoherence
-            // it repaired went away. If it did, the fixup reports "already
-            // applied"; if it did not, it applies as usual.
-            let result = EntryResult {
-                name: entry.name.clone(),
-                oid,
-                status: "absorbed".into(),
-                conflicted: false,
-                resolution: None,
-                fixup: None,
-                derived: None,
-            };
-            if !finish_entry(ctx, st, index, entry, &label, result)? {
-                return Ok(Some(STOPPED));
-            }
-            continue;
-        }
+    let before = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
+    let clean = merge_entry(ctx, entry, merging)?;
+    let mut result = EntryResult::new(&entry.name, oid.clone(), Status::Merged);
 
-        // A derived entry's pin is stale by construction: it was built against
-        // whatever its parents were then. What gets merged is the
-        // reconstruction; what gets recorded is still the pin.
-        let derived = if entry.parents.is_empty() {
-            None
-        } else {
-            match reconstruct(ctx, st, index, entry, &label, &oid)? {
-                Some(derived) => Some(derived),
-                None => return Ok(Some(STOPPED)),
-            }
-        };
-        let merging = derived.as_ref().map_or(oid.as_str(), |d| d.tip.as_str());
-
-        let before = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
-        let clean = merge_entry(ctx, entry, merging)?;
-
-        if !clean {
-            // A derived entry merges its reconstruction, which already contains
-            // the base; its topics were checked against the base one at a time
-            // as they were merged in above.
-            if entry.parents.is_empty() {
-                refuse_if_base_conflict(ctx, entry, Topic::entry(entry, &oid), &st.base)?;
-            }
-            st.conflicts += 1;
-            let unresolved = conflicted_files(&ctx.worktree)?;
-            if unresolved.is_empty() {
-                // rerere recognized every conflict hunk and staged the
-                // recorded resolutions (autoUpdate); commit and continue.
-                let hashes: Vec<String> = rerere::merge_rr(&ctx.worktree)?
-                    .into_iter()
-                    .map(|(hash, _)| hash)
-                    .collect();
-                git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-                println!("  {label} auto-resolved from tracked rerere pairs");
-                let result = EntryResult {
-                    name: entry.name.clone(),
-                    oid,
-                    status: "merged".into(),
-                    conflicted: true,
-                    resolution: Some(rerere::label(&hashes)),
-                    fixup: None,
-                    derived,
-                };
-                let done = finish_entry(ctx, st, index, entry, &label, result)?;
-                clean_derive(ctx, entry, done);
-                if !done {
-                    return Ok(Some(STOPPED));
-                }
-                continue;
-            }
-            st.next_index = index;
-            state::write(&ctx.worktree, st)?;
-            println!("\n  {label} CONFLICT in {} file(s):", unresolved.len());
-            for file in &unresolved {
-                println!("      {file}");
-            }
-            println!("\n  Resolve in: {}", ctx.worktree.display());
-            println!("  Stage with `git add`, then: fork-assembler continue");
-            return Ok(Some(STOPPED));
-        }
-
+    if clean {
         let after = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
-        let status = if before == after {
+        if before == after {
             println!("  {label} EMPTY -- merge changed nothing, drop candidate");
-            "empty"
+            result.status = Status::Empty;
         } else {
             // Naming the reconstruction is the point: the OID that just landed
             // in the stack is not the pin the lock records for this entry, and
@@ -1113,201 +291,68 @@ fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
             } else {
                 "merged"
             };
-            println!("  {label} {what} {}", short(merging));
-            "merged"
-        };
-        let result = EntryResult {
-            name: entry.name.clone(),
-            oid,
-            status: status.into(),
-            conflicted: false,
-            resolution: None,
-            fixup: None,
-            derived,
-        };
-        let done = finish_entry(ctx, st, index, entry, &label, result)?;
-        clean_derive(ctx, entry, done);
-        if !done {
+            println!("  {label} {what} {}", git::short(merging));
+        }
+    } else {
+        // A derived entry merges its reconstruction, which already contains
+        // the base; its topics were checked against the base one at a time
+        // as they were merged in.
+        if !entry.is_derived() {
+            refuse::refuse_if_base_conflict(
+                ctx,
+                entry,
+                refuse::Topic::entry(entry, &oid),
+                &st.base,
+            )?;
+        }
+        st.conflicts += 1;
+        let unresolved = conflicted_files(&ctx.worktree)?;
+        if !unresolved.is_empty() {
+            stall(ctx, st, index)?;
+            println!("\n  {label} CONFLICT in {} file(s):", unresolved.len());
+            for file in &unresolved {
+                println!("      {file}");
+            }
+            println!("\n  Resolve in: {}", ctx.worktree.display());
+            println!("  Stage with `git add`, then: fork-assembler continue");
             return Ok(Some(STOPPED));
+        }
+        // rerere recognized every conflict hunk and staged the recorded
+        // resolutions (autoUpdate); commit and continue.
+        let hashes: Vec<String> = rerere::merge_rr(&ctx.worktree)?
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect();
+        git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+        println!("  {label} auto-resolved from tracked rerere pairs");
+        result.conflicted = true;
+        result.resolution = Some(rerere::label(&hashes));
+    }
+    result.derived = derived;
+    let done = finish_entry(ctx, st, index, entry, label, result)?;
+    derive::clean(ctx, entry, done);
+    Ok((!done).then_some(STOPPED))
+}
+
+/// The core loop: process entries[start..], persisting state after each.
+/// Returns Some(exit_code) when stopped for the human, None when complete.
+fn run_entries(ctx: &Ctx, st: &mut State, start: usize) -> Result<Option<i32>> {
+    for (index, entry) in ctx.manifest.entries.iter().enumerate().skip(start) {
+        let label = ctx.label(index, &entry.name);
+        let oid = st
+            .pins
+            .get(&entry.name)
+            .cloned()
+            .with_context(|| format!("{}: pin vanished mid-build", entry.name))?;
+        let stopped = match &entry.kind {
+            Kind::Patch { path } => run_patch_entry(ctx, st, index, entry, &label, path, oid)?,
+            _ => run_live_entry(ctx, st, index, entry, &label, oid)?,
+        };
+        if stopped.is_some() {
+            return Ok(stopped);
         }
     }
     Ok(None)
-}
-
-/// Drop the reconstruction worktree once its entry's step has completed.
-///
-/// It survives an unfinished step on purpose: when a build stops on the stack
-/// merge or on a fixup, the reconstruction that produced the conflicting side
-/// is exactly what the operator needs to read next to it.
-fn clean_derive(ctx: &Ctx, entry: &Entry, step_completed: bool) {
-    if step_completed && !entry.parents.is_empty() {
-        remove_worktree(ctx, &ctx.derive_worktree());
-    }
-}
-
-fn provenance_json(ctx: &Ctx, st: &State, base: &str) -> Result<serde_json::Value> {
-    use serde_json::json;
-    let m = &ctx.manifest;
-    let subject = git::out(&ctx.repo, &["log", "-1", "--format=%s", base])?;
-    let date = git::out(&ctx.repo, &["log", "-1", "--format=%cI", base])?;
-
-    let results: BTreeMap<&str, &EntryResult> =
-        st.results.iter().map(|r| (r.name.as_str(), r)).collect();
-    let entries: Vec<serde_json::Value> = m
-        .entries
-        .iter()
-        .map(|entry| {
-            let result = results.get(entry.name.as_str());
-            let mut record = json!({
-                "label": entry.name,
-                "kind": entry.kind.kind_str(),
-                "status": result.map(|r| r.status.as_str()).unwrap_or("unknown"),
-                "commit": result.map(|r| r.oid.as_str()).unwrap_or(""),
-            });
-            let obj = record.as_object_mut().expect("record is an object");
-            if let Some(pr) = entry.pr_number() {
-                obj.insert("pr".into(), json!(pr));
-            }
-            if let Kind::Branch { branch, .. } = &entry.kind {
-                obj.insert("branch".into(), json!(branch));
-            }
-            if let Some(fixup) = &entry.fixup {
-                obj.insert("fixup".into(), json!(fixup));
-            }
-            // A derived entry's `commit` is its pin, which by itself explains
-            // none of the tree it contributed. The parents and the two
-            // reconstruction commits are what make that tree accountable.
-            if !entry.parents.is_empty() {
-                let pins = st.parent_pins.get(&entry.name);
-                obj.insert(
-                    "parents".into(),
-                    json!(entry
-                        .parents
-                        .iter()
-                        .map(|parent| json!({
-                            "label": parent.name,
-                            "source": parent.source(),
-                            "commit": pins
-                                .and_then(|pins| pins.get(&parent.name))
-                                .cloned()
-                                .unwrap_or_default(),
-                        }))
-                        .collect::<Vec<_>>()),
-                );
-                if let Some(derived) = result.and_then(|r| r.derived.as_ref()) {
-                    obj.insert(
-                        "derived".into(),
-                        json!({ "baseTip": derived.base_tip, "tip": derived.tip }),
-                    );
-                }
-            }
-            if let Some(summary) = &entry.summary {
-                obj.insert("summary".into(), json!(summary));
-            }
-            if let Some(note) = &entry.note {
-                obj.insert("note".into(), json!(note.trim()));
-            }
-            record
-        })
-        .collect();
-
-    let mut top = json!({
-        "schemaVersion": 1,
-        "manifest": manifest::FILE,
-        "upstream": {
-            "remote": m.remote_url(&m.base.remote)?,
-            "ref": m.base.ref_,
-            "commit": base,
-            "subject": subject,
-            "date": date,
-        },
-        "entries": entries,
-    });
-    if let Some(publish) = &m.publish {
-        let remote_url = publish
-            .remote
-            .as_deref()
-            .and_then(|name| m.remotes.get(name).cloned());
-        top.as_object_mut().expect("top is an object").insert(
-            "fork".into(),
-            json!({
-                "remote": remote_url,
-                "branch": publish.branch,
-            }),
-        );
-    }
-    Ok(top)
-}
-
-/// Publish completed derived-entry reconstructions only after every entry has
-/// assembled successfully. This keeps a later stack conflict from updating a
-/// review branch with a reconstruction that never became an assembled build.
-///
-/// A locked build is a read-only reproducibility check: it deliberately skips
-/// this network write even when the manifest requests publication.
-fn publish_reconstructions(ctx: &Ctx, st: &State, locked: bool) -> Result<()> {
-    for entry in &ctx.manifest.entries {
-        let Some(target) = &entry.reconstruction_publish else {
-            continue;
-        };
-        let Some(tip) = st
-            .results
-            .iter()
-            .find(|result| result.name == entry.name)
-            .and_then(|result| result.derived.as_ref())
-            .map(|derived| derived.tip.as_str())
-        else {
-            // An absorbed or empty entry has no newly reconstructed branch to
-            // publish. Its normal build result already explains why.
-            continue;
-        };
-        if locked {
-            println!(
-                "  {} reconstruction publication to {} skipped (--locked)",
-                entry.name,
-                target.source()
-            );
-            continue;
-        }
-
-        let destination = format!("refs/heads/{}", target.branch);
-        let out = git::raw(
-            &ctx.repo,
-            &["ls-remote", "--heads", &target.remote, &destination],
-        )?;
-        if !out.status.success() {
-            bail!(
-                "{}: could not read reconstruction publish target {}: {}",
-                entry.name,
-                target.source(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        let expected = String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .map(str::to_string);
-        let lease = match expected {
-            Some(oid) => format!("--force-with-lease={destination}:{oid}"),
-            None => format!("--force-with-lease={destination}:"),
-        };
-        let source = format!("{tip}:{destination}");
-        git::out(&ctx.repo, &["push", &lease, &target.remote, &source]).with_context(|| {
-            format!(
-                "{}: publishing reconstructed {} to {}",
-                entry.name,
-                short(tip),
-                target.source()
-            )
-        })?;
-        println!(
-            "  {} published reconstruction {} -> {}",
-            entry.name,
-            short(tip),
-            target.source()
-        );
-    }
-    Ok(())
 }
 
 /// Finish a completed run: provenance commit, lock write, reporting.
@@ -1319,7 +364,7 @@ fn finalize(ctx: &Ctx, st: &State, previous: Option<&Lock>, write_lock: bool) ->
     let tree = git::out(&ctx.worktree, &["rev-parse", "HEAD^{tree}"])?;
 
     let head = if let Some(file) = &ctx.manifest.provenance_file {
-        let provenance = provenance_json(ctx, st, &st.base)?;
+        let provenance = provenance::provenance_json(ctx, st, &st.base)?;
         let body = serde_json::to_string_pretty(&provenance)? + "\n";
         std::fs::write(ctx.worktree.join(file), body)?;
         git::out(&ctx.worktree, &["add", file])?;
@@ -1399,10 +444,32 @@ fn finalize(ctx: &Ctx, st: &State, previous: Option<&Lock>, write_lock: bool) ->
     Ok(())
 }
 
+/// The pinned base, fetched once if the object is missing, or pinned fresh
+/// when nothing has pinned it yet.
+fn ensure_base(ctx: &Ctx, pinned: Option<String>, locked: bool) -> Result<String> {
+    let Some(base) = pinned else {
+        if locked {
+            bail!("no base pin recorded and --locked forbids pinning");
+        }
+        let oid = fetch_base(ctx)?;
+        println!("  pinned base -> {}", git::short(&oid));
+        return Ok(oid);
+    };
+    if !git::has_commit(&ctx.repo, &base) {
+        if locked {
+            bail!("pinned base {base} is not present locally and --locked forbids fetching");
+        }
+        fetch_base(ctx)?;
+        if !git::has_commit(&ctx.repo, &base) {
+            bail!("pinned base {base} is not reachable from the live base ref");
+        }
+    }
+    Ok(base)
+}
+
 pub fn build(root: &Path, locked: bool) -> Result<i32> {
     let ctx = Ctx::open(root, !locked)?;
-    if let Some(st) = state::read(&ctx.worktree).unwrap_or(None) {
-        let _ = st;
+    if state::read(&ctx.worktree).is_ok_and(|st| st.is_some()) {
         bail!(
             "a build is already in progress in {}; finish it with `fork-assembler continue` \
              (or remove the worktree to abandon it)",
@@ -1415,36 +482,12 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
         .as_ref()
         .map(|l| l.pins.clone())
         .unwrap_or_default();
-
-    let base = match previous.as_ref().and_then(|l| l.pins.base.clone()) {
-        Some(base) => {
-            if !git::has_commit(&ctx.repo, &base) {
-                if locked {
-                    bail!(
-                        "pinned base {base} is not present locally and --locked forbids fetching"
-                    );
-                }
-                fetch_base(&ctx)?;
-                if !git::has_commit(&ctx.repo, &base) {
-                    bail!("pinned base {base} is not reachable from the live base ref");
-                }
-            }
-            base
-        }
-        None => {
-            if locked {
-                bail!("no base pin recorded and --locked forbids pinning");
-            }
-            let oid = fetch_base(&ctx)?;
-            println!("  pinned base -> {}", &oid[..12.min(oid.len())]);
-            oid
-        }
-    };
+    let base = ensure_base(&ctx, pins.base.take(), locked)?;
 
     for entry in &ctx.manifest.entries {
-        ensure_pin(&ctx, entry, &mut pins.entries, locked)?;
-        if !entry.parents.is_empty() {
-            ensure_parent_pins(&ctx, entry, &mut pins.parents, locked)?;
+        pins::ensure_pin(&ctx, entry, &mut pins.entries, locked)?;
+        if entry.is_derived() {
+            pins::ensure_parent_pins(&ctx, entry, &mut pins.parents, locked)?;
         }
     }
     // Pins for entries the manifest no longer carries are not facts about
@@ -1453,66 +496,48 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     // misleading when the same ref later reappears as a parent, pinned
     // elsewhere at a different OID. A removed entry that returns simply pins
     // fresh, which is what its first build would do anyway.
-    pins.entries
-        .retain(|name, _| ctx.manifest.entries.iter().any(|e| &e.name == name));
-    pins.parents
-        .retain(|name, _| ctx.manifest.entries.iter().any(|e| &e.name == name));
-    pins.anchors
-        .retain(|name, _| ctx.manifest.entries.iter().any(|e| &e.name == name));
+    pins.entries.retain(|name, _| ctx.manifest.has_entry(name));
+    pins.parents.retain(|name, _| ctx.manifest.has_entry(name));
+    pins.anchors.retain(|name, _| ctx.manifest.has_entry(name));
 
     // Decide full rebuild vs incremental extension vs up-to-date. Fixup blobs
     // ride in the snapshot, so editing one invalidates from its entry exactly
     // as repinning that entry would.
     let fixups = fixup_blobs(&ctx.root, &ctx.manifest.entries, true)?;
     let snapshot = lock::snapshot(&ctx.manifest.entries, &pins, &fixups);
-    let mut start = 0usize;
-    let mut extended_from = None;
-    let mut results: Vec<EntryResult> = Vec::new();
     let relation = previous
         .as_ref()
         .map(|l| lock::prefix_relation(l, &snapshot, &base))
         .unwrap_or(Prefix::NoBuild);
+    let last_build = previous.as_ref().and_then(|l| l.build.as_ref());
 
-    let start_commit = match relation {
-        Prefix::Exact if !locked => {
-            let build = previous
-                .as_ref()
-                .and_then(|l| l.build.as_ref())
-                .expect("Exact implies a build");
-            if git::has_commit(&ctx.repo, &build.pre_provenance_commit) {
-                println!("up to date: tree {}", build.tree);
-                return Ok(0);
-            }
-            base.clone()
+    // Where the run starts: the last build's head when this one extends it,
+    // else the base. A locked build always reproduces from scratch.
+    let mut start = 0usize;
+    let mut results: Vec<EntryResult> = Vec::new();
+    let mut extended_from = None;
+    let mut start_commit = base.clone();
+    match (relation, last_build) {
+        (Prefix::Exact, Some(build))
+            if !locked && git::has_commit(&ctx.repo, &build.pre_provenance_commit) =>
+        {
+            println!("up to date: tree {}", build.tree);
+            return Ok(0);
         }
-        Prefix::Extension(prefix_len) if !locked => {
-            let build = previous
-                .as_ref()
-                .and_then(|l| l.build.as_ref())
-                .expect("Extension implies a build");
-            if git::has_commit(&ctx.repo, &build.pre_provenance_commit) {
-                println!(
-                    "extending the locked build ({} new entr{})",
-                    snapshot.len() - prefix_len,
-                    if snapshot.len() - prefix_len == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    }
-                );
-                start = prefix_len;
-                results = build.results.clone();
-                extended_from = Some(build.pre_provenance_commit.clone());
-                build.pre_provenance_commit.clone()
-            } else {
-                base.clone()
-            }
+        (Prefix::Extension(prefix_len), Some(build))
+            if !locked && git::has_commit(&ctx.repo, &build.pre_provenance_commit) =>
+        {
+            let new = snapshot.len() - prefix_len;
+            println!(
+                "extending the locked build ({new} new {})",
+                entries_noun(new)
+            );
+            start = prefix_len;
+            results = build.results.clone();
+            extended_from = Some(build.pre_provenance_commit.clone());
+            start_commit = build.pre_provenance_commit.clone();
         }
-        _ => base.clone(),
-    };
-    if start == 0 {
-        println!("building from base {}", short(&base));
-        results.clear();
+        _ => println!("building from base {}", git::short(&base)),
     }
 
     prepare_worktree(&ctx, &ctx.worktree, &start_commit)?;
@@ -1527,7 +552,7 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     }
     let mut st = State {
         next_index: start,
-        base: base.clone(),
+        base,
         pins: pins.entries,
         parent_pins: pins.parents,
         anchors: pins.anchors,
@@ -1543,22 +568,11 @@ pub fn build(root: &Path, locked: bool) -> Result<i32> {
     match run_entries(&ctx, &mut st, start)? {
         Some(code) => Ok(code),
         None => {
-            publish_reconstructions(&ctx, &st, locked)?;
+            derive::publish(&ctx, &st, locked)?;
             finalize(&ctx, &st, previous.as_ref(), !locked)?;
             Ok(0)
         }
     }
-}
-
-/// The worktree's own git dir, absolute — where the in-flight merge or
-/// cherry-pick records itself.
-fn git_dir(worktree: &Path) -> Result<PathBuf> {
-    let dir = PathBuf::from(git::out(worktree, &["rev-parse", "--git-dir"])?);
-    Ok(if dir.is_absolute() {
-        dir
-    } else {
-        worktree.join(dir)
-    })
 }
 
 /// What `continue` says about a resolution it just committed. Harvesting is
@@ -1580,8 +594,100 @@ fn report_harvest(label: &str, what: &str, harvested: &[String]) {
     }
 }
 
+/// Resume a build stalled in a coherence fixup: the merge is already
+/// committed, so only the fixup's staged content needs a commit. Re-running
+/// the merge here would duplicate it.
+fn resume_fixup(ctx: &Ctx, st: &mut State, mut pending: EntryResult) -> Result<()> {
+    let index = st.next_index;
+    let entry = &ctx.manifest.entries[index];
+    let rel = entry.fixup.clone().with_context(|| {
+        format!(
+            "{}: the build stalled in a coherence fixup but the manifest no longer \
+             declares one; abandon the worktree and rebuild",
+            entry.name
+        )
+    })?;
+    if staged_files(&ctx.worktree)?.is_empty() {
+        bail!(
+            "{}: nothing staged for the fixup {rel}; resolve it and `git add`, \
+             or detach it with `fork-assembler fixup {} --remove`",
+            entry.name,
+            entry.name
+        );
+    }
+    let message = format!("fork-assembler: fixup {}", entry.name);
+    git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
+    pending.fixup = Some(patch_blob(&ctx.root, &rel)?);
+    st.results.push(pending);
+    st.next_index = index + 1;
+    state::write(&ctx.worktree, st)?;
+    println!(
+        "  {} fixup committed as resolved",
+        ctx.label(index, &entry.name)
+    );
+    // The lock now pins a fixup blob whose patch does NOT reproduce what
+    // was just committed, so a rebuild stalls here again. Say so plainly.
+    println!(
+        "  WARNING: {rel} still holds the version that failed; re-capture it with \
+         `fork-assembler fixup {} {rel} --capture` after this build, or the next \
+         rebuild stops here again",
+        entry.name
+    );
+    Ok(())
+}
+
+/// Resume a build stalled on a stack merge the human has resolved: commit it,
+/// harvest the rerere pairs, and finish the entry's step. Returns false when
+/// the step's fixup then stalled in turn.
+fn resume_merge(ctx: &Ctx, st: &mut State) -> Result<bool> {
+    let index = st.next_index;
+    let entry = &ctx.manifest.entries[index];
+    // Read MERGE_RR before committing: the rerere-enabled commit records
+    // the postimages and clears it.
+    let merge_rr = rerere::merge_rr(&ctx.worktree)?;
+    git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+    let harvested = rerere::harvest(&ctx.root, &ctx.worktree)?;
+    rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
+    // The tracked object, which is not always the merged one: a derived
+    // entry merges its reconstruction, and the lock records its pin.
+    let oid = match st.pins.get(&entry.name) {
+        Some(pin) => pin.clone(),
+        None => git::out(&ctx.worktree, &["rev-parse", "HEAD^2"])?,
+    };
+    let label = ctx.label(index, &entry.name);
+    report_harvest(&label, "resolved", &harvested);
+    let mut result = EntryResult::new(&entry.name, oid, Status::Merged);
+    result.conflicted = true;
+    result.resolution = Some(rerere::label(&harvested));
+    result.derived = st.derived.get(&entry.name).cloned();
+    // finish_entry persists the advance IMMEDIATELY: if the very next
+    // entry errors, a stale index would re-merge this one and falsely
+    // report it EMPTY. It also runs this entry's fixup, which can stall
+    // in turn — the resolution and its fixup are one step.
+    let done = finish_entry(ctx, st, index, entry, &label, result)?;
+    derive::clean(ctx, entry, done);
+    Ok(done)
+}
+
+/// Resume a build stalled on a patch entry: commit what the human staged.
+fn resume_patch(ctx: &Ctx, st: &mut State) -> Result<()> {
+    let index = st.next_index;
+    let entry = &ctx.manifest.entries[index];
+    if !entry.kind.is_patch() {
+        return Ok(());
+    }
+    let message = format!("fork-assembler: {}", entry.name);
+    git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
+    let oid = st.pins.get(&entry.name).cloned().unwrap_or_default();
+    let mut result = EntryResult::new(&entry.name, oid, Status::Applied);
+    result.conflicted = true;
+    st.results.push(result);
+    st.next_index = index + 1;
+    state::write(&ctx.worktree, st)
+}
+
 pub fn cont(root: &Path) -> Result<i32> {
-    let ctx = Ctx::open(root, false).or_else(|_| Ctx::open(root, true))?;
+    let ctx = Ctx::open(root, true)?;
     let Some(mut st) = state::read(&ctx.worktree)? else {
         bail!("no in-progress build found; run `fork-assembler build`");
     };
@@ -1612,157 +718,20 @@ pub fn cont(root: &Path) -> Result<i32> {
             unresolved.join("\n  ")
         );
     }
-    let git_dir = git_dir(&stalled_worktree)?;
+    let git_dir = git::git_dir(&stalled_worktree)?;
 
-    let stalled = st.next_index;
-    let total = ctx.manifest.entries.len();
-    let label = |index: usize, name: &str| format!("[{:2}/{total}] {name:<24}", index + 1);
-
-    if let Some(mut ds) = st.derive.clone() {
-        // The stall is inside a reconstruction. Finish whatever git has open
-        // in the derive worktree and advance that sequence's index; the entry
-        // loop below then re-enters the reconstruction where it left off,
-        // merges the result into the stack, and carries on.
+    if let Some(ds) = st.derive.clone() {
         let entry = &ctx.manifest.entries[ds.entry_index];
-        let label = label(ds.entry_index, &entry.name);
-        if git_dir.join("MERGE_HEAD").exists() {
-            // Read MERGE_RR before committing: the rerere-enabled commit
-            // records the postimages and clears it.
-            let merge_rr = rerere::merge_rr(&stalled_worktree)?;
-            git::out(
-                &stalled_worktree,
-                &rerere::with_cfg(&["commit", "--no-edit"]),
-            )?;
-            let harvested = rerere::harvest(&ctx.root, &stalled_worktree)?;
-            // Attributed to the entry, not the parent: the entry is what the
-            // manifest carries and what a later build will replay this for.
-            rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-            let what = match entry.parents.get(ds.next_parent) {
-                Some(parent) => format!("parent {} merged", parent.name),
-                None => "parent merged".to_string(),
-            };
-            report_harvest(&label, &what, &harvested);
-            ds.next_parent += 1;
-        } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
-            let merge_rr = rerere::merge_rr(&stalled_worktree)?;
-            let picked = ds.delta.get(ds.next_pick).cloned().unwrap_or_default();
-            if git::ok(&stalled_worktree, &["diff", "--cached", "--quiet", "HEAD"]) {
-                // The resolution kept nothing: the commit's content is
-                // already in the reconstruction, so there is nothing to
-                // commit and the replay simply skips it.
-                git::out(&stalled_worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
-                println!(
-                    "  {label} replayed {}: EMPTY after resolution -- skipped",
-                    short(&picked)
-                );
-            } else {
-                git::out(
-                    &stalled_worktree,
-                    &replay_cfg(&["cherry-pick", "--continue"]),
-                )?;
-                let harvested = rerere::harvest(&ctx.root, &stalled_worktree)?;
-                rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-                report_harvest(&label, &format!("replayed {}", short(&picked)), &harvested);
-            }
-            ds.next_pick += 1;
-        }
-        // Nothing in flight means the human committed the resolution by hand;
-        // re-entering the reconstruction is then the whole of the repair.
-        st.next_index = ds.entry_index;
-        persist_derive(&ctx, &mut st, &ds)?;
-    } else if let Some(mut pending) = st.pending.take() {
-        // Stalled in a fixup: the merge is already committed, so only the
-        // fixup's staged content needs a commit. Re-running the merge here
-        // would duplicate it.
-        let entry = &ctx.manifest.entries[stalled];
-        let rel = entry.fixup.clone().with_context(|| {
-            format!(
-                "{}: the build stalled in a coherence fixup but the manifest no longer \
-                 declares one; abandon the worktree and rebuild",
-                entry.name
-            )
-        })?;
-        if git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty() {
-            bail!(
-                "{}: nothing staged for the fixup {rel}; resolve it and `git add`, \
-                 or detach it with `fork-assembler fixup {} --remove`",
-                entry.name,
-                entry.name
-            );
-        }
-        let message = format!("fork-assembler: fixup {}", entry.name);
-        git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
-        pending.fixup = Some(patch_blob(&ctx.root, &rel)?);
-        st.results.push(pending);
-        st.next_index = stalled + 1;
-        state::write(&ctx.worktree, &st)?;
-        println!(
-            "  {} fixup committed as resolved",
-            label(stalled, &entry.name)
-        );
-        // The lock now pins a fixup blob whose patch does NOT reproduce what
-        // was just committed, so a rebuild stalls here again. Say so plainly.
-        println!(
-            "  WARNING: {rel} still holds the version that failed; re-capture it with \
-             `fork-assembler fixup {} {rel} --capture` after this build, or the next \
-             rebuild stops here again",
-            entry.name
-        );
+        let label = ctx.label(ds.entry_index, &entry.name);
+        derive::resume(&ctx, &mut st, ds, &label)?;
+    } else if let Some(pending) = st.pending.take() {
+        resume_fixup(&ctx, &mut st, pending)?;
     } else if git_dir.join("MERGE_HEAD").exists() {
-        let entry = &ctx.manifest.entries[stalled];
-        // Read MERGE_RR before committing: the rerere-enabled commit records
-        // the postimages and clears it.
-        let merge_rr = rerere::merge_rr(&ctx.worktree)?;
-        git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-        let harvested = rerere::harvest(&ctx.root, &ctx.worktree)?;
-        rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
-        // The tracked object, which is not always the merged one: a derived
-        // entry merges its reconstruction, and the lock records its pin.
-        let oid = match st.pins.get(&entry.name) {
-            Some(pin) => pin.clone(),
-            None => git::out(&ctx.worktree, &["rev-parse", "HEAD^2"])?,
-        };
-        let label = label(stalled, &entry.name);
-        report_harvest(&label, "resolved", &harvested);
-        let result = EntryResult {
-            name: entry.name.clone(),
-            oid,
-            status: "merged".into(),
-            conflicted: true,
-            resolution: Some(rerere::label(&harvested)),
-            fixup: None,
-            derived: st.derived.get(&entry.name).cloned(),
-        };
-        // finish_entry persists the advance IMMEDIATELY: if the very next
-        // entry errors, a stale index would re-merge this one and falsely
-        // report it EMPTY. It also runs this entry's fixup, which can stall
-        // in turn — the resolution and its fixup are one step.
-        let done = finish_entry(&ctx, &mut st, stalled, entry, &label, result)?;
-        clean_derive(&ctx, entry, done);
-        if !done {
+        if !resume_merge(&ctx, &mut st)? {
             return Ok(STOPPED);
         }
-    } else if git_dir.join("MERGE_MSG").exists()
-        || !git::out(&ctx.worktree, &["diff", "--cached", "--name-only"])?.is_empty()
-    {
-        // A stalled patch entry: commit the staged patch-entry result.
-        let entry = &ctx.manifest.entries[stalled];
-        if let Kind::Patch { .. } = &entry.kind {
-            let message = format!("fork-assembler: {}", entry.name);
-            git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
-            let oid = st.pins.get(&entry.name).cloned().unwrap_or_default();
-            st.results.push(EntryResult {
-                name: entry.name.clone(),
-                oid,
-                status: "applied".into(),
-                conflicted: true,
-                resolution: None,
-                fixup: None,
-                derived: None,
-            });
-            st.next_index = stalled + 1;
-            state::write(&ctx.worktree, &st)?;
-        }
+    } else if git_dir.join("MERGE_MSG").exists() || !staged_files(&ctx.worktree)?.is_empty() {
+        resume_patch(&ctx, &mut st)?;
     }
 
     println!(
@@ -1775,7 +744,7 @@ pub fn cont(root: &Path) -> Result<i32> {
         Some(code) => Ok(code),
         None => {
             let previous = lock::load(&ctx.root)?;
-            publish_reconstructions(&ctx, &st, false)?;
+            derive::publish(&ctx, &st, false)?;
             finalize(&ctx, &st, previous.as_ref(), true)?;
             Ok(0)
         }
