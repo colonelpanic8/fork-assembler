@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 
 use crate::engine::derive::{self, Anchor};
-use crate::engine::{self, refuse, Ctx};
+use crate::engine::{self, refuse, Ctx, Live, Want};
 use crate::git;
 use crate::lock::{self, EntryResult, Prefix, Status};
 use crate::manifest::edit::{self, Removal};
@@ -60,9 +60,19 @@ pub fn update(root: &Path, names: &[String], report: &dyn Report) -> Result<Upda
         }
     }
 
+    let mut fetch = Vec::new();
+    if wants("base") {
+        fetch.push(Want::Base);
+    }
+    for entry in ctx.manifest.entries.iter().filter(|e| wants(&e.name)) {
+        fetch.push(Want::Entry(entry));
+        fetch.extend(entry.parents.iter().map(|p| Want::Parent(entry, p)));
+    }
+    let live = ctx.fetch_live(&fetch)?;
+
     let mut base = None;
     if wants("base") {
-        let new = ctx.fetch_base()?;
+        let new = live.base()?;
         base = Some(PinMove {
             old: lock.pins.base.replace(new.clone()),
             new,
@@ -74,10 +84,10 @@ pub fn update(root: &Path, names: &[String], report: &dyn Report) -> Result<Upda
         if !wants(&entry.name) {
             continue;
         }
-        let new = ctx.fetch_entry(entry)?;
+        let new = live.entry(entry)?;
         let old = lock.pins.entries.insert(entry.name.clone(), new.clone());
         let (parents, anchor) = if entry.is_derived() {
-            let (parents, anchor) = update_derived(&ctx, &mut lock, entry, &new)?;
+            let (parents, anchor) = update_derived(&ctx, &live, &mut lock, entry, &new)?;
             (parents, Some(anchor))
         } else {
             (Vec::new(), None)
@@ -105,6 +115,7 @@ pub fn update(root: &Path, names: &[String], report: &dyn Report) -> Result<Upda
 /// cannot tell duplicated work from replayed work until it is in the tree.
 fn update_derived(
     ctx: &Ctx,
+    live: &Live,
     lock: &mut lock::Lock,
     entry: &Entry,
     pin: &str,
@@ -117,7 +128,7 @@ fn update_derived(
         .unwrap_or_default();
     let mut moves = Vec::new();
     for parent in &entry.parents {
-        let new = ctx.fetch_parent(entry, parent)?;
+        let new = live.parent(entry, parent)?;
         let old = pins.insert(parent.name.clone(), new.clone());
         moves.push(ParentUpdate {
             parent: parent.name.clone(),
@@ -272,10 +283,22 @@ pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusRepo
         .filter(|_| live)
         .map(|repo| Ctx::new(root, m.clone(), repo.clone(), report));
 
+    let live = match &ctx {
+        Some(ctx) => {
+            let mut fetch = vec![Want::Base];
+            for entry in m.entries.iter().filter(|e| !e.kind.is_patch()) {
+                fetch.push(Want::Entry(entry));
+                fetch.extend(entry.parents.iter().map(|p| Want::Parent(entry, p)));
+            }
+            Some(ctx.fetch_live(&fetch)?)
+        }
+        None => None,
+    };
+
     let base = BaseStatus {
         source: format!("{}:{}", m.base.remote, m.base.ref_),
         pin: lock.pins.base.clone(),
-        live_head: ctx.as_ref().map(Ctx::fetch_base).transpose()?,
+        live_head: live.as_ref().map(Live::base).transpose()?,
     };
 
     let results: BTreeMap<&str, &EntryResult> = lock
@@ -312,8 +335,8 @@ pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusRepo
         {
             flags.extend(base_flag(repo, pin, base));
         }
-        if let (Some(ctx), false) = (ctx.as_ref(), entry.kind.is_patch()) {
-            let head = ctx.fetch_entry(entry)?;
+        if let (Some(live), false) = (live.as_ref(), entry.kind.is_patch()) {
+            let head = live.entry(entry)?;
             if Some(&head) != pin {
                 flags.push(Flag::LiveHead { oid: head });
             }
@@ -331,8 +354,8 @@ pub fn status(root: &Path, live: bool, report: &dyn Report) -> Result<StatusRepo
                 if let (Some(pin), Some(base), Some(repo)) = (pin, base_pin, repo.as_ref()) {
                     flags.extend(base_flag(repo, pin, base));
                 }
-                if let Some(ctx) = ctx.as_ref() {
-                    let head = ctx.fetch_parent(entry, parent)?;
+                if let Some(live) = live.as_ref() {
+                    let head = live.parent(entry, parent)?;
                     if Some(&head) != pin {
                         flags.push(Flag::LiveHead { oid: head });
                     }

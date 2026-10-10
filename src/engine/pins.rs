@@ -7,10 +7,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use super::Ctx;
 use crate::git;
+use crate::lock;
 use crate::manifest::{self, Entry, Kind, Parent};
 use crate::report::Event;
 
@@ -76,37 +77,175 @@ pub fn fixup_blobs(
     Ok(blobs)
 }
 
-impl Ctx<'_> {
-    /// Fetch `kind`'s live ref into `holding` and return what it resolved to.
-    fn fetch_ref(&self, kind: &Kind, holding: &str) -> Result<String> {
-        let Some((remote, source)) = kind.remote_ref() else {
-            bail!("{} is a patch, not a fetchable ref", kind.source());
-        };
-        let spec = format!("+{source}:{holding}");
-        git::out(&self.repo, &["fetch", remote, &spec])?;
-        git::out(&self.repo, &["rev-parse", holding])
+/// One live ref a verb needs fetched.
+#[derive(Clone, Copy)]
+pub enum Want<'a> {
+    Base,
+    /// A patch entry resolves to its file's blob; nothing is fetched.
+    Entry(&'a Entry),
+    Parent(&'a Entry, &'a Parent),
+}
+
+/// What a batch of `Want`s resolved to.
+#[derive(Default)]
+pub struct Live {
+    base: Option<String>,
+    entries: BTreeMap<String, String>,
+    parents: BTreeMap<(String, String), String>,
+}
+
+impl Live {
+    pub fn base(&self) -> Result<String> {
+        self.base.clone().context("the base was not fetched")
     }
 
-    pub fn fetch_entry(&self, entry: &Entry) -> Result<String> {
-        match &entry.kind {
-            Kind::Patch { path } => patch_blob(&self.root, path),
-            kind => self.fetch_ref(kind, &holding_ref(entry)),
+    pub fn entry(&self, entry: &Entry) -> Result<String> {
+        self.entries
+            .get(&entry.name)
+            .cloned()
+            .with_context(|| format!("{} was not fetched", entry.name))
+    }
+
+    pub fn parent(&self, entry: &Entry, parent: &Parent) -> Result<String> {
+        self.parents
+            .get(&(entry.name.clone(), parent.name.clone()))
+            .cloned()
+            .with_context(|| format!("{}: parent {} was not fetched", entry.name, parent.name))
+    }
+}
+
+/// A `Want` that needs the network: one refspec on one remote.
+struct RefFetch<'a> {
+    want: Want<'a>,
+    remote: &'a str,
+    source: String,
+    holding: String,
+}
+
+impl RefFetch<'_> {
+    fn spec(&self) -> String {
+        format!("+{}:{}", self.source, self.holding)
+    }
+
+    fn what(&self) -> String {
+        match self.want {
+            Want::Base => "base".to_string(),
+            Want::Entry(entry) => entry.name.clone(),
+            Want::Parent(entry, parent) => format!("{}: parent {}", entry.name, parent.name),
         }
     }
+}
 
-    pub fn fetch_parent(&self, entry: &Entry, parent: &Parent) -> Result<String> {
-        self.fetch_ref(&parent.kind, &parent_holding_ref(entry, parent))
+fn fetch_args<'s>(remote: &'s str, specs: &'s [String]) -> Vec<&'s str> {
+    let mut args = vec!["fetch", "--no-tags", remote];
+    args.extend(specs.iter().map(String::as_str));
+    args
+}
+
+impl Ctx<'_> {
+    fn ref_fetch<'a>(&'a self, want: Want<'a>) -> Option<RefFetch<'a>> {
+        let (remote, source, holding) = match want {
+            Want::Base => {
+                let base = &self.manifest.base;
+                (
+                    base.remote.as_str(),
+                    format!("refs/heads/{}", base.ref_),
+                    "refs/fork-assembler/base".to_string(),
+                )
+            }
+            Want::Entry(entry) => {
+                let (remote, source) = entry.kind.remote_ref()?;
+                (remote, source, holding_ref(entry))
+            }
+            Want::Parent(entry, parent) => {
+                let (remote, source) = parent.kind.remote_ref()?;
+                (remote, source, parent_holding_ref(entry, parent))
+            }
+        };
+        Some(RefFetch {
+            want,
+            remote,
+            source,
+            holding,
+        })
     }
 
-    pub fn fetch_base(&self) -> Result<String> {
-        let base = &self.manifest.base;
-        let spec = format!("+refs/heads/{}:refs/fork-assembler/base", base.ref_);
-        git::out(&self.repo, &["fetch", &base.remote, &spec])?;
-        git::out(&self.repo, &["rev-parse", "refs/fork-assembler/base"])
+    /// Fetch every wanted live ref into its holding ref with one `git fetch`
+    /// per remote. Git aborts a whole fetch when any one ref is missing, so a
+    /// failed batch is retried ref by ref to name the entry that broke it.
+    pub fn fetch_live(&self, wants: &[Want]) -> Result<Live> {
+        let mut live = Live::default();
+        let mut by_remote: BTreeMap<&str, Vec<RefFetch>> = BTreeMap::new();
+        for &want in wants {
+            match (want, self.ref_fetch(want)) {
+                (_, Some(fetch)) => by_remote.entry(fetch.remote).or_default().push(fetch),
+                (Want::Entry(entry), None) => {
+                    if let Kind::Patch { path } = &entry.kind {
+                        live.entries
+                            .insert(entry.name.clone(), patch_blob(&self.root, path)?);
+                    }
+                }
+                (_, None) => bail!("a parent must be a fetchable ref, not a patch"),
+            }
+        }
+
+        for (remote, fetches) in &by_remote {
+            let specs: Vec<String> = fetches.iter().map(RefFetch::spec).collect();
+            if git::out(&self.repo, &fetch_args(remote, &specs)).is_err() {
+                for (fetch, spec) in fetches.iter().zip(&specs) {
+                    git::out(&self.repo, &fetch_args(remote, std::slice::from_ref(spec)))
+                        .with_context(|| {
+                            format!("{}: fetching {remote} {}", fetch.what(), fetch.source)
+                        })?;
+                }
+            }
+            let mut args = vec!["rev-parse"];
+            args.extend(fetches.iter().map(|f| f.holding.as_str()));
+            let oids = git::out(&self.repo, &args)?;
+            for (fetch, oid) in fetches.iter().zip(oids.lines()) {
+                let oid = oid.to_string();
+                match fetch.want {
+                    Want::Base => live.base = Some(oid),
+                    Want::Entry(entry) => {
+                        live.entries.insert(entry.name.clone(), oid);
+                    }
+                    Want::Parent(entry, parent) => {
+                        live.parents
+                            .insert((entry.name.clone(), parent.name.clone()), oid);
+                    }
+                }
+            }
+        }
+        Ok(live)
     }
 
-    /// Make sure a pinned commit is in the object store, fetching its live ref
-    /// once when permitted. `what` names the pin for the two refusals.
+    /// What `build` must fetch before resolving pins: whatever has no pin
+    /// yet, or is pinned at a commit missing from the object store. An
+    /// unpinned patch entry rides along to have its blob hashed.
+    pub fn missing_pins<'a>(&'a self, pins: &lock::Pins) -> Vec<Want<'a>> {
+        let absent = |pin: Option<&String>| pin.is_none_or(|p| !git::has_commit(&self.repo, p));
+        let mut wants = Vec::new();
+        if absent(pins.base.as_ref()) {
+            wants.push(Want::Base);
+        }
+        for entry in &self.manifest.entries {
+            let pin = pins.entries.get(&entry.name);
+            if pin.is_none() || (!entry.kind.is_patch() && absent(pin)) {
+                wants.push(Want::Entry(entry));
+            }
+            let parent_pins = pins.parents.get(&entry.name);
+            for parent in &entry.parents {
+                if absent(parent_pins.and_then(|p| p.get(&parent.name))) {
+                    wants.push(Want::Parent(entry, parent));
+                }
+            }
+        }
+        wants
+    }
+
+    /// Make sure a pinned commit is in the object store, taking its live ref
+    /// from the batch `build` fetched when permitted. `what` names the pin for
+    /// the two refusals.
     fn ensure_present(
         &self,
         pin: &str,
@@ -137,6 +276,7 @@ impl Ctx<'_> {
         &self,
         entry: &Entry,
         pins: &mut BTreeMap<String, String>,
+        live: &Live,
         locked: bool,
     ) -> Result<String> {
         if let Some(pin) = pins.get(&entry.name) {
@@ -151,9 +291,8 @@ impl Ctx<'_> {
                     );
                     }
                 }
-                _ => self.ensure_present(&pin, locked, &entry.name, &entry.name, || {
-                    self.fetch_entry(entry)
-                })?,
+                _ => self
+                    .ensure_present(&pin, locked, &entry.name, &entry.name, || live.entry(entry))?,
             }
             return Ok(pin);
         }
@@ -163,7 +302,7 @@ impl Ctx<'_> {
             entry.name
         );
         }
-        let oid = self.fetch_entry(entry)?;
+        let oid = live.entry(entry)?;
         self.emit(Event::Pinned {
             entry: entry.name.clone(),
             oid: oid.clone(),
@@ -179,6 +318,7 @@ impl Ctx<'_> {
         &self,
         entry: &Entry,
         parent_pins: &mut BTreeMap<String, BTreeMap<String, String>>,
+        live: &Live,
         locked: bool,
     ) -> Result<()> {
         let mut pins = parent_pins.get(&entry.name).cloned().unwrap_or_default();
@@ -186,7 +326,7 @@ impl Ctx<'_> {
             let what = format!("{}: parent {}", entry.name, parent.name);
             match pins.get(&parent.name).cloned() {
                 Some(pin) => self.ensure_present(&pin, locked, &what, &entry.name, || {
-                    self.fetch_parent(entry, parent)
+                    live.parent(entry, parent)
                 })?,
                 None => {
                     if locked {
@@ -196,7 +336,7 @@ impl Ctx<'_> {
                             entry.name
                         );
                     }
-                    let oid = self.fetch_parent(entry, parent)?;
+                    let oid = live.parent(entry, parent)?;
                     self.emit(Event::PinnedParent {
                         entry: entry.name.clone(),
                         parent: parent.name.clone(),

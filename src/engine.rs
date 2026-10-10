@@ -30,7 +30,7 @@ use crate::rerere;
 use crate::source;
 use crate::state::{self, State};
 
-pub use pins::{fixup_blobs, patch_blob};
+pub use pins::{fixup_blobs, patch_blob, Live, Want};
 
 pub const WORKTREE: &str = ".worktrees/build";
 
@@ -175,14 +175,14 @@ impl Ctx<'_> {
         Ok(Apply::Done(Outcome::Applied))
     }
 
-    /// The pinned base, fetched once if the object is missing, or pinned fresh
-    /// when nothing has pinned it yet.
-    fn ensure_base(&self, pinned: Option<String>, locked: bool) -> Result<String> {
+    /// The pinned base, taken from the live fetch if the object is missing, or
+    /// pinned fresh when nothing has pinned it yet.
+    fn ensure_base(&self, pinned: Option<String>, live: &Live, locked: bool) -> Result<String> {
         let Some(base) = pinned else {
             if locked {
                 bail!("no base pin recorded and --locked forbids pinning");
             }
-            let oid = self.fetch_base()?;
+            let oid = live.base()?;
             self.emit(Event::PinnedBase { oid: oid.clone() });
             return Ok(oid);
         };
@@ -190,7 +190,7 @@ impl Ctx<'_> {
             if locked {
                 bail!("pinned base {base} is not present locally and --locked forbids fetching");
             }
-            self.fetch_base()?;
+            live.base()?;
             if !git::has_commit(&self.repo, &base) {
                 bail!("pinned base {base} is not reachable from the live base ref");
             }
@@ -609,12 +609,17 @@ pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
         .as_ref()
         .map(|l| l.pins.clone())
         .unwrap_or_default();
-    let base = ctx.ensure_base(pins.base.take(), locked)?;
+    let live = if locked {
+        Live::default()
+    } else {
+        ctx.fetch_live(&ctx.missing_pins(&pins))?
+    };
+    let base = ctx.ensure_base(pins.base.take(), &live, locked)?;
 
     for entry in &ctx.manifest.entries {
-        ctx.ensure_pin(entry, &mut pins.entries, locked)?;
+        ctx.ensure_pin(entry, &mut pins.entries, &live, locked)?;
         if entry.is_derived() {
-            ctx.ensure_parent_pins(entry, &mut pins.parents, locked)?;
+            ctx.ensure_parent_pins(entry, &mut pins.parents, &live, locked)?;
         }
     }
     // Pins for entries the manifest no longer carries are not facts about
