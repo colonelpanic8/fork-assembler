@@ -23,6 +23,10 @@ fn holding_ref(entry: &Entry) -> String {
     )
 }
 
+/// The base remote's tags, so provenance can place the base relative to
+/// upstream releases without consulting whatever tags happen to be local.
+pub const BASE_TAGS: &str = "refs/fork-assembler/base-tags/";
+
 /// Parents get their own namespace under the entry that declares them: two
 /// entries may legitimately declare the same parent, and each reconstruction
 /// is standalone, so the holding refs must not be shared between them.
@@ -189,14 +193,22 @@ impl Ctx<'_> {
             }
         }
 
+        let base_wanted = wants.iter().any(|want| matches!(want, Want::Base));
         for (remote, fetches) in &by_remote {
-            let specs: Vec<String> = fetches.iter().map(RefFetch::spec).collect();
+            let mut specs: Vec<String> = fetches.iter().map(RefFetch::spec).collect();
+            let tags = (base_wanted && *remote == self.manifest.base.remote)
+                .then(|| format!("+refs/tags/*:{BASE_TAGS}*"));
+            specs.extend(tags.clone());
             if git::out(&self.repo, &fetch_args(remote, &specs)).is_err() {
                 for (fetch, spec) in fetches.iter().zip(&specs) {
                     git::out(&self.repo, &fetch_args(remote, std::slice::from_ref(spec)))
                         .with_context(|| {
                             format!("{}: fetching {remote} {}", fetch.what(), fetch.source)
                         })?;
+                }
+                if let Some(tags) = &tags {
+                    git::out(&self.repo, &fetch_args(remote, std::slice::from_ref(tags)))
+                        .with_context(|| format!("base: fetching {remote} tags"))?;
                 }
             }
             let mut args = vec!["rev-parse"];

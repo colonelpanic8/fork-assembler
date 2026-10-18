@@ -289,6 +289,28 @@ fn provenance_commit_and_tree_invariant() {
     assert_eq!(json["entries"][0]["label"], "t1");
 }
 
+#[test]
+fn provenance_places_the_base_after_its_nearest_upstream_tag() {
+    let fx = fixture();
+    git(&fx.upstream, &["tag", "-a", "-m", "v1", "v1.0.0"]);
+    fs::write(fx.upstream.join("a.txt"), "after tag\n").unwrap();
+    git(&fx.upstream, &["commit", "-q", "-am", "after tag"]);
+    topic(&fx, "t1", "c.txt", "from t1\n");
+    let manifest = fs::read_to_string(fx.root.join("manifest.toml")).unwrap();
+    fs::write(
+        fx.root.join("manifest.toml"),
+        format!("provenance_file = \"stack-build-info.json\"\n{manifest}"),
+    )
+    .unwrap();
+    add_branch(&fx, "t1");
+    ff_ok(&fx.root, &["build"]);
+
+    let body = fs::read_to_string(fx.root.join(".worktrees/build/stack-build-info.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["upstream"]["tag"], "v1.0.0");
+    assert_eq!(json["upstream"]["distance"], 1);
+}
+
 /// A removed entry's pin is not a fact about anything, and a stale one is
 /// actively misleading once the same ref reappears as a parent pinned
 /// elsewhere. The next build drops it; a re-added entry pins fresh.

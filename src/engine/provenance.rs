@@ -2,10 +2,12 @@
 //! into the tree as the build's last commit when the manifest asks for one.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::pins::BASE_TAGS;
 use super::Run;
 use crate::git;
 use crate::lock::EntryResult;
@@ -79,16 +81,23 @@ impl Run<'_> {
             })
             .collect();
 
+        let mut upstream = json!({
+            "remote": m.remote_url(&m.base.remote)?,
+            "ref": m.base.ref_,
+            "commit": base,
+            "subject": subject,
+            "date": date,
+        });
+        if let Some((tag, distance)) = nearest_tag(&ctx.repo, base)? {
+            let obj = upstream.as_object_mut().expect("upstream is an object");
+            obj.insert("tag".into(), json!(tag));
+            obj.insert("distance".into(), json!(distance));
+        }
+
         let mut top = json!({
             "schemaVersion": 1,
             "manifest": manifest::FILE,
-            "upstream": {
-                "remote": m.remote_url(&m.base.remote)?,
-                "ref": m.base.ref_,
-                "commit": base,
-                "subject": subject,
-                "date": date,
-            },
+            "upstream": upstream,
             "entries": entries,
         });
         if let Some(publish) = &m.publish {
@@ -106,4 +115,32 @@ impl Run<'_> {
         }
         Ok(top)
     }
+}
+
+/// The newest base-remote tag on `base`'s first-parent history, and how many
+/// commits `base` has beyond it.
+fn nearest_tag(repo: &Path, base: &str) -> Result<Option<(String, u64)>> {
+    let decorate = format!("--decorate-refs={BASE_TAGS}");
+    let log = git::out(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--simplify-by-decoration",
+            &decorate,
+            "--decorate=full",
+            "--format=%D",
+            base,
+        ],
+    )?;
+    let Some(tag) = log
+        .lines()
+        .flat_map(|line| line.split(", "))
+        .find_map(|name| name.trim_start_matches("tag: ").strip_prefix(BASE_TAGS))
+    else {
+        return Ok(None);
+    };
+    let range = format!("{BASE_TAGS}{tag}..{base}");
+    let distance = git::out(repo, &["rev-list", "--count", &range])?.parse()?;
+    Ok(Some((tag.to_string(), distance)))
 }
