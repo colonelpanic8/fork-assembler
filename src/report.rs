@@ -250,5 +250,6 @@ pub enum Event {
     },
     LockWritten,
     Verified,
+    UsageRecorded,
     NothingToVerify,
 }

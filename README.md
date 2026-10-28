@@ -25,8 +25,8 @@ topic that cannot merge with the base on its own is out of date with upstream,
 and `build` refuses it instead of offering to resolve it — the fix is a rebase
 on the topic branch, pushed where its author and reviewers can see it.
 
-The Rust CLI implements build, update, append, repair, status, and prune
-workflows. The `t3code-assembly` repository is the reference real-world
+The Rust CLI implements build, update, append, repair, status, prune, and
+gc workflows. The `t3code-assembly` repository is the reference real-world
 consumer.
 
 Maintenance repositories check in only a stable agent-skill discovery stub.

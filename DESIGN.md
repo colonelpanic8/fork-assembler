@@ -119,8 +119,8 @@ that writable branch after a *complete* successful build. This supports a
 combined PR whose source is `pr = N`: the PR ref is fetch-only, so the manifest
 must name its writable fork branch explicitly. Publication uses a
 force-with-lease, so a concurrent review update aborts the build's publication
-instead of being overwritten. `build --locked` is read-only and always skips
-the requested publication.
+instead of being overwritten. `build --locked` always skips the requested
+publication.
 
 Parents are neither entries nor exclusions. They are carried — inside the entry
 that merged them — so the manifest refuses to also carry one as an entry, and
@@ -263,6 +263,16 @@ Mechanics:
   committed and the build continues, recording the entry as
   conflicted+auto-resolved in the lock. Otherwise the build stops (exit 2)
   for manual resolution.
+- **Usage record** — seeding gives every postimage one fixed mtime, far in
+  the future so `git rerere gc` never expires it. git touches a postimage
+  whenever it replays that resolution and writes a fresh one when it records
+  a new one, so at the end of each entry's step every postimage whose mtime
+  moved belongs to a pair that step used. Its hashes go into the result's
+  `resolutions`, and the mtimes are reset for the next step. `MERGE_RR` cannot
+  answer this: git drops a path from it the moment it replays the path's
+  resolution. The rr-cache is shared by both worktrees and lives on disk, so
+  reconstruction merges and picks, and every `continue` of the step, count
+  toward the entry.
 - **Harvest** — after `continue` commits a manual resolution, new or updated
   preimage/postimage pairs are copied from the worktree rr-cache into
   `resolutions/rerere/` and attributed in INDEX.toml. The index is for
@@ -272,6 +282,12 @@ Mechanics:
   tree hashes, so unrelated drift elsewhere (or elsewhere in the same file)
   still auto-resolves. A changed conflict hunk falls back to a manual stop,
   and the new resolution is harvested alongside the old pair.
+- **Collection** — the superseded pair stays until `gc` removes it. `gc`
+  keeps every pair some result of the lock's last build lists and deletes the
+  rest, with their INDEX records. It refuses while a build is in progress and
+  when any result predates the usage record, since it cannot then tell
+  unused from unrecorded. A verified `build --locked` writes the record into
+  the lock it reproduced.
 
 Known limitation, by design: rerere pairs capture only **conflicted-hunk**
 resolutions. Edits made outside conflict hunks while resolving, and conflicts
@@ -399,7 +415,9 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   reconstruction, in the derive worktree, which it names — on an unrecognized
   conflict. After all entries succeed, configured derived entries publish their
   reconstruction to their explicit writable branches. `--locked` additionally
-  refuses to touch the network, pin anything new, or publish a reconstruction.
+  refuses to touch the network, pin anything new, or publish a reconstruction;
+  the only lock field it writes is each result's `resolutions`, after verifying
+  the tree, since which pairs reproducing the lock needs is a fact about it.
 - `update [ENTRY...]` — the pin bump: repin the base and all entries (or only
   the named ones) to their live remote heads, including each derived entry's
   parents, after which it re-establishes that entry's anchor and reports which
@@ -442,6 +460,10 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   containment (`git cherry`) against the pinned base. Reports orphaned fixups
   the same way `remove` does — a topic landing upstream rarely dissolves the
   incoherence its fixup repaired.
+- `gc [--dry-run]` — remove the tracked rerere pairs no step of the lock's
+  last build used, and their INDEX.toml records. Refuses while a build is in
+  progress, and when the last build predates recording which pairs each step
+  used; `build --locked` records it.
 - `status` — lock vs. manifest vs. live refs: what's stale, what an incremental
   build would do, and which entries look merged upstream (prune candidates).
 

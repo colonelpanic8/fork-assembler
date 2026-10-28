@@ -228,7 +228,10 @@ or delete it; do not leave the question open.
    changed conflicts stop for resolution.
 3. After the repair completes, run `fork-assembler build --locked` to prove the
    tracked inputs reproduce the lock's tree.
-4. Commit the manifest, lock, and tracked resolution changes together.
+4. Run `fork-assembler gc --dry-run`. A changed conflict leaves its old pair
+   behind; the lock records which pairs each step used, so the listed pairs
+   are ones the build no longer needs. Run `fork-assembler gc` to remove them.
+5. Commit the manifest, lock, and tracked resolution changes together.
 
 ## When a PR merges upstream
 

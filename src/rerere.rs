@@ -307,12 +307,16 @@ pub fn index_add(
     index
         .resolutions
         .sort_by(|a, b| a.entry.cmp(&b.entry).then_with(|| a.hash.cmp(&b.hash)));
+    save_index(root, &index)
+}
+
+fn save_index(root: &Path, index: &Index) -> Result<()> {
     let mut body = String::from(
         "# Informational index of tracked rerere pairs: which entry's merge\n\
          # produced which conflict hash. Auditability only, never load-bearing;\n\
          # replay uses the pair directories, verification uses the lock tree.\n",
     );
-    body.push_str(&toml::to_string(&index)?);
+    body.push_str(&toml::to_string(index)?);
     fs::create_dir_all(root.join(DIR))?;
     fs::write(root.join(INDEX), body)?;
     Ok(())
@@ -325,4 +329,44 @@ pub fn index_entry_names(root: &Path) -> Result<BTreeSet<String>> {
         .into_iter()
         .map(|r| r.entry)
         .collect())
+}
+
+/// Conflict hashes of the tracked pairs.
+pub fn tracked(root: &Path) -> Result<BTreeSet<String>> {
+    let mut hashes = BTreeSet::new();
+    let dir = root.join(DIR);
+    if !dir.exists() {
+        return Ok(hashes);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            hashes.insert(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    Ok(hashes)
+}
+
+/// The entry INDEX.toml attributes each recorded hash to.
+pub fn attributions(root: &Path) -> Result<BTreeMap<String, String>> {
+    Ok(load_index(root)?
+        .resolutions
+        .into_iter()
+        .map(|r| (r.hash, r.entry))
+        .collect())
+}
+
+/// Delete the given tracked pairs and their INDEX.toml records.
+pub fn remove(root: &Path, hashes: &[String]) -> Result<()> {
+    for hash in hashes {
+        let dir = root.join(DIR).join(hash);
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    }
+    let mut index = load_index(root)?;
+    let recorded = index.resolutions.len();
+    index.resolutions.retain(|r| !hashes.contains(&r.hash));
+    if index.resolutions.len() != recorded {
+        save_index(root, &index)?;
+    }
+    Ok(())
 }

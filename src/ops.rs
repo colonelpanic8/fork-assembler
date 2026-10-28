@@ -1,7 +1,7 @@
 //! Non-build verbs: update (the only pin-mover), status, prune, remove,
-//! fixup. Each returns what it found or did; `output` decides how to say it.
+//! fixup, gc. Each returns what it found or did; `output` decides how to say it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Result};
@@ -465,6 +465,65 @@ pub fn prune(root: &Path, dry_run: bool) -> Result<PruneReport> {
     Ok(PruneReport {
         contained: contained_entries,
         outcome,
+    })
+}
+
+#[derive(Serialize)]
+pub struct UnusedPair {
+    pub hash: String,
+    /// The entry INDEX.toml attributes the pair to, when it has a record.
+    pub entry: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct GcReport {
+    pub kept: usize,
+    pub unused: Vec<UnusedPair>,
+    pub dry_run: bool,
+}
+
+/// Remove the tracked rerere pairs no step of the lock's last build used.
+pub fn gc(root: &Path, dry_run: bool) -> Result<GcReport> {
+    let worktree = root.join(engine::WORKTREE);
+    if state::in_progress(&worktree) {
+        bail!(
+            "a build is in progress in {}; finish it with `fork-assembler continue` first",
+            worktree.display()
+        );
+    }
+    let Some(build) = lock::load(root)?.and_then(|l| l.build) else {
+        bail!("the lock records no completed build; run `fork-assembler build` first");
+    };
+    let mut used = BTreeSet::new();
+    for result in &build.results {
+        let Some(hashes) = &result.resolutions else {
+            bail!(
+                "{}'s result in the lock does not record which rerere pairs it used: its \
+                 build predates that record, so gc cannot tell an unused pair from an \
+                 unrecorded one. Run `fork-assembler build --locked` to record it.",
+                result.name
+            );
+        };
+        used.extend(hashes.iter().cloned());
+    }
+
+    let tracked = rerere::tracked(root)?;
+    let attributions = rerere::attributions(root)?;
+    let unused: Vec<UnusedPair> = tracked
+        .difference(&used)
+        .map(|hash| UnusedPair {
+            hash: hash.clone(),
+            entry: attributions.get(hash).cloned(),
+        })
+        .collect();
+    if !dry_run {
+        let hashes: Vec<String> = unused.iter().map(|pair| pair.hash.clone()).collect();
+        rerere::remove(root, &hashes)?;
+    }
+    Ok(GcReport {
+        kept: tracked.len() - unused.len(),
+        unused,
+        dry_run,
     })
 }
 

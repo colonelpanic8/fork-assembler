@@ -489,7 +489,13 @@ impl<'a> Run<'a> {
             self.emit(Event::LockWritten);
         } else {
             match previous_tree {
-                Some(expected) if expected == tree => self.emit(Event::Verified),
+                Some(expected) if expected == tree => {
+                    self.emit(Event::Verified);
+                    if let Some(lock) = previous.and_then(|l| self.with_recorded_usage(l)) {
+                        lock::save(&ctx.root, &lock)?;
+                        self.emit(Event::UsageRecorded);
+                    }
+                }
                 Some(expected) => {
                     bail!("reproduction FAILED: built tree {tree} but the lock records {expected}")
                 }
@@ -498,6 +504,31 @@ impl<'a> Run<'a> {
         }
         state::clear(&ctx.worktree)?;
         Ok(())
+    }
+
+    /// `previous` with each result's `resolutions` replaced by what this
+    /// verified reproduction used, or None when nothing would change. Which
+    /// pairs reproducing the lock needs is a fact about the lock, so a locked
+    /// build may record it without writing anything else.
+    fn with_recorded_usage(&self, previous: &Lock) -> Option<Lock> {
+        let mut lock = previous.clone();
+        let results = &mut lock.build.as_mut()?.results;
+        let aligned = results.len() == self.st.results.len()
+            && results
+                .iter()
+                .zip(&self.st.results)
+                .all(|(old, new)| old.name == new.name);
+        if !aligned {
+            return None;
+        }
+        let mut changed = false;
+        for (old, new) in results.iter_mut().zip(&self.st.results) {
+            if old.resolutions != new.resolutions {
+                old.resolutions.clone_from(&new.resolutions);
+                changed = true;
+            }
+        }
+        changed.then_some(lock)
     }
 
     /// Resume a build stalled in a coherence fixup: the merge is already
@@ -594,7 +625,7 @@ impl<'a> Run<'a> {
 
 pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
     let ctx = Ctx::open(root, !locked, report)?;
-    if state::read(&ctx.worktree).is_ok_and(|st| st.is_some()) {
+    if state::in_progress(&ctx.worktree) {
         bail!(
             "a build is already in progress in {}; finish it with `fork-assembler continue` \
              (or remove the worktree to abandon it)",

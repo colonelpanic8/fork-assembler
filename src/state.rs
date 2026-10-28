@@ -94,6 +94,11 @@ pub fn read(worktree: &Path) -> Result<Option<State>> {
     Ok(Some(state))
 }
 
+/// True when `worktree` holds an unfinished build's state.
+pub fn in_progress(worktree: &Path) -> bool {
+    read(worktree).is_ok_and(|st| st.is_some())
+}
+
 pub fn write(worktree: &Path, state: &State) -> Result<()> {
     let path = state_path(worktree)?;
     fs::write(&path, serde_json::to_string_pretty(state)?)

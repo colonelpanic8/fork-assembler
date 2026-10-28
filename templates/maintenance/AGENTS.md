@@ -16,7 +16,8 @@ topic branches into a single branch, with tracked conflict resolutions.
   worktree's rr-cache exclusively from them (wiped first, so nothing ambient
   leaks in) and auto-resolves recognized conflicts.
   `resolutions/rerere/INDEX.toml` records which entry produced which pairs —
-  informational only, never load-bearing.
+  informational only, never load-bearing. Each lock result's `resolutions`
+  lists the pairs that entry's step used; `gc` removes the pairs none lists.
 - `patches/` holds two things. A **coherence fixup** (`fixup = "..."` on a
   branch or pr entry) is applied inside THAT entry's own step, right after
   its merge: it repairs what admitting the entry alongside the earlier ones
@@ -70,6 +71,7 @@ fork-assembler build                  # assemble from lock pins; incremental for
 fork-assembler build --locked         # reproduce exactly; no network, no new pins
 fork-assembler update [ENTRY...]      # batch bump: repin base + entries to live heads
 fork-assembler prune [--dry-run]      # drop entries whose changes landed in the base
+fork-assembler gc [--dry-run]         # remove tracked pairs the last build did not use
 ```
 
 `build` never moves existing pins; `update` is the only verb that does. The
@@ -88,7 +90,8 @@ When a build stops on a conflict:
    that entry's fixup if it has one.
 4. Run `fork-assembler build --locked` after the repair completes to prove the
    tracked pairs reproduce the lock's tree.
-5. Commit the manifest, lock, and tracked pairs together.
+5. Run `fork-assembler gc` to remove the pairs a changed conflict superseded.
+6. Commit the manifest, lock, and tracked pairs together.
 
 When a build stops on a fixup that no longer applies, the entry's merge is
 already committed and only the fixup is owed. Repair the worktree, then

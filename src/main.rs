@@ -124,6 +124,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove tracked rerere pairs the lock's last build did not use
+    Gc {
+        /// Report what would be removed without removing it
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Compare lock vs. manifest (offline; --live also checks remote heads)
     Status {
         /// Fetch live heads and report pins that are behind
@@ -177,6 +183,7 @@ fn run(command: Command, out: &Out) -> Result<i32> {
         )?),
         Command::Remove { name } => out.result(&ops::remove(&root, name)?),
         Command::Prune { dry_run } => out.result(&ops::prune(&root, dry_run)?),
+        Command::Gc { dry_run } => out.result(&ops::gc(&root, dry_run)?),
         Command::Status { live } => out.result(&ops::status(&root, live, out)?),
     }
     Ok(0)

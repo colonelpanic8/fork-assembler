@@ -17,8 +17,8 @@ use crate::lock::{self, Prefix};
 use crate::manifest::edit::{Excluded, Removal};
 use crate::manifest::{self, entries_noun};
 use crate::ops::{
-    CaptureSource, EntryStatus, FixupReport, Flag, ParentStatus, PinMove, PruneReport, Pruned,
-    StatusReport, UpdateReport,
+    CaptureSource, EntryStatus, FixupReport, Flag, GcReport, ParentStatus, PinMove, PruneReport,
+    Pruned, StatusReport, UpdateReport,
 };
 use crate::report::{Doing, Event, Outcome, Replay, Report, Resolved, StepInfo};
 use crate::rerere;
@@ -412,6 +412,10 @@ fn event_text(event: &Event) -> String {
         }
         LockWritten => format!("wrote {}", lock::FILE),
         Verified => "verified: reproduced the lock's tree exactly".to_string(),
+        UsageRecorded => format!(
+            "recorded the rerere pairs the reproduction used in {}",
+            lock::FILE
+        ),
         NothingToVerify => {
             "(no lock to verify against; lock not written in --locked mode)".to_string()
         }
@@ -654,6 +658,40 @@ impl Render for PruneReport {
                 removal_notes(removal, &mut lines);
             }
         }
+        lines.join("\n")
+    }
+}
+
+impl Render for GcReport {
+    const VERB: &'static str = "gc";
+
+    fn text(&self) -> String {
+        let mut lines: Vec<String> = self
+            .unused
+            .iter()
+            .map(|pair| match &pair.entry {
+                Some(entry) => format!("  {} ({entry}): unused", pair.hash),
+                None => format!("  {}: unused", pair.hash),
+            })
+            .collect();
+        let removed = self.unused.len();
+        lines.push(if removed == 0 {
+            format!(
+                "nothing to collect: the last build used all {} tracked rerere pair(s)",
+                self.kept
+            )
+        } else if self.dry_run {
+            format!(
+                "would remove {removed} unused pair(s), keeping {} (dry run)",
+                self.kept
+            )
+        } else {
+            format!(
+                "removed {removed} unused pair(s) from {}, keeping {}",
+                rerere::DIR,
+                self.kept
+            )
+        });
         lines.join("\n")
     }
 }
