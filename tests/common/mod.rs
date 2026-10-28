@@ -248,6 +248,14 @@ pub fn pair_dirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Conflict hashes of the tracked pairs, sorted.
+pub fn pair_hashes(root: &Path) -> Vec<String> {
+    pair_dirs(root)
+        .iter()
+        .map(|dir| dir.file_name().unwrap().to_string_lossy().to_string())
+        .collect()
+}
+
 /// A plain unified diff rewriting `file` to `content`, taken against `branch`
 /// so it applies at that branch's position in the stack.
 pub fn patch_against(fx: &Fixture, branch: &str, file: &str, content: &str) -> String {

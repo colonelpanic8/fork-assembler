@@ -130,8 +130,11 @@ pub struct EntryResult {
     pub status: Status,
     #[serde(default)]
     pub conflicted: bool,
+    /// Conflict hashes of the tracked rerere pairs this step replayed or
+    /// recorded, reconstruction included. `None` on results written before
+    /// builds recorded them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
+    pub resolutions: Option<Vec<String>>,
     /// Blob hash of the coherence fixup applied at the end of this entry's
     /// step, when it carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,7 +178,7 @@ impl EntryResult {
             oid,
             status,
             conflicted: false,
-            resolution: None,
+            resolutions: None,
             fixup: None,
             derived: None,
         }
@@ -186,9 +189,10 @@ impl EntryResult {
 /// OID — generated commits keep real timestamps — but both are reproducible as
 /// trees, which is the invariant this project verifies.
 ///
-/// `conflicted` and `resolution` on the surrounding result describe the entry's
-/// merge into the stack. Conflicts met while reconstructing are counted in the
-/// build's conflict total and attributed to this entry in the rerere index.
+/// `conflicted` on the surrounding result describes the entry's merge into the
+/// stack. Conflicts met while reconstructing are counted in the build's
+/// conflict total, attributed to this entry in the rerere index, and their
+/// pairs listed in its `resolutions`.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DerivedResult {
     /// The merge of the pinned base and every parent pin: where the entry's

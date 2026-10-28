@@ -168,10 +168,10 @@ fn a_conflict_between_parents_stops_in_the_derive_worktree() {
     let wt = build_worktree(&fx);
     assert_eq!(read(wt.join("b.txt")), "one\nA+B\nthree\n");
     assert_eq!(read(wt.join("e.txt")), "own work\n");
-    let tree = lock_json(&fx.root)["build"]["tree"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let lock = lock_json(&fx.root);
+    let tree = lock["build"]["tree"].as_str().unwrap().to_string();
+    let used = serde_json::json!(pair_hashes(&fx.root));
+    assert_eq!(lock["build"]["results"][0]["resolutions"], used);
 
     // From scratch, the tracked pair replays the same resolution during the
     // derive phase and lands on the identical tree.
@@ -186,6 +186,19 @@ fn a_conflict_between_parents_stops_in_the_derive_worktree() {
         "{out}"
     );
     assert_eq!(lock_json(&fx.root)["build"]["tree"].as_str().unwrap(), tree);
+
+    // A pair replayed only inside the reconstruction is still the entry's.
+    advance_main(&fx, "a.txt", "base moved\n");
+    ff_ok(&fx.root, &["update", "base"]);
+    let out = ff_ok(&fx.root, &["build"]);
+    assert!(
+        out.contains("parent b merged; auto-resolved from tracked rerere pairs"),
+        "{out}"
+    );
+    assert_eq!(
+        lock_json(&fx.root)["build"]["results"][0]["resolutions"],
+        used
+    );
 }
 
 #[test]

@@ -66,10 +66,10 @@ fn conflict_harvest_then_rebuild_autoresolves() {
     let tree = lock["build"]["tree"].as_str().unwrap().to_string();
     let results = lock["build"]["results"].as_array().unwrap();
     assert_eq!(results[1]["conflicted"], true);
-    assert!(results[1]["resolution"]
-        .as_str()
-        .unwrap()
-        .starts_with("rerere:"));
+    assert_eq!(
+        results[1]["resolutions"],
+        serde_json::json!(pair_hashes(&fx.root))
+    );
 
     // Wipe the worktree; locked reproduction must auto-resolve from the
     // seeded tracked pairs and land on the identical tree.
@@ -85,6 +85,34 @@ fn conflict_harvest_then_rebuild_autoresolves() {
         "{out}"
     );
     assert_eq!(lock_json(&fx.root)["build"]["tree"].as_str().unwrap(), tree);
+}
+
+/// git drops a path from MERGE_RR the moment it replays a recorded
+/// resolution, so the lock cannot learn which pairs replayed from there.
+#[test]
+fn an_autoresolved_rebuild_records_the_replayed_pair() {
+    let fx = fixture();
+    topic(&fx, "t1", "b.txt", "one\nT1\nthree\n");
+    topic(&fx, "t2", "b.txt", "one\nT2\nthree\n");
+    add_branch(&fx, "t1");
+    add_branch(&fx, "t2");
+    ff_stopped(&fx.root, &["build"]);
+    let wt = build_worktree(&fx);
+    fs::write(wt.join("b.txt"), "one\nT1+T2\nthree\n").unwrap();
+    git(&wt, &["add", "b.txt"]);
+    ff_ok(&fx.root, &["continue"]);
+    let hash = pair_hashes(&fx.root).remove(0);
+
+    advance_main(&fx, "a.txt", "base moved\n");
+    ff_ok(&fx.root, &["update", "base"]);
+    let out = ff_ok(&fx.root, &["build"]);
+    assert!(
+        out.contains("auto-resolved from tracked rerere pairs"),
+        "{out}"
+    );
+    let results = &lock_json(&fx.root)["build"]["results"];
+    assert_eq!(results[0]["resolutions"], serde_json::json!([]));
+    assert_eq!(results[1]["resolutions"], serde_json::json!([hash]));
 }
 
 #[test]

@@ -18,6 +18,10 @@
 //! records which entry produced them in INDEX.toml. The index is for
 //! auditability only, never load-bearing.
 //!
+//! Each entry's lock result lists the pairs its step replayed or recorded,
+//! read from postimage mtimes (see `take_used`); `gc` removes the pairs no
+//! result lists.
+//!
 //! Known limitation, by design: rerere pairs capture only conflicted-hunk
 //! resolutions. Edits made outside conflict hunks while resolving, and
 //! conflicts rerere cannot token-ize (delete/modify, binary), are not
@@ -28,6 +32,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,14 +50,12 @@ pub fn with_cfg<'a>(args: &[&'a str]) -> Vec<&'a str> {
     CFG.iter().copied().chain(args.iter().copied()).collect()
 }
 
-/// Human-readable resolution label for lock results.
-pub fn label(hashes: &[String]) -> String {
-    if hashes.is_empty() {
-        "rerere".to_string()
-    } else {
-        format!("rerere:{}", hashes.join(","))
-    }
-}
+/// The mtime every seeded postimage carries until git uses it. git touches a
+/// postimage when it replays that resolution and writes a fresh one when it
+/// records a new one, so any other mtime marks a pair used since. 2100-01-01,
+/// far in the future, because `git rerere gc` expires resolutions by
+/// postimage age.
+const UNUSED: Duration = Duration::from_secs(4_102_444_800);
 
 /// The rr-cache directory the worktree's git uses. rr-cache lives in the
 /// COMMON git dir, shared by all worktrees of the source repo.
@@ -72,7 +75,11 @@ fn rr_cache(worktree: &Path) -> Result<PathBuf> {
 /// True for the rr-cache files that constitute a durable pair. `thisimage`
 /// and friends are transient working state and never tracked.
 fn is_pair_file(name: &str) -> bool {
-    name.starts_with("preimage") || name.starts_with("postimage")
+    name.starts_with("preimage") || is_postimage(name)
+}
+
+fn is_postimage(name: &str) -> bool {
+    name.starts_with("postimage")
 }
 
 fn copy_pair_files(src: &Path, dst: &Path) -> Result<()> {
@@ -106,8 +113,39 @@ fn pairs_differ(a: &Path, b: &Path) -> Result<bool> {
     Ok(list(a)? != list(b)?)
 }
 
+/// The rr-cache's postimage files, by conflict hash.
+fn postimages(cache: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    if !cache.exists() {
+        return Ok(files);
+    }
+    for entry in fs::read_dir(cache)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let hash = entry.file_name().to_string_lossy().to_string();
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
+            if is_postimage(&file.file_name().to_string_lossy()) {
+                files.push((hash.clone(), file.path()));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn mark_unused(postimage: &Path) -> Result<()> {
+    fs::File::options()
+        .write(true)
+        .open(postimage)
+        .and_then(|file| file.set_modified(UNIX_EPOCH + UNUSED))
+        .with_context(|| format!("resetting the mtime of {}", postimage.display()))
+}
+
 /// Wipe the worktree's rr-cache and reseed it exclusively from the tracked
-/// pairs. Returns the number of seeded conflict entries.
+/// pairs, every one marked unused. Returns the number of seeded conflict
+/// entries.
 pub fn seed(root: &Path, worktree: &Path) -> Result<usize> {
     let cache = rr_cache(worktree)?;
     if cache.exists() {
@@ -125,7 +163,24 @@ pub fn seed(root: &Path, worktree: &Path) -> Result<usize> {
             }
         }
     }
+    for (_, postimage) in postimages(&cache)? {
+        mark_unused(&postimage)?;
+    }
     Ok(seeded)
+}
+
+/// The conflict hashes whose pairs git replayed or recorded since the last
+/// call (or the seed), sorted. Marks them unused again, so each call answers
+/// for one step and a pair two steps replay counts for both.
+pub fn take_used(worktree: &Path) -> Result<Vec<String>> {
+    let mut used = BTreeSet::new();
+    for (hash, postimage) in postimages(&rr_cache(worktree)?)? {
+        if fs::metadata(&postimage)?.modified()? != UNIX_EPOCH + UNUSED {
+            mark_unused(&postimage)?;
+            used.insert(hash);
+        }
+    }
+    Ok(used.into_iter().collect())
 }
 
 /// The conflicts rerere is tracking for the in-progress merge:
@@ -181,7 +236,7 @@ pub fn harvest(root: &Path, worktree: &Path) -> Result<Vec<String>> {
         }
         let has_postimage = fs::read_dir(entry.path())?
             .filter_map(|f| f.ok())
-            .any(|f| f.file_name().to_string_lossy().starts_with("postimage"));
+            .any(|f| is_postimage(&f.file_name().to_string_lossy()));
         if !has_postimage {
             continue;
         }

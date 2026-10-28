@@ -224,9 +224,14 @@ impl<'a> Run<'a> {
     /// committed at that point, so the merge's result is held in
     /// `state.pending`: its presence is how `continue` knows to resume at the
     /// fixup rather than re-running the merge.
+    ///
+    /// Every rerere-using operation of the step, in either worktree and
+    /// across any number of `continue`s, is over by now, so this is where the
+    /// result learns which pairs the step used.
     fn finish_entry(&mut self, step: &Step, mut result: EntryResult) -> Result<bool> {
         let ctx = self.ctx;
         let entry = step.entry;
+        result.resolutions = Some(rerere::take_used(&ctx.worktree)?);
         if let Some(path) = &entry.fixup {
             let blob = patch_blob(&ctx.root, path)?;
             let message = format!("fork-assembler: fixup {}", entry.name);
@@ -367,14 +372,9 @@ impl<'a> Run<'a> {
             }
             // rerere recognized every conflict hunk and staged the recorded
             // resolutions (autoUpdate); commit and continue.
-            let hashes: Vec<String> = rerere::merge_rr(&ctx.worktree)?
-                .into_iter()
-                .map(|(hash, _)| hash)
-                .collect();
             git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
             self.emit(Event::AutoResolved { step: step.info() });
             result.conflicted = true;
-            result.resolution = Some(rerere::label(&hashes));
         }
         result.derived = derived;
         let done = self.finish_entry(step, result)?;
@@ -560,11 +560,10 @@ impl<'a> Run<'a> {
         self.emit(Event::Harvested {
             step: step.info(),
             resolved: Resolved::StackMerge,
-            pairs: harvested.clone(),
+            pairs: harvested,
         });
         let mut result = EntryResult::new(&entry.name, oid, Status::Merged);
         result.conflicted = true;
-        result.resolution = Some(rerere::label(&harvested));
         result.derived = self.st.derived.get(&entry.name).cloned();
         // finish_entry persists the advance IMMEDIATELY: if the very next
         // entry errors, a stale index would re-merge this one and falsely
@@ -588,9 +587,8 @@ impl<'a> Run<'a> {
         let oid = self.st.pins.get(&entry.name).cloned().unwrap_or_default();
         let mut result = EntryResult::new(&entry.name, oid, Status::Applied);
         result.conflicted = true;
-        self.st.results.push(result);
-        self.st.next_index = step.index + 1;
-        self.persist()
+        self.finish_entry(&step, result)?;
+        Ok(())
     }
 }
 

@@ -158,6 +158,41 @@ fn failed_fixup_stops_then_capture_repairs() {
     ff_ok(&fx.root, &["build", "--locked"]);
 }
 
+/// The result a fixup stall parks for `continue` already lists the pairs its
+/// merge used; nothing after the stall can recover them.
+#[test]
+fn a_fixup_stall_keeps_the_pairs_its_merge_used() {
+    let fx = fixture();
+    topic(&fx, "t1", "b.txt", "one\nT1\nthree\n");
+    topic(&fx, "t2", "b.txt", "one\nT2\nthree\n");
+    write_patch(
+        &fx.root,
+        "patches/coherence.patch",
+        &patch_against(&fx, "main", "a.txt", "base\nvia fixup\n").replace("a.txt", "missing.txt"),
+    );
+    add_branch(&fx, "t1");
+    add_branch(&fx, "t2");
+    ff_ok(&fx.root, &["fixup", "t2", "patches/coherence.patch"]);
+
+    ff_stopped(&fx.root, &["build"]);
+    let wt = fx.root.join(".worktrees/build");
+    fs::write(wt.join("b.txt"), "one\nT1+T2\nthree\n").unwrap();
+    git(&wt, &["add", "b.txt"]);
+    let out = ff_stopped(&fx.root, &["continue"]);
+    assert!(
+        out.contains("fixup patches/coherence.patch FAILED"),
+        "{out}"
+    );
+
+    fs::write(wt.join("a.txt"), "base\nby hand\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    ff_ok(&fx.root, &["continue"]);
+    assert_eq!(
+        lock_json(&fx.root)["build"]["results"][1]["resolutions"],
+        serde_json::json!(pair_hashes(&fx.root))
+    );
+}
+
 /// A fixup repairs an interaction between entries, so removing one side must
 /// surface the detached patch rather than silently dropping it.
 #[test]
