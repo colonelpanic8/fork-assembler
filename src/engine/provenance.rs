@@ -35,6 +35,12 @@ impl Run<'_> {
                     "commit": result.map(|r| r.oid.as_str()).unwrap_or(""),
                 });
                 let obj = record.as_object_mut().expect("record is an object");
+                let commit_date = result
+                    .filter(|r| !r.oid.is_empty())
+                    .and_then(|r| git::out(&ctx.repo, &["log", "-1", "--format=%cI", &r.oid]).ok());
+                if let Some(date) = commit_date {
+                    obj.insert("date".into(), json!(date));
+                }
                 if let Some(pr) = entry.pr_number() {
                     obj.insert("pr".into(), json!(pr));
                 }

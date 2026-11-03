@@ -315,6 +315,11 @@ fn provenance_commit_and_tree_invariant() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["schemaVersion"], 1);
     assert_eq!(json["entries"][0]["label"], "t1");
+    let pin = json["entries"][0]["commit"].as_str().unwrap();
+    assert_eq!(
+        json["entries"][0]["date"],
+        git(&fx.upstream, &["log", "-1", "--format=%cI", pin])
+    );
 }
 
 #[test]
