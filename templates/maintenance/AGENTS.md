@@ -45,7 +45,7 @@ topic branches into a single branch, with tracked conflict resolutions.
 - Rerere pairs capture only conflicted-hunk resolutions. If a correct
   resolution also needs edits outside the conflict hunks, put those edits in
   the entry's coherence fixup — a rebuild will otherwise surface them as a
-  tree mismatch. The lock's tree hash is the sole verification invariant.
+  tree mismatch.
 - Every entry boundary should be a coherent tree. A cross-entry repair
   belongs on the entry that made it necessary (its `fixup`), not in a patch
   entry parked at the end of the stack.
