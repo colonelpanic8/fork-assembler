@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::pins::derived_ref;
 use super::refuse::Topic;
-use super::{conflicted_files, Ctx, Run, Step};
+use super::{commit_merge, conflicted_files, Ctx, Run, Step};
 use crate::git;
 use crate::lock::{self, DerivedResult};
 use crate::manifest::{ConflictStyle, Entry};
@@ -167,6 +167,11 @@ fn replay_cfg<'a>(style: ConflictStyle, args: &[&'a str]) -> Vec<&'a str> {
     cfg
 }
 
+/// The message of the commit merging `parent` during `entry`'s reconstruction.
+fn parent_message(parent: &str, entry: &Entry) -> String {
+    format!("fork-assembler: merge parent {parent} (for {})", entry.name)
+}
+
 /// True when the derive worktree's index holds nothing beyond HEAD: a replay
 /// whose content is already present.
 fn nothing_staged(derive: &Path) -> bool {
@@ -276,12 +281,10 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                     parent: parent.name.clone(),
                 });
             } else {
-                let message = format!(
-                    "fork-assembler: merge parent {} (for {})",
-                    parent.name, entry.name
-                );
-                let out = git::raw(
+                let message = parent_message(&parent.name, entry);
+                let out = git::commit_raw(
                     &self.worktree,
+                    &["HEAD", &parent_pin],
                     &rerere::merging(
                         ctx.manifest.conflict_style,
                         &["merge", "--no-ff", "--no-edit", "-m", &message, &parent_pin],
@@ -311,7 +314,7 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                         self.stop(doing, unresolved)?;
                         return Ok(false);
                     }
-                    git::out(&self.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+                    commit_merge(&self.worktree, &message)?;
                     ctx.emit(Event::ParentAutoResolved {
                         step: step.info(),
                         parent: parent.name.clone(),
@@ -393,8 +396,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
         while self.ds.next_pick < self.ds.delta.len() {
             let commit = self.ds.delta[self.ds.next_pick].clone();
             let subject = git::out(&self.ctx().repo, &["log", "-1", "--format=%s", &commit])?;
-            let out = git::raw(
+            let out = git::commit_raw(
                 &self.worktree,
+                &["HEAD"],
                 &replay_cfg(
                     self.ctx().manifest.conflict_style,
                     &["cherry-pick", &commit],
@@ -427,8 +431,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                     Replay::AlreadyPresent
                 } else {
                     self.run.st.conflicts += 1;
-                    git::out(
+                    git::commit(
                         &self.worktree,
+                        &["HEAD"],
                         &replay_cfg(
                             self.ctx().manifest.conflict_style,
                             &["cherry-pick", "--continue"],
@@ -483,16 +488,16 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
             // Read MERGE_RR before committing: the rerere-enabled commit
             // records the postimages and clears it.
             let merge_rr = rerere::merge_rr(&self.worktree)?;
-            git::out(&self.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
-            let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
-            // Attributed to the entry, not the parent: the entry is what the
-            // manifest carries and what a later build will replay this for.
-            rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
             let parent = entry
                 .parents
                 .get(self.ds.next_parent)
                 .map(|parent| parent.name.clone())
                 .unwrap_or_default();
+            commit_merge(&self.worktree, &parent_message(&parent, entry))?;
+            let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
+            // Attributed to the entry, not the parent: the entry is what the
+            // manifest carries and what a later build will replay this for.
+            rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
             ctx.emit(Event::Harvested {
                 step: step.info(),
                 resolved: Resolved::ParentMerge { parent },
@@ -523,8 +528,9 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                     commit: picked.clone(),
                 });
             } else {
-                git::out(
+                git::commit(
                     &self.worktree,
+                    &["HEAD"],
                     &replay_cfg(
                         self.ctx().manifest.conflict_style,
                         &["cherry-pick", "--continue"],

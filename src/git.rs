@@ -8,7 +8,9 @@
 //! credentials, URL rewrites and SSH settings live. Everything else is build
 //! git: it ignores global and system configuration, pins the settings that can
 //! change a merge, a patch application or a commit object, and carries a fixed
-//! identity, so a build depends on nothing about the machine it runs on.
+//! identity, so that the same inputs yield the same commit OIDs on any machine
+//! at any time. Commits are created only through `commit`/`commit_raw`, which
+//! date each one from its parents.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -145,6 +147,46 @@ pub fn transport(dir: &Path, args: &[&str]) -> Result<Output> {
 /// `transport`, requiring success; returns trimmed stdout.
 pub fn transport_out(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(trimmed(require(transport(dir, args)?, dir, args)?))
+}
+
+/// The date a commit on top of `parents` carries: one second after the newest
+/// parent's committer date, in UTC. Derived from the parents alone, so a
+/// commit's metadata depends only on what it is built from: an incremental
+/// build extending an earlier one reproduces a clean build's commits exactly,
+/// and dates still increase along every generated parent edge.
+fn stamp(dir: &Path, parents: &[&str]) -> Result<String> {
+    let mut args = vec!["show", "-s", "--format=%ct"];
+    args.extend_from_slice(parents);
+    let times = out(dir, &args)?;
+    let newest = times
+        .lines()
+        .map(|line| line.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("reading committer dates of {}", parents.join(" ")))?
+        .into_iter()
+        .max()
+        .with_context(|| format!("no committer dates for {}", parents.join(" ")))?;
+    Ok(format!("@{} +0000", newest + 1))
+}
+
+/// Run a command that creates one commit whose parents are `parents` (as
+/// revisions resolvable in `dir`, e.g. `HEAD` and `MERGE_HEAD`), stamped by
+/// `stamp`. Returns the raw Output without judging the exit status.
+pub fn commit_raw(dir: &Path, parents: &[&str], args: &[&str]) -> Result<Output> {
+    let date = stamp(dir, parents)?;
+    let mut cmd = command(dir, args);
+    cmd.env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date);
+    exec(cmd, args)
+}
+
+/// `commit_raw`, requiring success; returns trimmed stdout.
+pub fn commit(dir: &Path, parents: &[&str], args: &[&str]) -> Result<String> {
+    Ok(trimmed(require(
+        commit_raw(dir, parents, args)?,
+        dir,
+        args,
+    )?))
 }
 
 /// True when `oid` resolves to a commit present in `dir`'s object store.

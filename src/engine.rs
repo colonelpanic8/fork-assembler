@@ -2,8 +2,8 @@
 //!
 //! `build` never moves an existing pin (`update` is the only verb that does);
 //! entries with no pin yet get pinned from live refs on their first build.
-//! The assembled branch is compiled output. `tree` (pre-provenance) is the
-//! reproducibility invariant.
+//! The assembled branch is compiled output, and deterministic: every commit
+//! goes through `git::commit`, so the same lock reproduces the same OIDs.
 //!
 //! This module owns `Run`, the entry loop, and its two entry points `build`
 //! and `cont`. Pin resolution, derived-entry reconstruction, the base-conflict
@@ -108,6 +108,25 @@ fn staged_files(worktree: &Path) -> Result<String> {
     git::out(worktree, &["diff", "--cached", "--name-only"])
 }
 
+/// The message of the commit merging `entry` into the stack.
+fn merge_message(entry: &Entry) -> String {
+    format!("fork-assembler: merge {}", entry.name)
+}
+
+/// Commit the merge in progress in `worktree` as `message`, recording its
+/// rerere resolutions. The message is always given rather than taken from
+/// MERGE_MSG: git lists the conflicted paths there, and a human resolving the
+/// merge may edit it, so a manual resolution and a later replay of it would
+/// otherwise commit different bytes.
+pub(crate) fn commit_merge(worktree: &Path, message: &str) -> Result<()> {
+    git::commit(
+        worktree,
+        &["HEAD", "MERGE_HEAD"],
+        &rerere::with_cfg(&["commit", "-q", "-m", message]),
+    )?;
+    Ok(())
+}
+
 /// How applying a patch file went.
 enum Apply {
     Done(Outcome),
@@ -180,7 +199,7 @@ impl Ctx<'_> {
         if staged_files(&self.worktree)?.is_empty() {
             return Ok(Apply::Done(Outcome::AlreadyApplied));
         }
-        git::out(&self.worktree, &["commit", "-q", "-m", message])?;
+        git::commit(&self.worktree, &["HEAD"], &["commit", "-q", "-m", message])?;
         Ok(Apply::Done(Outcome::Applied))
     }
 
@@ -302,9 +321,10 @@ impl<'a> Run<'a> {
 
     /// Merge `oid` into the stack as `entry`'s step.
     fn merge(&self, entry: &Entry, oid: &str) -> Result<bool> {
-        let message = format!("fork-assembler: merge {}", entry.name);
-        let out = git::raw(
+        let message = merge_message(entry);
+        let out = git::commit_raw(
             &self.ctx.worktree,
+            &["HEAD", oid],
             &rerere::merging(
                 self.ctx.manifest.conflict_style,
                 &["merge", "--no-ff", "--no-edit", "-m", &message, oid],
@@ -384,7 +404,7 @@ impl<'a> Run<'a> {
             }
             // rerere recognized every conflict hunk and staged the recorded
             // resolutions (autoUpdate); commit and continue.
-            git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+            commit_merge(&ctx.worktree, &merge_message(entry))?;
             self.emit(Event::AutoResolved { step: step.info() });
             result.conflicted = true;
         }
@@ -446,8 +466,9 @@ impl<'a> Run<'a> {
             std::fs::write(ctx.worktree.join(file), body)?;
             git::out(&ctx.worktree, &["add", file])?;
             if !git::out(&ctx.worktree, &["status", "--porcelain", "--", file])?.is_empty() {
-                git::out(
+                git::commit(
                     &ctx.worktree,
+                    &["HEAD"],
                     &[
                         "commit",
                         "-q",
@@ -566,7 +587,7 @@ impl<'a> Run<'a> {
             );
         }
         let message = format!("fork-assembler: fixup {}", entry.name);
-        git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
+        git::commit(&ctx.worktree, &["HEAD"], &["commit", "-q", "-m", &message])?;
         pending.fixup = Some(patch_blob(&ctx.root, &path)?);
         self.st.results.push(pending);
         self.st.next_index = step.index + 1;
@@ -591,7 +612,7 @@ impl<'a> Run<'a> {
         // Read MERGE_RR before committing: the rerere-enabled commit records
         // the postimages and clears it.
         let merge_rr = rerere::merge_rr(&ctx.worktree)?;
-        git::out(&ctx.worktree, &rerere::with_cfg(&["commit", "--no-edit"]))?;
+        commit_merge(&ctx.worktree, &merge_message(entry))?;
         let harvested = rerere::harvest(&ctx.root, &ctx.worktree)?;
         rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
         // The tracked object, which is not always the merged one: a derived
@@ -626,7 +647,7 @@ impl<'a> Run<'a> {
             return Ok(());
         }
         let message = format!("fork-assembler: {}", entry.name);
-        git::out(&ctx.worktree, &["commit", "-q", "-m", &message])?;
+        git::commit(&ctx.worktree, &["HEAD"], &["commit", "-q", "-m", &message])?;
         let oid = self.st.pins.get(&entry.name).cloned().unwrap_or_default();
         let mut result = EntryResult::new(&entry.name, oid, Status::Applied);
         result.conflicted = true;
