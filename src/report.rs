@@ -249,7 +249,11 @@ pub enum Event {
         previous_tree: Option<String>,
     },
     LockWritten,
-    Verified,
+    /// The reproduction matched the lock's tree, and its commit too when the
+    /// lock's build is deterministic (`commit`).
+    Verified {
+        commit: Option<String>,
+    },
     UsageRecorded,
     NothingToVerify,
 }

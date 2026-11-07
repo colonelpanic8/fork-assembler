@@ -27,8 +27,50 @@ The assembled branch is **compiled output**. It is never developed on, never
 merged back, and never reconciled with upstream directly. Upstream
 reconciliation happens per-topic, where diffs stay small.
 
-Reproducibility is judged by the **tree hash** of the assembled result, not by
-commit IDs (generated commits keep real timestamps).
+The assembled branch is also **deterministic**: the same manifest, pins,
+tracked resolutions and patches produce the same commit OIDs, whoever builds
+them, wherever, whenever, and by whichever route (clean, incremental, or
+through a human resolving conflicts). See [Deterministic commits](#deterministic-commits).
+The tree hash remains the cheap "did anything actually move" signal.
+
+### Deterministic commits
+
+Every generated commit goes through one wrapper (`git::commit`) that fixes
+everything git would otherwise take from its surroundings:
+
+- **Identity.** Author and committer are `fork-assembler
+  <fork-assembler@noreply.invalid>`. Replayed commits keep their original
+  author, as cherry-pick always does.
+- **Date.** One second after the newest parent's committer date, in UTC. It
+  depends only on the commit's own parents, so a build extending an earlier
+  one reproduces a clean build's commits exactly (a build-wide date taken from
+  the newest input would move every earlier commit when a newer entry is
+  appended), and dates increase along every generated edge.
+- **Message.** Always given explicitly. A conflicted merge is committed with
+  its canonical message, never MERGE_MSG, which lists the conflicted paths and
+  which a human resolving the merge may edit.
+- **Conflict style.** The manifest's `conflict_style` (`diff3` by default,
+  or `zdiff3`/`merge`) is passed to every merge, cherry-pick and 3-way patch
+  application. It is part of the recipe because git replays a rerere pair only
+  under the style it was recorded with; before it was a setting, pairs were
+  recorded under whatever the operator's global config said, so the default
+  matches the `diff3` that every existing pair was made under.
+- **Configuration.** Build git ignores global and system config and the
+  `GIT_CONFIG_*`/`GIT_AUTHOR_*`/`GIT_COMMITTER_*` environment, and pins the
+  repository-level settings that change a merge, an applied patch, a staged
+  mode, or a commit object's bytes. Transport (fetch, push, ls-remote, clone)
+  keeps the operator's config, which is where credentials live.
+
+The lock's build record carries the `protocol` it was built under. A build from
+another protocol (including every build from before this one) cannot be
+extended or reported up to date, and `build --locked` can only check its tree;
+under the current protocol it checks the commit too.
+
+What this does not cover: the git and fork-assembler versions (a maintenance
+repository pins both through its `flake.lock`, so they are part of the recipe
+too), attributes in the source repository's `info/attributes`, and the
+provenance record's nearest upstream tag, which is read from the tags fetched
+so far rather than pinned.
 
 ## Concepts
 
@@ -188,10 +230,10 @@ Known limitations, by design:
   are skipped, so a derived entry whose own work merges something is outside
   what this reconstructs — carry it as an ordinary entry, or declare that
   something as a parent too.
-- **Reproducibility is in trees, not commits.** Reconstruction generates fresh
-  commits with real timestamps, so the same inputs give the same trees and
-  different OIDs — the same bargain the assembled branch already makes, and the
-  lock's tree hash still catches anything replayed wrongly.
+- **Reconstructions are deterministic too.** They are generated commits like
+  any other, so the same pins and resolutions reproduce the same parent merge
+  and reconstructed tip — which also means republishing an unchanged
+  reconstruction pushes the same OID.
 
 ### Coherence fixups
 

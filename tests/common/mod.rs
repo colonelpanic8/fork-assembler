@@ -303,3 +303,56 @@ pub fn advance_main(fx: &Fixture, file: &str, content: &str) {
     git(&fx.upstream, &["add", "-A"]);
     git(&fx.upstream, &["commit", "-q", "-m", "upstream moves on"]);
 }
+
+/// `ff` with extra environment, applied after the defaults so a test can
+/// override the identity the harness otherwise supplies.
+pub fn ff_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("fork-assembler runs")
+}
+
+/// Copy everything a maintenance repository tracks — manifest, lock, rerere
+/// pairs, patches — into a fresh repository at `to`. Nothing generated comes
+/// along: no source clone, no worktrees, no rr-cache.
+pub fn copy_recipe(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for file in ["manifest.toml", "manifest.lock.json"] {
+        fs::copy(from.join(file), to.join(file)).unwrap();
+    }
+    for dir in ["resolutions", "patches"] {
+        if from.join(dir).exists() {
+            copy_dir(&from.join(dir), &to.join(dir));
+        }
+    }
+    git(to, &["init", "-q", "-b", "main"]);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// The assembled head the lock records.
+pub fn locked_commit(root: &Path) -> String {
+    lock_json(root)["build"]["commit"]
+        .as_str()
+        .expect("the lock records a build")
+        .to_string()
+}

@@ -2,9 +2,10 @@
 //!
 //! `pins` records which OID each ref was resolved to. Pins move only via
 //! `update` (or on an entry's very first build); `build` consumes them.
-//! `build` records what the last completed build produced. `tree` (the content
-//! tree BEFORE the provenance commit) is the reproducibility invariant;
-//! `built_tree` is what ships.
+//! `build` records what the last completed build produced. Builds under the
+//! current `PROTOCOL` generate their commits deterministically, so `commit` is
+//! reproducible exactly; `tree` (the content tree BEFORE the provenance commit)
+//! is what "did anything actually move" compares.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,6 +18,13 @@ use crate::git;
 use crate::manifest::Entry;
 
 pub const FILE: &str = "manifest.lock.json";
+
+/// How builds generate commits. A build recorded under any other protocol made
+/// commits this one would not, so it can be neither extended nor called up to
+/// date, and reproducing it can only be checked by tree.
+///
+/// 1: fixed identity, parent-derived dates, explicit messages, isolated config.
+pub const PROTOCOL: u32 = 1;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Lock {
@@ -58,10 +66,16 @@ pub struct Pins {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BuildRecord {
+    /// The commit-generation protocol the build ran under; 0 for builds that
+    /// predate deterministic commits.
+    #[serde(default)]
+    pub protocol: u32,
     pub generated: String,
     /// Base OID this build merged onto.
     pub base: String,
-    /// Assembled head (after the provenance commit, when one is written).
+    /// Assembled head (after the provenance commit, when one is written). Under
+    /// the current protocol, a pure function of the manifest, pins, tracked
+    /// resolutions and patches.
     pub commit: String,
     /// Last commit before the provenance commit; incremental builds extend
     /// from here. Equal to `commit` when no provenance file is configured.
@@ -185,9 +199,8 @@ impl EntryResult {
     }
 }
 
-/// The two commits a reconstruction produced. Neither is reproducible as an
-/// OID — generated commits keep real timestamps — but both are reproducible as
-/// trees, which is the invariant this project verifies.
+/// The two commits a reconstruction produced. Like every generated commit,
+/// both are reproducible as OIDs under the current protocol.
 ///
 /// `conflicted` on the surrounding result describes the entry's merge into the
 /// stack. Conflicts met while reconstructing are counted in the build's
@@ -315,6 +328,15 @@ pub fn prefix_relation(lock: &Lock, current: &[SnapshotEntry], base_pin: &str) -
     let Some(build) = &lock.build else {
         return Prefix::NoBuild;
     };
+    if build.protocol != PROTOCOL {
+        return Prefix::Diverged {
+            reason: format!(
+                "the last build ran under commit protocol {}, not {PROTOCOL}; its commits \
+                 would differ from a rebuild's",
+                build.protocol
+            ),
+        };
+    }
     if build.base != base_pin {
         return Prefix::Diverged {
             reason: format!(

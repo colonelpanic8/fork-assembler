@@ -411,7 +411,15 @@ fn event_text(event: &Event) -> String {
             format!("\ntree:   {tree}\ncommit: {commit}\nconflicts this run: {conflicts}{verdict}")
         }
         LockWritten => format!("wrote {}", lock::FILE),
-        Verified => "verified: reproduced the lock's tree exactly".to_string(),
+        Verified { commit } => match commit {
+            Some(commit) => format!(
+                "verified: reproduced the lock's tree exactly, as the identical commit {}",
+                short(commit)
+            ),
+            None => "verified: reproduced the lock's tree exactly (the lock predates \
+                     deterministic commits, so its commit cannot be compared)"
+                .to_string(),
+        },
         UsageRecorded => format!(
             "recorded the rerere pairs the reproduction used in {}",
             lock::FILE

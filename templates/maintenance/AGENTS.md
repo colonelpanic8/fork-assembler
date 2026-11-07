@@ -9,8 +9,9 @@ topic branches into a single branch, with tracked conflict resolutions.
 - `manifest.toml` is INTENT: named remotes, the base, and the ordered entries
   (branches, PRs, patch files).
 - `manifest.lock.json` is FACT: the OIDs the last build used, the assembled
-  commit, and its tree hash. The tree hash is the reproducibility invariant;
-  commit IDs are not.
+  commit, and its tree hash. Generated commits are deterministic, so the same
+  recipe reproduces the same assembled commit OID anywhere; `build --locked`
+  verifies the commit, not just the tree.
 - `resolutions/rerere/<hash>/{preimage,postimage}` are tracked git-rerere
   pairs replaying each conflicted merge's hunks. Every build seeds the build
   worktree's rr-cache exclusively from them (wiped first, so nothing ambient

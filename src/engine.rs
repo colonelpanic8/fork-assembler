@@ -506,6 +506,7 @@ impl<'a> Run<'a> {
                 &fixup_blobs(&ctx.root, &ctx.manifest.entries, true)?,
             );
             lock.build = Some(lock::BuildRecord {
+                protocol: lock::PROTOCOL,
                 generated: Utc::now().to_rfc3339(),
                 base: st.base.clone(),
                 commit: head,
@@ -521,9 +522,20 @@ impl<'a> Run<'a> {
             lock::save(&ctx.root, &lock)?;
             self.emit(Event::LockWritten);
         } else {
+            let previous_commit = previous_build
+                .filter(|b| b.protocol == lock::PROTOCOL)
+                .map(|b| b.commit.as_str());
             match previous_tree {
                 Some(expected) if expected == tree => {
-                    self.emit(Event::Verified);
+                    if let Some(expected) = previous_commit.filter(|c| *c != head) {
+                        bail!(
+                            "reproduction FAILED: built the lock's tree {tree}, but as commit \
+                             {head} where the lock records {expected}"
+                        )
+                    }
+                    self.emit(Event::Verified {
+                        commit: previous_commit.map(str::to_string),
+                    });
                     if let Some(lock) = previous.and_then(|l| self.with_recorded_usage(l)) {
                         lock::save(&ctx.root, &lock)?;
                         self.emit(Event::UsageRecorded);
