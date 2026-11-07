@@ -128,6 +128,17 @@ impl Recipe {
         })
     }
 
+    /// The recipe in the working tree at `root`.
+    pub fn working(root: &Path) -> Result<Recipe> {
+        Ok(Recipe {
+            rev: None,
+            root: root.to_path_buf(),
+            manifest: manifest::load(root)?,
+            lock: lock::load(root)?.unwrap_or_default(),
+            _checkout: None,
+        })
+    }
+
     /// How reports name this recipe.
     pub fn label(&self) -> String {
         match &self.rev {

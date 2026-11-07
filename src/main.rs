@@ -7,6 +7,7 @@
 
 mod add;
 mod assembled;
+mod compare;
 mod engine;
 mod git;
 mod init;
@@ -141,6 +142,20 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         checkout: Option<PathBuf>,
     },
+    /// Diff the assembled branches two maintenance commits built
+    Diff {
+        /// Maintenance commit for the old side (default: HEAD)
+        from: Option<String>,
+        /// Maintenance commit for the new side (default: the working tree)
+        to: Option<String>,
+        /// Only the paths either side's stack changes, not what moved only
+        /// upstream
+        #[arg(long)]
+        carried: bool,
+        /// Arguments passed through to `git diff` (after `--`)
+        #[arg(last = true)]
+        git_args: Vec<String>,
+    },
     /// Compare lock vs. manifest (offline; --live also checks remote heads)
     Status {
         /// Fetch live heads and report pins that are behind
@@ -199,6 +214,19 @@ fn run(command: Command, out: &Out) -> Result<i32> {
             &root,
             &revs,
             checkout.as_deref(),
+            out,
+        )?),
+        Command::Diff {
+            from,
+            to,
+            carried,
+            git_args,
+        } => out.result(&compare::diff(
+            &root,
+            from.as_deref(),
+            to.as_deref(),
+            carried,
+            &git_args,
             out,
         )?),
         Command::Status { live } => out.result(&ops::status(&root, live, out)?),

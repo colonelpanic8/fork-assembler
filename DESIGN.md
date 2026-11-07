@@ -512,6 +512,10 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   maintenance commit built (default HEAD), regenerating it from that commit's
   recipe when the object is gone; `--checkout` also opens it as a detached
   worktree of the source repository. See [Historical builds](#historical-builds).
+- `diff [FROM] [TO] [--carried] [-- GIT-DIFF-ARGS]` — `git diff` between the
+  assembled branches two maintenance commits built (default HEAD against the
+  working tree), beneath their provenance records. `--carried` keeps only the
+  paths either side's stack changes, dropping what moved only upstream.
 
 Builds run in a dedicated worktree under `.worktrees/` in the consuming repo.
 
@@ -519,7 +523,7 @@ Builds run in a dedicated worktree under `.worktrees/` in the consuming repo.
 
 Nothing preserves old assembled commits, and nothing needs to: generated
 commits are deterministic, so a maintenance commit's own recipe rebuilds
-exactly the commit its lock names. `assembled` treats a missing
+exactly the commit its lock names. `assembled` and `diff` treat a missing
 object as a cache miss. They check the old recipe out as a detached worktree of
 the maintenance repository (under its git dir, so nothing appears in the
 working tree), fetch by OID any pins the source repository has since pruned,

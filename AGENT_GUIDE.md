@@ -270,3 +270,8 @@ commit), and `--checkout DIR` opens it as a worktree to inspect or build.
 Builds from before deterministic commits are available only while their
 object still exists.
 
+`fork-assembler diff [FROM] [TO]` is `git diff` between the assembled branches
+two maintenance commits built (default: HEAD against the working tree, which
+reviews a rebuild before it is committed). `--carried` keeps only the paths
+the stack changes, leaving out what moved only upstream; anything after `--`
+goes to `git diff` (`-- --stat`, `-- --name-status -- PATH`).

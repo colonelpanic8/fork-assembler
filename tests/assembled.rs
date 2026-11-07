@@ -1,5 +1,6 @@
-//! `assembled`: the assembled branch of any maintenance commit is at hand —
-//! regenerated when its object is gone.
+//! `assembled` and `diff`: the assembled branch of any maintenance commit is
+//! at hand — regenerated when its object is gone — and two of them can be
+//! diffed.
 
 mod common;
 use common::*;
@@ -132,4 +133,76 @@ fn a_build_from_before_deterministic_commits_cannot_be_regenerated() {
     // ...but gone for good anywhere else.
     let err = ff_err(&clone_elsewhere(&fx), &["assembled"]);
     assert!(err.contains("predates deterministic commits"), "{err}");
+}
+
+#[test]
+fn diff_compares_the_assembled_branches() {
+    let fx = fixture();
+    let path = fx.root.join("manifest.toml");
+    let manifest = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!("provenance_file = \"stack-build-info.json\"\n{manifest}"),
+    )
+    .unwrap();
+    topic(&fx, "t1", "c.txt", "from t1\n");
+    topic(&fx, "t2", "d.txt", "from t2\n");
+    add_branch(&fx, "t1");
+    add_branch(&fx, "t2");
+    ff_ok(&fx.root, &["build"]);
+    let before = commit_recipe(&fx.root, "carry t1 and t2");
+
+    advance_main(&fx, "a.txt", "upstream moved\n");
+    git(&fx.upstream, &["checkout", "-q", "t1"]);
+    fs::write(fx.upstream.join("c.txt"), "from t1, revised\n").unwrap();
+    git(&fx.upstream, &["add", "-A"]);
+    git(&fx.upstream, &["commit", "-q", "-m", "t1 revised"]);
+    git(&fx.upstream, &["checkout", "-q", "main"]);
+    topic(&fx, "t3", "e.txt", "from t3\n");
+    ff_ok(&fx.root, &["remove", "t2"]);
+    add_branch(&fx, "t3");
+    ff_ok(&fx.root, &["update"]);
+    ff_ok(&fx.root, &["build"]);
+
+    // Against the working tree, before the new recipe is committed.
+    let out = ff_ok(&fx.root, &["diff"]);
+    assert!(out.contains("+from t1, revised"), "{out}");
+    assert!(out.contains("+upstream moved"), "{out}");
+    // The provenance record is metadata about the build, not the stack.
+    assert!(!out.contains("stack-build-info"), "{out}");
+    let after = commit_recipe(&fx.root, "drop t2, carry t3, bump");
+
+    let out = ff_ok(&fx.root, &["diff", &before, &after, "--carried"]);
+    assert!(out.contains("+from t1, revised"), "{out}");
+    assert!(out.contains("deleted file mode"), "{out}");
+    assert!(out.contains("+from t3"), "{out}");
+    assert!(!out.contains("upstream moved"), "{out}");
+
+    let out = ff_ok(&fx.root, &["diff", &before, &after, "--", "--name-status"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines,
+        ["M\ta.txt", "M\tc.txt", "D\td.txt", "A\te.txt"],
+        "{out}"
+    );
+    let out = ff_ok(
+        &fx.root,
+        &["diff", &before, &after, "--", "--stat", "--", "e.txt"],
+    );
+    assert!(out.contains("e.txt | 1 +"), "{out}");
+
+    let out = ff_ok(&fx.root, &["diff", &after, &after]);
+    assert!(out.trim().is_empty(), "{out}");
+
+    // A clone has neither assembled branch; both regenerate.
+    let elsewhere = clone_elsewhere(&fx);
+    let out = ff(&elsewhere, &["diff", &before, &after, "--", "--name-only"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("regenerating").count(), 2, "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().count(),
+        4,
+        "{stderr}"
+    );
 }

@@ -74,6 +74,7 @@ fork-assembler update [ENTRY...]      # batch bump: repin base + entries to live
 fork-assembler prune [--dry-run]      # drop entries whose changes landed in the base
 fork-assembler gc [--dry-run]         # remove tracked pairs the last build did not use
 fork-assembler assembled [REV] [--checkout DIR]  # REV's assembled commit, regenerated if gone
+fork-assembler diff [FROM] [TO] [--carried]      # git diff between two revs' assembled branches
 ```
 
 `build` never moves existing pins; `update` is the only verb that does. The

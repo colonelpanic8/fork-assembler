@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::add::{AddReport, Admitted, Discovered, ExcludeReport};
 use crate::assembled::AssembledReport;
+use crate::compare::DiffReport;
 use crate::engine::derive::AnchorRule;
 use crate::git::short;
 use crate::init::InitReport;
@@ -859,5 +860,13 @@ impl Render for AssembledReport {
             lines.push(format!("checked out at {}", path.display()));
         }
         lines.join("\n")
+    }
+}
+
+impl Render for DiffReport {
+    const VERB: &'static str = "diff";
+
+    fn text(&self) -> String {
+        self.diff.trim_end().to_string()
     }
 }
