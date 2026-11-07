@@ -74,7 +74,7 @@ pub fn source_repo(
             url: url.to_string(),
             path: path.clone(),
         });
-        git::out(root, &["clone", url, &path.to_string_lossy()])?;
+        git::transport_out(root, &["clone", url, &path.to_string_lossy()])?;
     } else if !git::ok(&path, &["rev-parse", "--git-dir"]) {
         bail!(
             "{} exists but is not a git repository; remove it and retry",

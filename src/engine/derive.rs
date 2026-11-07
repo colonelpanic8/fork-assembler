@@ -602,7 +602,7 @@ impl<'a> Run<'a> {
             }
 
             let destination = format!("refs/heads/{}", target.branch);
-            let out = git::raw(
+            let out = git::transport(
                 &ctx.repo,
                 &["ls-remote", "--heads", &target.remote, &destination],
             )?;
@@ -621,14 +621,15 @@ impl<'a> Run<'a> {
                 .unwrap_or_default();
             let lease = format!("--force-with-lease={destination}:{expected}");
             let source = format!("{tip}:{destination}");
-            git::out(&ctx.repo, &["push", &lease, &target.remote, &source]).with_context(|| {
-                format!(
-                    "{}: publishing reconstructed {} to {}",
-                    entry.name,
-                    git::short(tip),
-                    target.source()
-                )
-            })?;
+            git::transport_out(&ctx.repo, &["push", &lease, &target.remote, &source])
+                .with_context(|| {
+                    format!(
+                        "{}: publishing reconstructed {} to {}",
+                        entry.name,
+                        git::short(tip),
+                        target.source()
+                    )
+                })?;
             ctx.emit(Event::Published {
                 entry: entry.name.clone(),
                 oid: tip.to_string(),

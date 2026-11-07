@@ -199,15 +199,15 @@ impl Ctx<'_> {
             let tags = (base_wanted && *remote == self.manifest.base.remote)
                 .then(|| format!("+refs/tags/*:{BASE_TAGS}*"));
             specs.extend(tags.clone());
-            if git::out(&self.repo, &fetch_args(remote, &specs)).is_err() {
+            if git::transport_out(&self.repo, &fetch_args(remote, &specs)).is_err() {
                 for (fetch, spec) in fetches.iter().zip(&specs) {
-                    git::out(&self.repo, &fetch_args(remote, std::slice::from_ref(spec)))
+                    git::transport_out(&self.repo, &fetch_args(remote, std::slice::from_ref(spec)))
                         .with_context(|| {
                             format!("{}: fetching {remote} {}", fetch.what(), fetch.source)
                         })?;
                 }
                 if let Some(tags) = &tags {
-                    git::out(&self.repo, &fetch_args(remote, std::slice::from_ref(tags)))
+                    git::transport_out(&self.repo, &fetch_args(remote, std::slice::from_ref(tags)))
                         .with_context(|| format!("base: fetching {remote} tags"))?;
                 }
             }
