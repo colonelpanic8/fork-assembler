@@ -5,6 +5,11 @@
 # Derived entries may opt into updating a writable review branch after a full
 # successful build with: reconstruction_publish = "remote:branch".
 
+# How conflicts are written out: "diff3" (default), "zdiff3" or "merge". Part
+# of the recipe -- tracked rerere pairs replay only under the style they were
+# recorded with, so changing it strands every pair already in resolutions/.
+# conflict_style = "diff3"
+
 [remotes]
 # upstream = "https://github.com/OWNER/REPO"
 # mine = "https://github.com/YOU/REPO"

@@ -17,7 +17,7 @@ use super::refuse::Topic;
 use super::{conflicted_files, Ctx, Run, Step};
 use crate::git;
 use crate::lock::{self, DerivedResult};
-use crate::manifest::Entry;
+use crate::manifest::{ConflictStyle, Entry};
 use crate::report::{Doing, Event, Replay, Resolved};
 use crate::rerere;
 use crate::state::DeriveState;
@@ -161,9 +161,9 @@ fn delta_commits(repo: &Path, pin: &str, anchor: &str) -> Result<Vec<String>> {
 /// that exits successfully without opening anything. `cherry-pick` and its
 /// `--continue` want an editor by default, and a build has no terminal to give
 /// them one.
-fn replay_cfg<'a>(args: &[&'a str]) -> Vec<&'a str> {
+fn replay_cfg<'a>(style: ConflictStyle, args: &[&'a str]) -> Vec<&'a str> {
     let mut cfg = vec!["-c", "core.editor=true"];
-    cfg.extend(rerere::with_cfg(args));
+    cfg.extend(rerere::merging(style, args));
     cfg
 }
 
@@ -282,14 +282,10 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 );
                 let out = git::raw(
                     &self.worktree,
-                    &rerere::with_cfg(&[
-                        "merge",
-                        "--no-ff",
-                        "--no-edit",
-                        "-m",
-                        &message,
-                        &parent_pin,
-                    ]),
+                    &rerere::merging(
+                        ctx.manifest.conflict_style,
+                        &["merge", "--no-ff", "--no-edit", "-m", &message, &parent_pin],
+                    ),
                 )?;
                 if out.status.success() {
                     ctx.emit(Event::ParentMerged {
@@ -397,7 +393,13 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
         while self.ds.next_pick < self.ds.delta.len() {
             let commit = self.ds.delta[self.ds.next_pick].clone();
             let subject = git::out(&self.ctx().repo, &["log", "-1", "--format=%s", &commit])?;
-            let out = git::raw(&self.worktree, &replay_cfg(&["cherry-pick", &commit]))?;
+            let out = git::raw(
+                &self.worktree,
+                &replay_cfg(
+                    self.ctx().manifest.conflict_style,
+                    &["cherry-pick", &commit],
+                ),
+            )?;
             let outcome = if out.status.success() {
                 Replay::Clean
             } else {
@@ -415,11 +417,23 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // staged the result, or the commit's content is already
                 // present and there is nothing left to commit at all.
                 if nothing_staged(&self.worktree) {
-                    git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
+                    git::out(
+                        &self.worktree,
+                        &replay_cfg(
+                            self.ctx().manifest.conflict_style,
+                            &["cherry-pick", "--skip"],
+                        ),
+                    )?;
                     Replay::AlreadyPresent
                 } else {
                     self.run.st.conflicts += 1;
-                    git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
+                    git::out(
+                        &self.worktree,
+                        &replay_cfg(
+                            self.ctx().manifest.conflict_style,
+                            &["cherry-pick", "--continue"],
+                        ),
+                    )?;
                     Replay::AutoResolved
                 }
             };
@@ -497,13 +511,25 @@ impl<'r, 'a> Reconstruction<'r, 'a> {
                 // The resolution kept nothing: the commit's content is already
                 // in the reconstruction, so there is nothing to commit and the
                 // replay simply skips it.
-                git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--skip"]))?;
+                git::out(
+                    &self.worktree,
+                    &replay_cfg(
+                        self.ctx().manifest.conflict_style,
+                        &["cherry-pick", "--skip"],
+                    ),
+                )?;
                 ctx.emit(Event::ReplaySkipped {
                     step: step.info(),
                     commit: picked.clone(),
                 });
             } else {
-                git::out(&self.worktree, &replay_cfg(&["cherry-pick", "--continue"]))?;
+                git::out(
+                    &self.worktree,
+                    &replay_cfg(
+                        self.ctx().manifest.conflict_style,
+                        &["cherry-pick", "--continue"],
+                    ),
+                )?;
                 let harvested = rerere::harvest(&ctx.root, &self.worktree)?;
                 rerere::index_add(&ctx.root, &entry.name, &harvested, &merge_rr)?;
                 ctx.emit(Event::Harvested {

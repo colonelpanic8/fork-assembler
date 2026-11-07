@@ -160,7 +160,16 @@ impl Ctx<'_> {
             return Ok(Apply::Done(Outcome::AlreadyApplied));
         }
 
-        let applied = git::raw(&self.worktree, &["apply", "--3way", &patch_str])?;
+        let applied = git::raw(
+            &self.worktree,
+            &[
+                "-c",
+                self.manifest.conflict_style.config(),
+                "apply",
+                "--3way",
+                &patch_str,
+            ],
+        )?;
         if !applied.status.success() {
             let stderr = String::from_utf8_lossy(&applied.stderr)
                 .trim_end()
@@ -296,7 +305,10 @@ impl<'a> Run<'a> {
         let message = format!("fork-assembler: merge {}", entry.name);
         let out = git::raw(
             &self.ctx.worktree,
-            &rerere::with_cfg(&["merge", "--no-ff", "--no-edit", "-m", &message, oid]),
+            &rerere::merging(
+                self.ctx.manifest.conflict_style,
+                &["merge", "--no-ff", "--no-edit", "-m", &message, oid],
+            ),
         )?;
         Ok(out.status.success())
     }

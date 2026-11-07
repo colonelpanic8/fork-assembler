@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::git;
+use crate::manifest::ConflictStyle;
 
 pub const DIR: &str = "resolutions/rerere";
 pub const INDEX: &str = "resolutions/rerere/INDEX.toml";
@@ -48,6 +49,15 @@ const CFG: [&str; 4] = ["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=tr
 /// Prefix `args` with the per-command rerere config.
 pub fn with_cfg<'a>(args: &[&'a str]) -> Vec<&'a str> {
     CFG.iter().copied().chain(args.iter().copied()).collect()
+}
+
+/// `with_cfg` for an operation that can conflict: also selects the conflict
+/// style the tracked pairs were recorded under, without which they would not
+/// replay.
+pub fn merging<'a>(style: ConflictStyle, args: &[&'a str]) -> Vec<&'a str> {
+    let mut cfg = vec!["-c", style.config()];
+    cfg.extend(with_cfg(args));
+    cfg
 }
 
 /// The mtime every seeded postimage carries until git uses it. git touches a

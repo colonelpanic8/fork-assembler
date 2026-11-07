@@ -21,6 +21,8 @@ struct RawManifest {
     remotes: BTreeMap<String, String>,
     base: RawBase,
     provenance_file: Option<String>,
+    #[serde(default)]
+    conflict_style: ConflictStyle,
     publish: Option<Publish>,
     #[serde(default, rename = "entry")]
     entries: Vec<RawEntry>,
@@ -34,6 +36,31 @@ struct RawBase {
     #[serde(rename = "ref")]
     ref_: String,
     submodule: Option<String>,
+}
+
+/// How conflicts are written out, in the build worktrees and in the tracked
+/// rerere pairs. Part of the recipe: git only replays a pair under the style it
+/// was recorded with, so changing it strands every pair already tracked.
+/// Defaults to `diff3`, which every pair recorded before this was a setting
+/// was made under.
+#[derive(Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictStyle {
+    Merge,
+    #[default]
+    Diff3,
+    Zdiff3,
+}
+
+impl ConflictStyle {
+    /// The `-c` value selecting this style.
+    pub fn config(self) -> &'static str {
+        match self {
+            ConflictStyle::Merge => "merge.conflictStyle=merge",
+            ConflictStyle::Diff3 => "merge.conflictStyle=diff3",
+            ConflictStyle::Zdiff3 => "merge.conflictStyle=zdiff3",
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -85,6 +112,7 @@ pub struct Manifest {
     pub remotes: BTreeMap<String, String>,
     pub base: Base,
     pub provenance_file: Option<String>,
+    pub conflict_style: ConflictStyle,
     pub publish: Option<Publish>,
     pub entries: Vec<Entry>,
     pub excludes: Vec<Exclusion>,
@@ -668,6 +696,7 @@ pub fn load(root: &Path) -> Result<Manifest> {
             submodule: raw.base.submodule,
         },
         provenance_file: raw.provenance_file,
+        conflict_style: raw.conflict_style,
         publish: raw.publish,
         entries,
         excludes,
