@@ -670,6 +670,30 @@ impl<'a> Run<'a> {
 
 pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
     let ctx = Ctx::open(root, !locked, report)?;
+    build_in(&ctx, locked)
+}
+
+/// Rebuild `ctx`'s recipe from its lock alone, verifying the result against
+/// the lock, and return the assembled commit. The recipe's root need not be
+/// the maintenance repository: an old commit of it checked out elsewhere,
+/// built in the source repository the caller supplies, reproduces exactly the
+/// commit that commit's lock records.
+pub fn reproduce(ctx: &Ctx) -> Result<String> {
+    let result = build_in(ctx, true).and_then(|code| {
+        if code != 0 {
+            bail!(
+                "the reproduction stopped on a conflict that the recipe's tracked rerere \
+                 pairs do not resolve"
+            );
+        }
+        git::out(&ctx.worktree, &["rev-parse", "HEAD"])
+    });
+    ctx.remove_worktree(&ctx.derive_worktree());
+    ctx.remove_worktree(&ctx.worktree);
+    result
+}
+
+fn build_in(ctx: &Ctx, locked: bool) -> Result<i32> {
     if state::in_progress(&ctx.worktree) {
         bail!(
             "a build is already in progress in {}; finish it with `fork-assembler continue` \
@@ -760,7 +784,7 @@ pub fn build(root: &Path, locked: bool, report: &dyn Report) -> Result<i32> {
         ctx.emit(Event::Seeded { pairs: seeded });
     }
     let mut run = Run {
-        ctx: &ctx,
+        ctx,
         st: State {
             next_index: start,
             base,

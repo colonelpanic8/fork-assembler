@@ -256,5 +256,17 @@ say in the reason which upstream change obsoleted it.
 ## Verification
 
 After a completed repair, `fork-assembler build --locked` must reproduce the
-lock's tree hash. Never enable persistent Git rerere, develop on the assembled
-branch, or merge from the assembled branch.
+lock's assembled commit exactly (the tree hash too, for locks from before
+deterministic commits). Never enable persistent Git rerere, develop on the
+assembled branch, or merge from the assembled branch.
+
+## Historical builds
+
+The assembled branch of any maintenance commit can be had on demand: its lock
+names the commit, and its recipe regenerates exactly that commit when the
+object is gone. `fork-assembler assembled REV` prints it (regenerating if
+needed; progress goes to stderr, so `$(fork-assembler assembled REV)` is the
+commit), and `--checkout DIR` opens it as a worktree to inspect or build.
+Builds from before deterministic commits are available only while their
+object still exists.
+

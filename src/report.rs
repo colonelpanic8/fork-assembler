@@ -16,6 +16,14 @@ pub trait Report {
     fn event(&self, event: &Event);
 }
 
+/// Says nothing: for a build run on another verb's behalf, which reports
+/// its outcome itself.
+pub struct Silent;
+
+impl Report for Silent {
+    fn event(&self, _: &Event) {}
+}
+
 /// Which entry an event is about, and where it sits in the run.
 #[derive(Serialize, Clone)]
 pub struct StepInfo {
@@ -239,6 +247,12 @@ pub enum Event {
         entry: String,
         oid: String,
         target: String,
+    },
+
+    /// A past recipe's assembled commit is gone, and is being rebuilt from it.
+    Regenerating {
+        recipe: String,
+        commit: String,
     },
 
     // The end of a completed run.

@@ -73,6 +73,7 @@ fork-assembler build --locked         # reproduce exactly; no network, no new pi
 fork-assembler update [ENTRY...]      # batch bump: repin base + entries to live heads
 fork-assembler prune [--dry-run]      # drop entries whose changes landed in the base
 fork-assembler gc [--dry-run]         # remove tracked pairs the last build did not use
+fork-assembler assembled [REV] [--checkout DIR]  # REV's assembled commit, regenerated if gone
 ```
 
 `build` never moves existing pins; `update` is the only verb that does. The

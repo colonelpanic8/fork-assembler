@@ -6,6 +6,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 mod add;
+mod assembled;
 mod engine;
 mod git;
 mod init;
@@ -13,6 +14,7 @@ mod lock;
 mod manifest;
 mod ops;
 mod output;
+mod recipe;
 mod report;
 mod rerere;
 mod source;
@@ -130,6 +132,15 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Print the assembled commit a maintenance commit built, regenerating it
+    /// from that commit's recipe when it is gone
+    Assembled {
+        /// Maintenance commits (default: HEAD)
+        revs: Vec<String>,
+        /// Also check it out as a detached worktree of the source repository
+        #[arg(long, value_name = "DIR")]
+        checkout: Option<PathBuf>,
+    },
     /// Compare lock vs. manifest (offline; --live also checks remote heads)
     Status {
         /// Fetch live heads and report pins that are behind
@@ -184,6 +195,12 @@ fn run(command: Command, out: &Out) -> Result<i32> {
         Command::Remove { name } => out.result(&ops::remove(&root, name)?),
         Command::Prune { dry_run } => out.result(&ops::prune(&root, dry_run)?),
         Command::Gc { dry_run } => out.result(&ops::gc(&root, dry_run)?),
+        Command::Assembled { revs, checkout } => out.result(&assembled::assembled(
+            &root,
+            &revs,
+            checkout.as_deref(),
+            out,
+        )?),
         Command::Status { live } => out.result(&ops::status(&root, live, out)?),
     }
     Ok(0)

@@ -10,6 +10,7 @@
 use serde::Serialize;
 
 use crate::add::{AddReport, Admitted, Discovered, ExcludeReport};
+use crate::assembled::AssembledReport;
 use crate::engine::derive::AnchorRule;
 use crate::git::short;
 use crate::init::InitReport;
@@ -123,7 +124,13 @@ impl Report for Out {
                 {
                     eprintln!("{stderr}");
                 }
-                println!("{}", event_text(event));
+                // Progress, not results: kept off stdout, so a verb whose
+                // result is a commit or a diff can be captured or piped.
+                if let Event::Regenerating { .. } | Event::Cloning { .. } = event {
+                    eprintln!("{}", event_text(event));
+                } else {
+                    println!("{}", event_text(event));
+                }
             }
             Format::Json => println!(
                 "{}",
@@ -199,6 +206,10 @@ fn event_text(event: &Event) -> String {
             format!("  pinned {entry}'s parent {parent} -> {}", short(oid))
         }
 
+        Regenerating { recipe, commit } => format!(
+            "regenerating {} from the recipe at {recipe}...",
+            short(commit)
+        ),
         UpToDate { tree } => format!("up to date: tree {tree}"),
         Extending { new_entries } => format!(
             "extending the locked build ({new_entries} new {})",
@@ -829,5 +840,24 @@ impl Render for InitReport {
              next: edit manifest.toml, `direnv allow`, then `fork-assembler add` / `fork-assembler build`",
             self.dir.display()
         )
+    }
+}
+
+impl Render for AssembledReport {
+    const VERB: &'static str = "assembled";
+
+    /// One OID per line, so `$(fork-assembler assembled REV)` is the commit.
+    fn text(&self) -> String {
+        let mut lines: Vec<String> = match &self.items[..] {
+            [only] => vec![only.commit.clone()],
+            items => items
+                .iter()
+                .map(|item| format!("{} {}", short(&item.rev), item.commit))
+                .collect(),
+        };
+        if let Some(path) = &self.checkout {
+            lines.push(format!("checked out at {}", path.display()));
+        }
+        lines.join("\n")
     }
 }

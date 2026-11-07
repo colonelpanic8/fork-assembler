@@ -508,8 +508,33 @@ triggers a rebuild from there — detectable via the lock, never surprising.
   used; `build --locked` records it.
 - `status` — lock vs. manifest vs. live refs: what's stale, what an incremental
   build would do, and which entries look merged upstream (prune candidates).
+- `assembled [REV...] [--checkout DIR]` — print the assembled commit a
+  maintenance commit built (default HEAD), regenerating it from that commit's
+  recipe when the object is gone; `--checkout` also opens it as a detached
+  worktree of the source repository. See [Historical builds](#historical-builds).
 
 Builds run in a dedicated worktree under `.worktrees/` in the consuming repo.
+
+### Historical builds
+
+Nothing preserves old assembled commits, and nothing needs to: generated
+commits are deterministic, so a maintenance commit's own recipe rebuilds
+exactly the commit its lock names. `assembled` treats a missing
+object as a cache miss. They check the old recipe out as a detached worktree of
+the maintenance repository (under its git dir, so nothing appears in the
+working tree), fetch by OID any pins the source repository has since pruned,
+run a locked build there against the shared source repository, and verify the
+result against that recipe's lock. The result is cached as
+`refs/fork-assembler/assembled/<maintenance commit>` in the source repository.
+Regeneration reseeds the rerere cache the source repository's worktrees share,
+so it refuses while a build is stopped. Builds from before deterministic
+commits can be looked up only while their object still exists.
+
+The maintenance commit is deliberately not written into the assembled commit.
+It could be — the dependency no longer has to run the other way — but the
+lock would then have to stop recording the assembled commit (the commit naming
+the lock cannot be named by it), costing `build --locked` its commit check and
+leaving a build from an uncommitted recipe with no truthful name.
 
 ### Merged topics
 
